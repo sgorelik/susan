@@ -12,6 +12,7 @@ so the database survives redeploys. Ephemeral disk alone loses the file on each 
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -59,6 +60,26 @@ def _build_engine():
         f"sqlite+aiosqlite:///{abs_path}",
         echo=False,
     )
+
+
+def normalize_google_access_token(raw: str) -> str:
+    """Return a bare OAuth access token. Accepts JSON blobs from OAuth Playground pasted into env."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if '"access_token"' in raw or "'access_token'" in raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict) and data.get("access_token"):
+                return str(data["access_token"]).strip()
+        except json.JSONDecodeError:
+            pass
+    t = raw
+    if t.lower().startswith("bearer "):
+        t = t[7:].strip()
+    # Drop anything after a newline (illegal in HTTP headers)
+    t = t.split("\n")[0].strip().strip('"').strip("'")
+    return t
 
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -147,7 +168,7 @@ async def upsert_tokens(slack_user_id: str, access_token: str, refresh_token: st
 
 async def get_valid_access_token(slack_user_id: str) -> str:
     """Return a valid Google access token for this Slack user, refreshing if needed."""
-    env_fallback = os.environ.get("GOOGLE_ACCESS_TOKEN", "")
+    env_fallback = normalize_google_access_token(os.environ.get("GOOGLE_ACCESS_TOKEN", ""))
     async with SessionLocal() as session:
         row = await session.get(GoogleToken, slack_user_id)
         if not row:
@@ -157,7 +178,7 @@ async def get_valid_access_token(slack_user_id: str) -> str:
 
         buffer = timedelta(minutes=2)
         if row.expires_at > datetime.now(timezone.utc) + buffer:
-            return row.access_token
+            return normalize_google_access_token(row.access_token)
 
         new_access, expires_in = await _refresh_access_token(row.refresh_token)
         row.access_token = new_access
