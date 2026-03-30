@@ -223,7 +223,7 @@ ACTIONS = {
 GOOGLE_ACTIONS = frozenset({"doc", "email", "invite"})
 GITHUB_ACTIONS = frozenset({"pr", "issue", "pr_summary"})
 
-APPROVE_ACTION_TYPES = frozenset({"doc", "email", "invite", "pr", "issue"})
+APPROVE_ACTION_TYPES = frozenset({"doc", "email", "invite", "pr", "issue", "pr_summary"})
 
 
 def verify_slack(req_body: bytes, timestamp: str, signature: str) -> bool:
@@ -623,16 +623,73 @@ async def notify_user_ephemeral(
         await post_slack_delayed_response(response_url, payload)
 
 
-async def post_message(channel: str, text: str, thread_ts: str | None = None):
-    payload = {"channel": channel, "text": text}
+async def post_message(
+    channel: str,
+    text: str,
+    thread_ts: str | None = None,
+    blocks: list[dict] | None = None,
+) -> dict:
+    payload: dict = {"channel": channel, "text": text}
     if thread_ts:
         payload["thread_ts"] = thread_ts
-    async with httpx.AsyncClient() as client:
-        await client.post(
+    if blocks:
+        payload["blocks"] = blocks
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
             "https://slack.com/api/chat.postMessage",
             headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
             json=payload,
         )
+    try:
+        data = r.json()
+    except json.JSONDecodeError:
+        data = {}
+    if not data.get("ok"):
+        logger.error("chat.postMessage failed: %s", data)
+        raise RuntimeError(str(data.get("error", "chat.postMessage failed")))
+    return data
+
+
+async def post_pr_summary_to_channel(
+    channel: str,
+    thread_ts: str | None,
+    title: str,
+    body: str,
+) -> None:
+    """Publish PR summary as channel/thread messages (splits long bodies; ≤48 sections per message)."""
+    chunk_size = 2800
+    max_sections = 48
+    s = (body or "").strip()
+    parts: list[str] = []
+    while s:
+        parts.append(s[:chunk_size])
+        s = s[chunk_size:]
+    if not parts:
+        parts = ["_(empty)_"]
+    reply_thread_ts = thread_ts
+    i = 0
+    first_message = True
+    while i < len(parts):
+        batch = parts[i : i + max_sections]
+        i += len(batch)
+        blk: list[dict] = []
+        if first_message:
+            blk.append(
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"*{title}*\n_Posted via Susan_"},
+                }
+            )
+            blk.append({"type": "divider"})
+            first_message = False
+        for p in batch:
+            blk.append({"type": "section", "text": {"type": "mrkdwn", "text": p[:2900]}})
+        is_last = i >= len(parts)
+        fallback = (title[:200] if is_last else f"{title[:80]}… (continued)") or "PR summary"
+        data = await post_message(channel, fallback, thread_ts=reply_thread_ts, blocks=blk)
+        ts = data.get("ts")
+        if reply_thread_ts is None and ts and not is_last:
+            reply_thread_ts = ts
 
 
 EMAIL_IN_TEXT_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
@@ -898,22 +955,73 @@ def is_plausible_github_repo_slug(slug: str) -> bool:
 
 def parse_repo_slug_from_text(text: str) -> str | None:
     """Extract owner/repo from slash text; validated so Slack links are never treated as repos."""
-    m = re.search(r"\b(?:repo|in)\s*:?\s*([^\s]+/[^\s]+)", text, re.I)
-    if m:
-        cand = m.group(1).strip().rstrip(".,;)")
-        if is_plausible_github_repo_slug(cand):
-            return cand.lower()
-    m = re.search(r"github\.com/([^/\s]+)/([^/\s?#]+)", text, re.I)
-    if m:
-        cand = f"{m.group(1)}/{m.group(2)}"
-        if is_plausible_github_repo_slug(cand):
-            return cand.lower()
-    m = re.search(r"\b([a-zA-Z0-9][a-zA-Z0-9-]{0,38}/[a-zA-Z0-9._-]+)\b", text)
-    if m:
-        cand = m.group(1)
-        if is_plausible_github_repo_slug(cand):
-            return cand.lower()
-    return None
+    all_slugs = parse_all_repo_slugs_from_text(text)
+    return all_slugs[0] if all_slugs else None
+
+
+def parse_all_repo_slugs_from_text(text: str) -> list[str]:
+    """All distinct owner/repo slugs from slash text (order preserved)."""
+    if not (text or "").strip():
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def add_slug(cand: str) -> None:
+        if not is_plausible_github_repo_slug(cand):
+            return
+        c = cand.strip().lower()
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+
+    m_list = re.search(r"(?i)\b(?:repos?|in)\s*:\s*([^\n]+)", text)
+    if m_list:
+        for part in m_list.group(1).split(","):
+            p = part.strip()
+            if p:
+                add_slug(p)
+
+    for m in re.finditer(r"github\.com/([^/\s]+)/([^/\s?#]+)", text, re.I):
+        add_slug(f"{m.group(1)}/{m.group(2)}")
+
+    for m in re.finditer(
+        r"\b([a-zA-Z0-9][a-zA-Z0-9-]{0,38}/[a-zA-Z0-9._-]+)\b", text
+    ):
+        add_slug(m.group(1))
+
+    return out
+
+
+def resolve_github_repos_for_pr_summary(
+    text: str,
+) -> tuple[list[str] | None, str | None, bool]:
+    """Returns (repos, error_ephemeral, needs_multi_picker)."""
+    allow = _pr_allowlist()
+    parsed = parse_all_repo_slugs_from_text(text)
+    if parsed:
+        if allow:
+            bad = [r for r in parsed if r not in allow]
+            if bad:
+                return None, (
+                    f"Repo(s) not allowed: {', '.join(f'`{b}`' for b in bad)}. "
+                    f"Allowed: {', '.join(allow)}."
+                ), False
+        return parsed, None, False
+    default = (os.environ.get("GITHUB_REPO") or "").strip().lower()
+    if default:
+        if allow and default not in allow:
+            return None, (
+                f"Default `GITHUB_REPO` (`{default}`) is not in `GITHUB_REPOS`: {', '.join(allow)}."
+            ), False
+        return [default], None, False
+    if len(allow) == 1:
+        return [allow[0]], None, False
+    if len(allow) > 1:
+        return None, None, True
+    return None, (
+        "No GitHub repo configured. Set `GITHUB_REPO` or `GITHUB_REPOS`, "
+        "or name repos in your command (e.g. `org/a org/b` or `repos: org/a, org/b`)."
+    ), False
 
 
 def resolve_github_repo_for_pr(text: str) -> tuple[str | None, str | None, bool]:
@@ -1008,35 +1116,17 @@ async def fetch_merged_prs_for_repo_range(
     return items
 
 
-async def post_long_ephemeral(
-    channel: str,
-    user: str,
-    title: str,
-    body: str,
-    response_url: str | None = None,
-) -> None:
-    """Slack mrkdwn sections are limited ~3000 chars; split long summaries."""
-    chunk = 2800
-    parts: list[str] = []
-    s = body.strip()
-    while s:
-        parts.append(s[:chunk])
-        s = s[chunk:]
-    if not parts:
-        parts = ["_(empty)_"]
-    blocks: list[dict] = [
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*{title}*\n_(only visible to you)_"},
-        }
-    ]
-    for p in parts:
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": p[:2900]}})
-    await notify_user_ephemeral(channel, user, title, blocks, response_url)
+def _pr_summary_title_line(repos: list[str], since_d: str, until_d: str) -> str:
+    if len(repos) == 1:
+        return f"PR summary — `{repos[0]}` ({since_d} → {until_d})"
+    shown = ", ".join(f"`{r}`" for r in repos[:5])
+    if len(repos) > 5:
+        shown += f", … (+{len(repos) - 5} more)"
+    return f"PR summary — {shown} ({since_d} → {until_d})"
 
 
 async def process_pr_summary(
-    repo: str,
+    repos: list[str],
     command_text: str,
     convo: str,
     channel: str,
@@ -1044,6 +1134,11 @@ async def process_pr_summary(
     thread_ts: str | None,
     response_url: str | None,
 ) -> None:
+    if not repos:
+        await notify_user_ephemeral(
+            channel, user, "No repositories to summarize.", None, response_url
+        )
+        return
     since_d, until_d = parse_pr_summary_time_range(command_text)
     try:
         token = await get_github_token(user)
@@ -1051,33 +1146,50 @@ async def process_pr_summary(
         await notify_user_ephemeral(channel, user, str(e), None, response_url)
         return
     try:
-        items = await fetch_merged_prs_for_repo_range(repo, since_d, until_d, token)
+        batches = await asyncio.gather(
+            *[
+                fetch_merged_prs_for_repo_range(r, since_d, until_d, token)
+                for r in repos
+            ]
+        )
     except Exception as e:
         logger.exception("GitHub PR fetch failed")
         await notify_user_ephemeral(channel, user, f"Susan error: {e}", None, response_url)
         return
-    lines: list[str] = []
-    for it in items:
-        num = it.get("number")
-        title = (it.get("title") or "").replace("\n", " ")
-        url = it.get("html_url") or ""
-        pr_meta = it.get("pull_request") or {}
-        merged = pr_meta.get("merged_at") or it.get("closed_at") or ""
-        login = (it.get("user") or {}).get("login") or "?"
-        lines.append(f"#{num} | {merged[:10] if merged else '?'} | @{login} | {title} | {url}")
-    raw_list = "\n".join(lines) if lines else "(No merged PRs in this window.)"
+    sections: list[str] = []
+    total = 0
+    for repo, items in zip(repos, batches):
+        total += len(items)
+        lines: list[str] = []
+        for it in items:
+            num = it.get("number")
+            pr_title = (it.get("title") or "").replace("\n", " ")
+            url = it.get("html_url") or ""
+            pr_meta = it.get("pull_request") or {}
+            merged = pr_meta.get("merged_at") or it.get("closed_at") or ""
+            login = (it.get("user") or {}).get("login") or "?"
+            lines.append(
+                f"#{num} | {merged[:10] if merged else '?'} | @{login} | {pr_title} | {url}"
+            )
+        raw_list = "\n".join(lines) if lines else "(No merged PRs in this window.)"
+        sections.append(
+            f"### Repository `{repo}`\nMerged PRs ({len(items)}):\n{raw_list}"
+        )
     prompt = (
-        f"Repository `{repo}`.\n"
+        f"Repositories ({len(repos)}): {', '.join(f'`{r}`' for r in repos)}\n"
         f"Merged date range (UTC, inclusive): {since_d} through {until_d}.\n"
-        f"Merged PRs ({len(items)}):\n{raw_list}\n"
+        f"Total merged PRs in range: {total}\n\n" + "\n\n".join(sections)
     )
     if (convo or "").strip():
         prompt += f"\nSlack thread context (optional):\n{convo.strip()[:6000]}\n"
     system = (
-        "You are Susan. Write a concise Slack-ready summary (mrkdwn) of merged pull requests. "
+        "You are Susan. Write a concise Slack-ready summary (mrkdwn) of merged pull requests "
+        "across one or more repositories. "
         "Use short ## headings, bullets, and link PRs as <url|#123 short title>. "
-        "Group by theme or area if obvious. Note the date range and repo at the top. "
-        "If there were zero PRs, say so and suggest widening the time range."
+        "Group by theme or area when it helps; you may group by repository or combine cross-repo themes. "
+        "State the date range and repo list at the top. "
+        "If there were zero PRs everywhere, say so and suggest widening the time range. "
+        "Do not say the summary is private, ephemeral, or “only visible to you” — the app handles visibility."
     )
     try:
         summary = await call_claude(system, prompt)
@@ -1085,11 +1197,61 @@ async def process_pr_summary(
         logger.exception("PR summary Claude failed")
         await notify_user_ephemeral(channel, user, f"Susan error: {e}", None, response_url)
         return
-    await post_long_ephemeral(
+    title = _pr_summary_title_line(repos, since_d, until_d)
+    meta = {
+        "title": title,
+        "body": summary,
+        "channel_id": channel,
+        "thread_ts": thread_ts,
+        "repos": repos,
+    }
+    draft_id = await create_user_draft(
+        user, "pr_summary", json.dumps(meta, ensure_ascii=False)
+    )
+    display_truncated = summary[:2800] + ("..." if len(summary) > 2800 else "")
+    hint = (
+        "_Use *Approve & post to channel* to publish this summary for everyone in this conversation, "
+        "or *Cancel*._"
+    )
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Susan preview — {ACTIONS['pr_summary'][0]}*\n_(Only visible to you)_\n{hint}",
+            },
+        },
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"```{display_truncated}```"}},
+        {
+            "type": "actions",
+            "block_id": f"susan_pr_summary_{channel}_{thread_ts or 'none'}",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✓ Approve & post to channel"},
+                    "style": "primary",
+                    "action_id": "approve_pr_summary",
+                    "value": draft_id,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✗ Cancel"},
+                    "action_id": "cancel_susan",
+                    "value": draft_id,
+                },
+            ],
+        },
+    ]
+    repo_hint = (
+        f"`{repos[0]}`"
+        if len(repos) == 1
+        else f"{len(repos)} repos ({', '.join(repos[:3])}{'…' if len(repos) > 3 else ''})"
+    )
+    await notify_user_ephemeral(
         channel,
         user,
-        f"PR summary — `{repo}` ({since_d} → {until_d})",
-        summary,
+        f"Susan PR summary preview ready for {repo_hint}",
+        blocks,
         response_url,
     )
 
@@ -1186,6 +1348,93 @@ async def post_github_repo_picker_ephemeral(
         )
     await notify_user_ephemeral(
         channel, user, f"Pick a repo for this {label}", blocks, response_url
+    )
+
+
+def _slack_multi_summary_selected_repos(payload: dict, pick_id: str) -> list[str]:
+    """Read multi_static_select choices from block_actions `state` (Run PR summary button)."""
+    nid = pick_id.replace("-", "")
+    blk = f"m{nid}"
+    state = payload.get("state") or {}
+    values = state.get("values") or {}
+    inner = values.get(blk) or {}
+    sel_el = inner.get("sel") or {}
+    opts = sel_el.get("selected_options") or []
+    out = [o.get("value", "").strip().lower() for o in opts if o.get("value")]
+    if out:
+        return out
+    found: list[str] = []
+    for _bid, actions in values.items():
+        if not isinstance(actions, dict):
+            continue
+        for _aid, el in actions.items():
+            if not isinstance(el, dict):
+                continue
+            if el.get("type") != "multi_static_select":
+                continue
+            for o in el.get("selected_options") or []:
+                v = (o.get("value") or "").strip().lower()
+                if v:
+                    found.append(v)
+            if found:
+                return found
+    return []
+
+
+async def post_github_repo_multi_summary_picker_ephemeral(
+    channel: str,
+    user: str,
+    text: str,
+    thread_ts: str | None,
+    response_url: str | None,
+    allow: list[str],
+) -> None:
+    """Ephemeral multi-select + confirm for PR summary when several repos are allowed."""
+    pick_id = await create_repo_pick_pending(user, channel, thread_ts, "summary", text)
+    nid = pick_id.replace("-", "")
+    blk_multi = f"m{nid}"
+    options = [
+        {"text": {"type": "plain_text", "text": r[:75]}, "value": r}
+        for r in allow[:100]
+    ]
+    blocks: list[dict] = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    "*Choose one or more repositories* for this PR summary (from `GITHUB_REPOS`). "
+                    "Pick repos below, then click *Run PR summary*."
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "block_id": blk_multi,
+            "elements": [
+                {
+                    "type": "multi_static_select",
+                    "action_id": "sel",
+                    "placeholder": {"type": "plain_text", "text": "Select repositories"},
+                    "options": options,
+                }
+            ],
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Run PR summary"},
+                    "style": "primary",
+                    "action_id": f"github_repo_multi_summary_go_{pick_id}",
+                    "value": "go",
+                }
+            ],
+        },
+    ]
+    await notify_user_ephemeral(
+        channel, user, "Select repos for PR summary", blocks, response_url
     )
 
 
@@ -1478,6 +1727,7 @@ async def process_command(
                             "type": "button",
                             "text": {"type": "plain_text", "text": "✗ Cancel"},
                             "action_id": "cancel_susan",
+                            "value": draft_id,
                         },
                     ],
                 },
@@ -1551,23 +1801,64 @@ async def resume_slash_after_oauth(row: dict) -> None:
         if action in GITHUB_ACTIONS:
             if action == "issue":
                 repo, err, need_pick = resolve_github_repo_for_issue(text)
+                if need_pick:
+                    await post_github_repo_picker_ephemeral(
+                        channel,
+                        user,
+                        action,
+                        text,
+                        thread_ts,
+                        response_url,
+                        _issue_allowlist(),
+                    )
+                    return
+                if err:
+                    await notify_user_ephemeral(channel, user, err, None, response_url)
+                    return
+                await process_command(
+                    action,
+                    convo,
+                    text,
+                    channel,
+                    user,
+                    thread_ts,
+                    response_url,
+                    github_repo=repo,
+                )
+            elif action == "pr_summary":
+                repos, err, need_pick = resolve_github_repos_for_pr_summary(text)
+                if need_pick:
+                    await post_github_repo_multi_summary_picker_ephemeral(
+                        channel,
+                        user,
+                        text,
+                        thread_ts,
+                        response_url,
+                        _pr_allowlist(),
+                    )
+                    return
+                if err:
+                    await notify_user_ephemeral(channel, user, err, None, response_url)
+                    return
+                await process_pr_summary(
+                    repos, text, convo, channel, user, thread_ts, response_url
+                )
             else:
                 repo, err, need_pick = resolve_github_repo_for_pr(text)
-            if need_pick:
-                pick_kind = "summary" if action == "pr_summary" else action
-                allow = _pr_allowlist() if action in ("pr", "pr_summary") else _issue_allowlist()
-                await post_github_repo_picker_ephemeral(
-                    channel, user, pick_kind, text, thread_ts, response_url, allow
-                )
-                return
-            if err:
-                await notify_user_ephemeral(channel, user, err, None, response_url)
-                return
-            if action == "pr_summary":
-                await process_pr_summary(
-                    repo, text, convo, channel, user, thread_ts, response_url
-                )
-            else:
+                if need_pick:
+                    await post_github_repo_picker_ephemeral(
+                        channel,
+                        user,
+                        "pr",
+                        text,
+                        thread_ts,
+                        response_url,
+                        _pr_allowlist(),
+                    )
+                    return
+                if err:
+                    await notify_user_ephemeral(channel, user, err, None, response_url)
+                    return
                 await process_command(
                     action,
                     convo,
@@ -1890,6 +2181,92 @@ def connect_slack_response_combined(user: str, channel_id: str | None = None) ->
     )
 
 
+def normalize_slack_command_text(raw: str) -> str:
+    """Strip Slack/client quirks (NBSP, ZWSP, BOM) from slash command text before matching."""
+    s = (raw or "").strip()
+    for ch in ("\u00a0", "\u200b", "\u200c", "\ufeff"):
+        s = s.replace(ch, "")
+    return s.strip()
+
+
+def is_susan_help_command(text_lower: str) -> bool:
+    t = text_lower.strip()
+    if not t:
+        return False
+    if t == "?":
+        return True
+    # Word boundary so "helpful" is not treated as help; allows "help", "help me", "commands …"
+    return bool(re.match(r"^(help|commands|usage)\b", t))
+
+
+def susan_slash_help_response() -> JSONResponse:
+    """Ephemeral Block Kit help; command keywords mirror detect_action / ACTIONS."""
+    action_lines: list[str] = []
+    for _key, (label, kws) in ACTIONS.items():
+        kw_str = ", ".join(f"`{k}`" for k in kws)
+        action_lines.append(f"• *{label}* — include one of: {kw_str}")
+    actions_body = "\n".join(action_lines)
+
+    body_how = (
+        "*How it works*\n"
+        "Run `/susan` *in a thread* so Susan reads that thread, or paste a *Slack message link* "
+        "(⋯ → Copy link) if you’re not in the thread. You’ll get a *private preview*; then *Approve*, "
+        "*Edit* (email & calendar), or *Cancel*. "
+        "For *summarize merged PRs*, approving posts the summary to the *channel* (everyone can see it)."
+    )
+    body_connect = (
+        "*Connect accounts*\n"
+        "• `/susan connect` — Google + GitHub (whatever is configured on the server)\n"
+        "• `/susan connect google` — Docs, Gmail, Calendar\n"
+        "• `/susan connect github` — issues & PRs"
+    )
+    body_what = "*What to ask*\n" + actions_body
+    body_ex = (
+        "*Examples*\n"
+        "`/susan create a doc summarizing this thread for the launch notes`\n"
+        "`/susan send email to the team thanking them for the release`\n"
+        "`/susan create invite for a 30m design review next Tuesday`\n"
+        "`/susan create issue in org/repo login button is misaligned`\n"
+        "`/susan create pr in org/repo fixing the typo we discussed`\n"
+        "`/susan summarize merged prs for org/repo last 30 days`\n"
+        "`/susan summarize merged prs for org/a org/b org/c last 14 days`"
+    )
+    body_pr = (
+        "*PR summaries — time ranges* (optional; default is last 7 days)\n"
+        "`last 14 days` · `past week` · `past month` · `since 2026-01-01` · `from 2026-01-01 to 2026-03-01`"
+    )
+    body_repo = (
+        "*Repos*\n"
+        "Name `owner/repo` in the message (several: `org/a org/b` or `repos: org/a, org/b`), "
+        "or use `GITHUB_REPO` / `GITHUB_REPOS` on the server. "
+        "For *PR summaries* with multiple entries in `GITHUB_REPOS` and no repos in the text, "
+        "Susan shows a *multi-select* — choose repos, then *Run PR summary*. "
+        "For *PRs/issues*, if several repos are allowed she still asks you to pick one."
+    )
+    blocks: list[dict] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "Susan — commands & examples", "emoji": True},
+        },
+        {"type": "section", "text": {"type": "mrkdwn", "text": body_how}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": body_connect}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": body_what}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": body_ex}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": body_pr}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": body_repo}},
+    ]
+    return JSONResponse(
+        {
+            "response_type": "ephemeral",
+            "text": "Susan — commands & examples (see the full message).",
+            "blocks": blocks,
+        }
+    )
+
+
 @app.get("/susan")
 async def slash_susan_get():
     """Slack invokes POST /susan with a form body; GET is probes/browsers only."""
@@ -1913,7 +2290,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
     if not verify_slack(body, ts, sig):
         raise HTTPException(status_code=403, detail="Invalid signature")
     form = _slack_form_fields(body)
-    text = form.get("text", "").strip()
+    text = normalize_slack_command_text(form.get("text", ""))
     channel = form.get("channel_id", "")
     user = form.get("user_id", "")
     thread_ts = form.get("thread_ts") or None
@@ -1936,12 +2313,19 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
             }
         )
 
+    if is_susan_help_command(text_lower):
+        return susan_slash_help_response()
+
     action = detect_action(text)
     if not action:
         return JSONResponse(
             {
                 "response_type": "ephemeral",
-                "text": "Susan doesn't understand that command. Try: `connect`, `create a doc`, `send email`, `create invite`, `create issue`, `create pr`, or `summarize prs …` (GitHub merged PRs for a repo + time range).",
+                "text": (
+                    "Susan doesn’t understand that command. Try `/susan help` for examples, "
+                    "or keywords like `connect`, `doc`, `email`, `invite`, `issue`, `pr`, "
+                    "or `summarize prs` (merged PRs for a repo + time range)."
+                ),
             }
         )
 
@@ -1983,23 +2367,64 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
             if action in GITHUB_ACTIONS:
                 if action == "issue":
                     repo, err, need_pick = resolve_github_repo_for_issue(text)
+                    if need_pick:
+                        await post_github_repo_picker_ephemeral(
+                            channel,
+                            user,
+                            action,
+                            text,
+                            thread_ts,
+                            response_url,
+                            _issue_allowlist(),
+                        )
+                        return
+                    if err:
+                        await notify_user_ephemeral(channel, user, err, None, response_url)
+                        return
+                    await process_command(
+                        action,
+                        convo,
+                        text,
+                        channel,
+                        user,
+                        thread_ts,
+                        response_url,
+                        github_repo=repo,
+                    )
+                elif action == "pr_summary":
+                    repos, err, need_pick = resolve_github_repos_for_pr_summary(text)
+                    if need_pick:
+                        await post_github_repo_multi_summary_picker_ephemeral(
+                            channel,
+                            user,
+                            text,
+                            thread_ts,
+                            response_url,
+                            _pr_allowlist(),
+                        )
+                        return
+                    if err:
+                        await notify_user_ephemeral(channel, user, err, None, response_url)
+                        return
+                    await process_pr_summary(
+                        repos, text, convo, channel, user, thread_ts, response_url
+                    )
                 else:
                     repo, err, need_pick = resolve_github_repo_for_pr(text)
-                if need_pick:
-                    pick_kind = "summary" if action == "pr_summary" else action
-                    allow = _pr_allowlist() if action in ("pr", "pr_summary") else _issue_allowlist()
-                    await post_github_repo_picker_ephemeral(
-                        channel, user, pick_kind, text, thread_ts, response_url, allow
-                    )
-                    return
-                if err:
-                    await notify_user_ephemeral(channel, user, err, None, response_url)
-                    return
-                if action == "pr_summary":
-                    await process_pr_summary(
-                        repo, text, convo, channel, user, thread_ts, response_url
-                    )
-                else:
+                    if need_pick:
+                        await post_github_repo_picker_ephemeral(
+                            channel,
+                            user,
+                            "pr",
+                            text,
+                            thread_ts,
+                            response_url,
+                            _pr_allowlist(),
+                        )
+                        return
+                    if err:
+                        await notify_user_ephemeral(channel, user, err, None, response_url)
+                        return
                     await process_command(
                         action,
                         convo,
@@ -2021,7 +2446,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
 
     background_tasks.add_task(run)
     ack = (
-        "Got it — Susan is fetching *merged PRs* from GitHub for that repo and date range, then drafting a summary (only visible to you)."
+        "Got it — Susan is fetching *merged PRs* from GitHub for the chosen repo(s) and date range, then drafting a summary (only visible to you)."
         if action == "pr_summary"
         else f"Got it — Susan is reading the channel and preparing a *{ACTIONS[action][0]}* preview..."
     )
@@ -2030,7 +2455,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
 
 async def handle_slack_view_submission(payload: dict, background_tasks: BackgroundTasks) -> JSONResponse:
     """Modal submit for editable email / calendar drafts."""
-    user = (payload.get("user") or {}).get("id") or ""
+    user = slack_interaction_user_id(payload)
     view = payload.get("view") or {}
     callback_id = view.get("callback_id") or ""
     values = (view.get("state") or {}).get("values") or {}
@@ -2095,6 +2520,42 @@ async def handle_slack_view_submission(payload: dict, background_tasks: Backgrou
     return JSONResponse({"response_action": "clear"})
 
 
+def slack_interaction_user_id(payload: dict) -> str:
+    """Slack user id from interaction payload (handles typical and enterprise-shaped user objects)."""
+    u = payload.get("user")
+    if not isinstance(u, dict):
+        return ""
+    uid = (u.get("id") or "").strip()
+    if uid:
+        return uid
+    eu = u.get("enterprise_user")
+    if isinstance(eu, dict):
+        return (eu.get("id") or "").strip()
+    return ""
+
+
+def slack_interaction_channel_id(payload: dict) -> str:
+    """Best-effort channel id for block_actions (ephemeral previews often omit container.channel_id)."""
+    c = payload.get("container") or {}
+    cid = (c.get("channel_id") or "").strip()
+    if cid:
+        return cid
+    ch = payload.get("channel")
+    if isinstance(ch, dict):
+        cid = (ch.get("id") or "").strip()
+        if cid:
+            return cid
+    msg = payload.get("message") or {}
+    mc = msg.get("channel")
+    if isinstance(mc, str) and mc.strip():
+        return mc.strip()
+    if isinstance(mc, dict):
+        cid = (mc.get("id") or "").strip()
+        if cid:
+            return cid
+    return ""
+
+
 @app.post("/susan/actions")
 async def handle_action(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
@@ -2122,11 +2583,19 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
         logger.warning("block_actions with empty actions payload keys=%s", list(payload.keys()))
         return JSONResponse({})
 
-    channel = (payload.get("container") or {}).get("channel_id") or (payload.get("channel") or {}).get("id") or ""
-    user = (payload.get("user") or {}).get("id") or ""
-    if not channel or not user:
-        logger.warning("block_actions missing channel or user: container=%s", payload.get("container"))
+    user = slack_interaction_user_id(payload)
+    if not user:
+        logger.warning("block_actions missing user: payload keys=%s", list(payload.keys()))
         return JSONResponse({})
+
+    channel = slack_interaction_channel_id(payload)
+    if not channel:
+        logger.warning(
+            "block_actions channel unresolved (ephemeral quirks); keys=%s container=%s message.ch=%s",
+            list(payload.keys()),
+            payload.get("container"),
+            (payload.get("message") or {}).get("channel"),
+        )
 
     action_type: str | None = None
     value = ""
@@ -2151,6 +2620,13 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                 view = build_email_modal_view(draft_id, channel, parse_email_draft(content))
             elif kind == "invite":
                 view = build_invite_modal_view(draft_id, channel, parse_invite_draft(content))
+            elif kind == "pr_summary":
+                return JSONResponse(
+                    {
+                        "response_type": "ephemeral",
+                        "text": "PR summaries don’t use the editor — use *Approve & post to channel* on the preview.",
+                    }
+                )
             else:
                 return JSONResponse(
                     {"response_type": "ephemeral", "text": "Unknown draft type."}
@@ -2168,6 +2644,76 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                     }
                 )
             return JSONResponse({})
+        if aid.startswith("github_repo_multi_summary_go_"):
+            pick_id = aid.removeprefix("github_repo_multi_summary_go_").strip()
+            if not pick_id:
+                return JSONResponse(
+                    {"response_type": "ephemeral", "text": "Invalid PR summary picker."}
+                )
+            repos_sel = _slack_multi_summary_selected_repos(payload, pick_id)
+            if not repos_sel:
+                return JSONResponse(
+                    {
+                        "response_type": "ephemeral",
+                        "text": (
+                            "Select one or more repositories in the dropdown, then click "
+                            "*Run PR summary* again."
+                        ),
+                    }
+                )
+            row = await consume_repo_pick_pending(pick_id, user)
+            if not row or row["kind"] != "summary":
+                return JSONResponse(
+                    {
+                        "response_type": "ephemeral",
+                        "text": "Picker expired. Run `/susan` again.",
+                    }
+                )
+            allow = _pr_allowlist()
+            if allow:
+                bad = [r for r in repos_sel if r not in allow]
+                if bad:
+                    return JSONResponse(
+                        {
+                            "response_type": "ephemeral",
+                            "text": (
+                                f"Repo(s) not allowed: {', '.join(f'`{b}`' for b in bad)}. "
+                                f"Allowed: {', '.join(allow)}."
+                            ),
+                        }
+                    )
+            seen: set[str] = set()
+            repos_ordered: list[str] = []
+            for r in repos_sel:
+                if r not in seen:
+                    seen.add(r)
+                    repos_ordered.append(r)
+
+            async def run_pr_summary_multi():
+                try:
+                    convo = await fetch_slack_history(
+                        row["channel_id"], row["thread_ts"], user
+                    )
+                    await process_pr_summary(
+                        repos_ordered,
+                        row["command_text"],
+                        convo,
+                        row["channel_id"],
+                        user,
+                        row["thread_ts"],
+                        None,
+                    )
+                except Exception as e:
+                    logger.exception("PR summary multi-repo follow-up failed")
+                    await post_ephemeral(channel, user, f"Susan error: {e}")
+
+            background_tasks.add_task(run_pr_summary_multi)
+            return JSONResponse(
+                {
+                    "response_type": "ephemeral",
+                    "text": f"Using {len(repos_ordered)} repo(s) — fetching merged PRs…",
+                }
+            )
         # Buttons use github_repo_pick_0, github_repo_pick_1, … (unique action_ids).
         if aid.startswith("github_repo_pick"):
             try:
@@ -2203,7 +2749,7 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                     convo = await fetch_slack_history(row["channel_id"], row["thread_ts"], user)
                     if row["kind"] == "summary":
                         await process_pr_summary(
-                            repo,
+                            [repo],
                             row["command_text"],
                             convo,
                             row["channel_id"],
@@ -2265,7 +2811,7 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                     convo = await fetch_slack_history(row["channel_id"], row["thread_ts"], user)
                     if row["kind"] == "summary":
                         await process_pr_summary(
-                            repo,
+                            [repo],
                             row["command_text"],
                             convo,
                             row["channel_id"],
@@ -2297,7 +2843,28 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
             return JSONResponse({"response_type": "ephemeral", "text": sel_msg})
 
         if aid == "cancel_susan":
-            return JSONResponse({"response_type": "ephemeral", "text": "Susan cancelled. No action taken."})
+            val = (a.get("value") or "").strip()
+
+            async def consume_cancel_draft() -> None:
+                try:
+                    if _looks_like_draft_id(val):
+                        await consume_user_draft(val, user)
+                except Exception:
+                    logger.exception("consume_user_draft on cancel")
+
+            background_tasks.add_task(consume_cancel_draft)
+
+            # Ephemeral + sync JSON often ignores invalid combos (e.g. response_type + delete_original).
+            # response_url is the documented path to delete the source message (including ephemeral).
+            ru = (payload.get("response_url") or "").strip()
+            if ru:
+                try:
+                    await post_slack_delayed_response(ru, {"delete_original": True})
+                except Exception:
+                    logger.exception("cancel: response_url delete failed; falling back to sync body")
+                    return JSONResponse({"delete_original": True})
+                return JSONResponse({})
+            return JSONResponse({"delete_original": True})
         if aid.startswith("approve_"):
             suffix = aid[len("approve_") :].strip().casefold()
             value = a.get("value") or ""
@@ -2317,6 +2884,7 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
         return JSONResponse({})
 
     async def execute():
+        notify_ch = (channel or "").strip()
         try:
             if action_type == "doc":
                 result = await create_google_doc(value, user)
@@ -2348,9 +2916,55 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                 result = await create_calendar_invite(text, user)
             elif action_type == "issue":
                 result = await create_github_issue(value, user)
-            else:
+            elif action_type == "pr_summary":
+                if not _looks_like_draft_id(value):
+                    await post_ephemeral(
+                        channel,
+                        user,
+                        "Invalid PR summary draft. Run `/susan summarize prs …` again.",
+                    )
+                    return
+                row = await consume_user_draft(value, user)
+                if not row or row.get("kind") != "pr_summary":
+                    await post_ephemeral(
+                        channel,
+                        user,
+                        "That PR summary draft expired. Run `/susan summarize prs …` again.",
+                    )
+                    return
+                try:
+                    meta = json.loads(row["content"])
+                    title = (meta.get("title") or "PR summary").strip()
+                    body = meta.get("body") or ""
+                    post_ch = (meta.get("channel_id") or channel or "").strip()
+                    th = meta.get("thread_ts")
+                    if not isinstance(th, str) or not th.strip():
+                        th = None
+                    if not post_ch:
+                        result = "Could not post — missing channel."
+                    else:
+                        notify_ch = notify_ch or post_ch
+                        await post_pr_summary_to_channel(post_ch, th, title, body)
+                        result = "Posted the PR summary to the channel."
+                except (json.JSONDecodeError, TypeError, RuntimeError) as e:
+                    logger.exception("pr_summary post failed")
+                    result = f"Susan error posting summary: {e}"
+            elif action_type == "pr":
                 result = await create_github_pr(value, user)
-            await post_ephemeral(channel, user, f"✓ Susan done: {result}")
+            else:
+                logger.error("Unhandled approve action_type=%s", action_type)
+                await post_ephemeral(
+                    channel,
+                    user,
+                    "Susan internal error: unknown approve action.",
+                )
+                return
+            if notify_ch:
+                await post_ephemeral(notify_ch, user, f"✓ Susan done: {result}")
+            else:
+                logger.warning(
+                    "No channel for approve ack user=%s action=%s", user, action_type
+                )
         except Exception as e:
             await post_ephemeral(channel, user, f"Susan error during execution: {str(e)}")
 

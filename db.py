@@ -228,7 +228,7 @@ async def create_oauth_resume_pending(
 
 
 class UserDraftPending(Base):
-    """Full Claude draft for email/invite — button payloads only store id (Slack 2000-char limit)."""
+    """Full draft for email/invite/pr_summary — button payloads only store id (Slack 2000-char limit)."""
 
     __tablename__ = "user_draft_pending"
 
