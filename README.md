@@ -21,7 +21,7 @@ A FastAPI backend powering `/susan` in Slack.
 | Variable | Description |
 |---|---|
 | `SLACK_SIGNING_SECRET` | Slack App → Basic Information |
-| `SLACK_BOT_TOKEN` | Bot User OAuth Token (`xoxb-...`) |
+| `SLACK_BOT_TOKEN` | Bot User OAuth Token (`xoxb-...`) — app needs **users:read.email** so Susan can turn `<@U…>` mentions into addresses for Gmail/Calendar |
 | `ANTHROPIC_API_KEY` | console.anthropic.com |
 | `GOOGLE_ACCESS_TOKEN` | Optional: single shared Google token (else per-user OAuth via `/susan connect google`) |
 | `DEFAULT_EMAIL_TO` | Default email recipient |

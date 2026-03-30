@@ -38,7 +38,8 @@
         "im:write",
         "mpim:history",
         "mpim:write",
-        "users:read"
+        "users:read",
+        "users:read.email"
       ]
     },
     "pkce_enabled": false

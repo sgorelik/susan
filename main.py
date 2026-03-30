@@ -635,10 +635,95 @@ async def post_message(channel: str, text: str, thread_ts: str | None = None):
         )
 
 
+EMAIL_IN_TEXT_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+
+# Slack mention: <@U123ABC> or <@U123ABC|display name> (also W for workflows in some workspaces)
+SLACK_USER_MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]+)?>")
+
+
+async def slack_users_lookup_email(user_id: str) -> str | None:
+    """Requires bot scope users:read.email; without it profile.email is empty."""
+    uid = user_id.strip().upper()
+    if not uid:
+        return None
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            "https://slack.com/api/users.info",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            params={"user": uid},
+        )
+    data = r.json()
+    if not data.get("ok"):
+        logger.warning("users.info %s: %s", uid, data.get("error"))
+        return None
+    profile = (data.get("user") or {}).get("profile") or {}
+    email = (profile.get("email") or "").strip()
+    return email or None
+
+
+async def resolve_slack_recipients_to_emails(raw: str) -> tuple[str, list[str]]:
+    """Replace <@U…> mentions and bare Slack user ids (U…/W…) in a To/Attendees line with workspace emails."""
+    if not (raw or "").strip():
+        return "", []
+    cache: dict[str, str | None] = {}
+
+    async def lookup(uid: str) -> str | None:
+        k = uid.strip().upper()
+        if k not in cache:
+            cache[k] = await slack_users_lookup_email(k)
+        return cache[k]
+
+    text = raw.strip()
+    unresolved: list[str] = []
+
+    if "<@" in text:
+        seen_full: set[str] = set()
+        pairs: list[tuple[str, str]] = []
+        for m in SLACK_USER_MENTION_RE.finditer(text):
+            full, uid = m.group(0), m.group(1)
+            if full not in seen_full:
+                seen_full.add(full)
+                pairs.append((full, uid))
+        for full, uid in pairs:
+            em = await lookup(uid)
+            if em:
+                text = text.replace(full, em)
+            else:
+                text = text.replace(full, "")
+                unresolved.append(uid.upper())
+
+    resolved_parts: list[str] = []
+    for chunk in re.split(r"[,;]", text):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        found_addrs = EMAIL_IN_TEXT_RE.findall(chunk)
+        if found_addrs:
+            resolved_parts.extend(found_addrs)
+            continue
+        uid_m = re.fullmatch(r"([uw][a-z0-9]{8,12})", chunk, re.I)
+        if uid_m:
+            uid = uid_m.group(1).upper()
+            em = await lookup(uid)
+            if em:
+                resolved_parts.append(em)
+            else:
+                unresolved.append(uid)
+            continue
+        resolved_parts.append(chunk)
+
+    out = ", ".join(resolved_parts)
+    out = re.sub(r",\s*,+", ", ", out)
+    out = re.sub(r"^\s*,\s*|\s*,\s*$", "", out)
+    out = re.sub(r"\s{2,}", " ", out).strip()
+    un = list(dict.fromkeys(unresolved))
+    return out, un
+
+
 SYSTEM_PROMPTS = {
     "doc": "You are Susan. Given a Slack conversation, write a structured document with sections: ## Summary, ## Key Decisions, ## Action Items, ## Open Questions. Be concise and professional.",
-    "email": "You are Susan. Given a Slack conversation, draft a professional email. Output ONLY this structure:\nTo: email1@domain.com, email2@domain.com\nSubject: <subject>\n\n<body>\n\nPut every recipient in To: (comma-separated). If the user names people or gives addresses in their instructions, use those addresses in To:. If they give no recipients, use To: with DEFAULT_EMAIL_TO from the server only if you know it; otherwise leave To: empty and they will set it in Slack.",
-    "invite": "You are Susan. Given a Slack conversation, draft a calendar invite. Output ONLY:\nTitle: <short title>\nAttendees: email1@..., email2@... (comma-separated)\nStart: <ISO8601 e.g. 2026-04-15T14:00:00>\nEnd: <ISO8601>\nTimeZone: <IANA e.g. America/New_York or UTC>\nDescription:\n<agenda / notes>\n\nInfer date/time from the thread. If the user names attendees or emails, use them in Attendees:.",
+    "email": "You are Susan. Given a Slack conversation, draft a professional email. Output ONLY this structure:\nTo: …\nSubject: <subject>\n\n<body>\n\nRecipients in To: must be comma-separated. Use real email@domain when known. When the thread shows Slack user ids before each message (e.g. U01ABC2XYZ3: hello), you may put those people in To: as Slack mentions: <@U01ABC2XYZ3> (one per person Susan should email). Susan will resolve mentions to workspace emails. If the user types @mentions in Slack, the thread text may already contain <@U…> — keep those in To:. If no recipients, leave To: empty.",
+    "invite": "You are Susan. Given a Slack conversation, draft a calendar invite. Output ONLY:\nTitle: <short title>\nAttendees: … (comma-separated emails and/or <@SLACK_USER_ID> mentions as in the thread)\nStart: <ISO8601 e.g. 2026-04-15T14:00:00>\nEnd: <ISO8601>\nTimeZone: <IANA e.g. America/New_York or UTC>\nDescription:\n<agenda / notes>\n\nInfer date/time from the thread. For people only identified by Slack user id in the thread (U01…), use <@U01…> in Attendees: so Susan can resolve emails.",
     "issue": "You are Susan. Given a Slack conversation, draft a GitHub issue. Output ONLY:\nTitle: <short title>\n\nDescription:\n<markdown body with context, steps to reproduce, expected vs actual, or acceptance criteria as appropriate>\n",
     "pr": "You are Susan. Given a Slack conversation about code, draft a GitHub PR. Output ONLY:\nTitle: ...\n\nDescription:\n...\n\nFiles changed:\nFor each file: one repo-relative path on its own line, then a fenced code block with the full file contents. Example:\nsrc/foo.py\n```python\n...\n```\nRepeat for more files.",
 }
@@ -1893,9 +1978,6 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
     return JSONResponse({"response_type": "ephemeral", "text": ack})
 
 
-EMAIL_IN_TEXT_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
-
-
 async def handle_slack_view_submission(payload: dict, background_tasks: BackgroundTasks) -> JSONResponse:
     """Modal submit for editable email / calendar drafts."""
     user = (payload.get("user") or {}).get("id") or ""
@@ -2270,11 +2352,23 @@ async def send_gmail(content: str, slack_user_id: str) -> str:
     to_raw = (parsed.get("to") or "").strip()
     if not to_raw:
         to_raw = (os.environ.get("DEFAULT_EMAIL_TO") or "").strip()
+    to_raw, slack_unres = await resolve_slack_recipients_to_emails(to_raw)
+    if slack_unres and not EMAIL_IN_TEXT_RE.findall(to_raw):
+        return (
+            "Email not sent — could not resolve Slack user(s) to email: "
+            f"`{', '.join(slack_unres)}`. Add the **users:read.email** bot scope and reinstall the app, "
+            "or use plain *email@domain* addresses in To:."
+        )
     if not to_raw:
         return (
             "Email not sent — add *To:* recipients in the draft (or set DEFAULT_EMAIL_TO on the server)."
         )
-    recipients = [x.strip() for x in to_raw.replace(";", ",").split(",") if x.strip()]
+    recipients = list(dict.fromkeys(EMAIL_IN_TEXT_RE.findall(to_raw)))
+    if not recipients:
+        return (
+            "Email not sent — no valid email addresses in *To:* after resolving Slack mentions. "
+            "Use emails or <@USER_ID> with **users:read.email** scope."
+        )
     subject = (parsed.get("subject") or "Email from Susan").strip()
     body = parsed.get("body") or ""
     msg = MIMEText(body)
@@ -2307,12 +2401,14 @@ async def create_calendar_invite(content: str, slack_user_id: str) -> str:
     start = p["start"]
     end = p["end"]
     desc = p["description"]
-    att_raw = p["attendees"]
-    emails: list[str] = []
-    for part in att_raw.replace(";", ",").split(","):
-        part = part.strip()
-        if part:
-            emails.extend(EMAIL_IN_TEXT_RE.findall(part))
+    att_raw, att_unres = await resolve_slack_recipients_to_emails(p["attendees"])
+    emails = list(dict.fromkeys(EMAIL_IN_TEXT_RE.findall(att_raw)))
+    if not emails and att_unres:
+        return (
+            "Calendar invite not created — could not resolve Slack user(s) to email: "
+            f"`{', '.join(att_unres)}`. Add **users:read.email** to the Slack app and reinstall, "
+            "or use plain *email@domain* in Attendees:."
+        )
     if not emails:
         fallback = (os.environ.get("DEFAULT_EMAIL_TO") or "").strip()
         if fallback:
