@@ -82,6 +82,13 @@ def normalize_google_access_token(raw: str) -> str:
     return t
 
 
+def _as_utc_aware(dt: datetime) -> datetime:
+    """SQLite returns naive datetimes for timezone=True columns; comparisons need UTC-aware."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 engine = _build_engine()
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
@@ -177,7 +184,8 @@ async def get_valid_access_token(slack_user_id: str) -> str:
             raise ValueError("Google is not connected. Type `/susan connect` in Slack to link your account.")
 
         buffer = timedelta(minutes=2)
-        if row.expires_at > datetime.now(timezone.utc) + buffer:
+        expires_at = _as_utc_aware(row.expires_at)
+        if expires_at > datetime.now(timezone.utc) + buffer:
             return normalize_google_access_token(row.access_token)
 
         new_access, expires_in = await _refresh_access_token(row.refresh_token)
