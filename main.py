@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+import uuid
 import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -517,10 +518,85 @@ SYSTEM_PROMPTS = {
     "email": "You are Susan. Given a Slack conversation, draft a professional email. Output ONLY:\nSubject: <subject>\n\n<body>",
     "invite": "You are Susan. Given a Slack conversation, draft a calendar invite. Output ONLY:\nTitle: ...\nDate/Time: ...\nDuration: ...\nAttendees: ...\nAgenda: ...\nInfer details from context.",
     "issue": "You are Susan. Given a Slack conversation, draft a GitHub issue. Output ONLY:\nTitle: <short title>\n\nDescription:\n<markdown body with context, steps to reproduce, expected vs actual, or acceptance criteria as appropriate>\n",
-    "pr": "You are Susan. Given a Slack conversation about code, draft a GitHub PR. Output ONLY:\nTitle: ...\n\nDescription:\n...\n\nFiles changed:\n<filename>\n```\n<code>\n```",
+    "pr": "You are Susan. Given a Slack conversation about code, draft a GitHub PR. Output ONLY:\nTitle: ...\n\nDescription:\n...\n\nFiles changed:\nFor each file: one repo-relative path on its own line, then a fenced code block with the full file contents. Example:\nsrc/foo.py\n```python\n...\n```\nRepeat for more files.",
 }
 
 REPO_PREFIX = "__REPO__:"
+
+
+def _sanitize_repo_rel_path(path: str) -> str | None:
+    p = path.strip().strip("/").replace("\\", "/")
+    if not p or any(seg == ".." for seg in p.split("/")):
+        return None
+    return p
+
+
+def _parse_pr_files_changed(content: str) -> list[tuple[str, str]]:
+    """Parse Claude PR output after 'Files changed:' — path line then ``` fenced code."""
+    m = re.search(r"(?is)Files changed:\s*", content)
+    if not m:
+        return []
+    s = content[m.end() :]
+    out: list[tuple[str, str]] = []
+    pos = 0
+    n = len(s)
+    while pos < n:
+        while pos < n and s[pos] in " \t\r\n":
+            pos += 1
+        if pos >= n:
+            break
+        line_end = s.find("\n", pos)
+        if line_end == -1:
+            break
+        line = s[pos:line_end].strip()
+        pos = line_end + 1
+        if not line or line.startswith("#"):
+            continue
+        path = line.strip("`").strip()
+        if not path:
+            continue
+        while pos < n and s[pos] in " \t\r\n":
+            pos += 1
+        if pos >= n or not s.startswith("```", pos):
+            break
+        pos += 3
+        nl = s.find("\n", pos)
+        if nl == -1:
+            break
+        pos = nl + 1
+        end_fence = s.find("```", pos)
+        if end_fence == -1:
+            break
+        body = s[pos:end_fence]
+        out.append((path, body))
+        pos = end_fence + 3
+    return out
+
+
+async def _github_put_file_on_branch(
+    client: httpx.AsyncClient,
+    repo: str,
+    path: str,
+    file_body: str,
+    branch: str,
+    message: str,
+    hdrs: dict,
+) -> str | None:
+    """Create or update a file on ``branch``. Returns None on success, else an error message."""
+    enc = urllib.parse.quote(path, safe="/")
+    url = f"https://api.github.com/repos/{repo}/contents/{enc}"
+    gr = await client.get(url, headers=hdrs, params={"ref": branch})
+    existing_sha = None
+    if gr.status_code == 200:
+        existing_sha = gr.json().get("sha")
+    b64 = base64.b64encode(file_body.encode("utf-8")).decode("ascii")
+    payload: dict = {"message": message, "content": b64, "branch": branch}
+    if existing_sha:
+        payload["sha"] = existing_sha
+    put_r = await client.put(url, headers=hdrs, json=payload)
+    if put_r.status_code not in (200, 201):
+        return f"Could not commit `{path}`: {put_r.status_code} {put_r.text}"
+    return None
 
 
 def _comma_repo_list(raw: str) -> list[str]:
@@ -1567,8 +1643,6 @@ async def create_github_issue(content: str, slack_user_id: str) -> str:
 
 
 async def create_github_pr(content: str, slack_user_id: str) -> str:
-    import re
-
     try:
         token = await get_github_token(slack_user_id)
     except ValueError as e:
@@ -1583,25 +1657,68 @@ async def create_github_pr(content: str, slack_user_id: str) -> str:
     desc_m = re.search(r"Description:\s*([\s\S]+?)(?=Files changed:|$)", content)
     title = title_m.group(1).strip() if title_m else "Susan: changes from Slack"
     desc = desc_m.group(1).strip() if desc_m else content
-    branch = f"susan/slack-{int(time.time())}"
+
+    parsed: list[tuple[str, str]] = []
+    for raw_path, file_body in _parse_pr_files_changed(content):
+        sp = _sanitize_repo_rel_path(raw_path)
+        if sp:
+            parsed.append((sp, file_body))
+    by_path: dict[str, str] = {}
+    for p, b in parsed:
+        by_path[p] = b
+    file_list = list(by_path.items())
+    ts = int(time.time())
+    if not file_list:
+        file_list = [
+            (
+                f"docs/susan/slack-pr-{ts}.md",
+                f"# {title}\n\n{desc}\n\n"
+                "_*(No `Files changed:` block was parsed; add real file edits in this branch or adjust the preview format.)*_\n",
+            )
+        ]
+
+    branch = f"susan/slack-{ts}-{uuid.uuid4().hex[:8]}"
     hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-    async with httpx.AsyncClient() as client:
-        sha_r = await client.get(f"https://api.github.com/repos/{repo}/git/refs/heads/{base}", headers=hdrs)
+    async with httpx.AsyncClient(timeout=120) as client:
+        sha_r = await client.get(
+            f"https://api.github.com/repos/{repo}/git/refs/heads/{base}",
+            headers=hdrs,
+        )
+        if sha_r.status_code >= 400:
+            return f"Could not read base branch `{base}` in `{repo}`: {sha_r.status_code} {sha_r.text}"
         sha = sha_r.json().get("object", {}).get("sha")
         if not sha:
             return f"Could not find base branch '{base}' in {repo}."
-        await client.post(
+        ref_r = await client.post(
             f"https://api.github.com/repos/{repo}/git/refs",
             headers=hdrs,
             json={"ref": f"refs/heads/{branch}", "sha": sha},
         )
+        if ref_r.status_code not in (201,):
+            return f"Could not create branch `{branch}`: {ref_r.status_code} {ref_r.text}"
+
+        nfiles = len(file_list)
+        for i, (path, file_body) in enumerate(file_list):
+            msg = f"susan: {title[:60]}"
+            if nfiles > 1:
+                msg = f"{msg} ({path})"
+            err = await _github_put_file_on_branch(
+                client, repo, path, file_body, branch, msg, hdrs
+            )
+            if err:
+                return err
+
         pr_r = await client.post(
             f"https://api.github.com/repos/{repo}/pulls",
             headers=hdrs,
             json={"title": title, "body": desc, "head": branch, "base": base},
         )
-    pr = pr_r.json()
-    return f"PR created: {pr.get('html_url', pr)}"
+        pr_status = pr_r.status_code
+        pr_data = pr_r.json()
+
+    if pr_status >= 400:
+        return f"PR not created ({pr_status}): {pr_data}"
+    return f"PR created: {pr_data.get('html_url', pr_data)}"
 
 
 @app.get("/")
