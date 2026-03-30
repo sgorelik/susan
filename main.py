@@ -21,6 +21,7 @@ from db import (
     get_valid_access_token,
     init_db,
     upsert_tokens,
+    user_has_google_tokens,
 )
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -117,6 +118,8 @@ ACTIONS = {
     "invite": ("create invite", ["invite", "calendar", "meeting", "event"]),
     "pr": ("create pr", ["pr", "pull request", "github"]),
 }
+
+GOOGLE_ACTIONS = frozenset({"doc", "email", "invite"})
 
 
 def verify_slack(req_body: bytes, timestamp: str, signature: str) -> bool:
@@ -469,6 +472,55 @@ async def auth_google_callback(code: str, state: str):
     )
 
 
+def connect_google_slack_response(user: str, intro: str | None = None) -> JSONResponse:
+    """Ephemeral message + button to open Google OAuth (same as /susan connect)."""
+    base = public_base_url()
+    if not base:
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": "Set PUBLIC_BASE_URL (e.g. https://your-app.up.railway.app) or set GOOGLE_REDIRECT_URI to https://…/auth/google/callback so the Connect link works.",
+            }
+        )
+    try:
+        _ = os.environ["GOOGLE_CLIENT_ID"]
+        _ = os.environ["GOOGLE_CLIENT_SECRET"]
+        _ = os.environ["GOOGLE_REDIRECT_URI"]
+    except KeyError:
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": "Google OAuth is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI.",
+            }
+        )
+    intro = intro or "Connect your Google account so Susan uses *your* Docs, Gmail, and Calendar."
+    state = make_oauth_state(user)
+    auth_path = f"{base}/auth/google?state={urllib.parse.quote(state, safe='')}"
+    blocks = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": intro},
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Connect Google Account"},
+                    "url": auth_path,
+                }
+            ],
+        },
+    ]
+    return JSONResponse(
+        {
+            "response_type": "ephemeral",
+            "text": "Google connection (only visible to you).",
+            "blocks": blocks,
+        }
+    )
+
+
 @app.get("/susan")
 async def slash_susan_get():
     """Slack invokes POST /susan with a form body; GET is probes/browsers only."""
@@ -501,53 +553,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
     logger.info("Slack slash verified: user=%s channel=%s text=%r", user, channel, text[:120] if text else "")
 
     if text_lower == "connect" or text_lower.startswith("connect "):
-        base = public_base_url()
-        if not base:
-            return JSONResponse(
-                {
-                    "response_type": "ephemeral",
-                    "text": "Set PUBLIC_BASE_URL (e.g. https://your-app.up.railway.app) or set GOOGLE_REDIRECT_URI to https://…/auth/google/callback so the Connect link works.",
-                }
-            )
-        try:
-            _ = os.environ["GOOGLE_CLIENT_ID"]
-            _ = os.environ["GOOGLE_CLIENT_SECRET"]
-            _ = os.environ["GOOGLE_REDIRECT_URI"]
-        except KeyError:
-            return JSONResponse(
-                {
-                    "response_type": "ephemeral",
-                    "text": "Google OAuth is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI.",
-                }
-            )
-        state = make_oauth_state(user)
-        auth_path = f"{base}/auth/google?state={urllib.parse.quote(state, safe='')}"
-        blocks = [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "Connect your Google account so Susan uses *your* Docs, Gmail, and Calendar.",
-                },
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Connect Google Account"},
-                        "url": auth_path,
-                    }
-                ],
-            },
-        ]
-        return JSONResponse(
-            {
-                "response_type": "ephemeral",
-                "text": "Connect your Google account (only visible to you).",
-                "blocks": blocks,
-            }
-        )
+        return connect_google_slack_response(user)
 
     action = detect_action(text)
     if not action:
@@ -556,6 +562,12 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                 "response_type": "ephemeral",
                 "text": "Susan doesn't understand that command. Try: `connect`, `create a doc`, `send email`, `create invite`, or `create pr`.",
             }
+        )
+
+    if action in GOOGLE_ACTIONS and not await user_has_google_tokens(user):
+        return connect_google_slack_response(
+            user,
+            intro="*Google isn’t connected yet.* Use the button to link your account, then run your command again (or use `/susan connect` anytime).",
         )
 
     async def run():

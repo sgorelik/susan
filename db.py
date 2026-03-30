@@ -173,6 +173,15 @@ async def upsert_tokens(slack_user_id: str, access_token: str, refresh_token: st
         await session.commit()
 
 
+async def user_has_google_tokens(slack_user_id: str) -> bool:
+    """True if env fallback or a DB row exists for this Slack user."""
+    if normalize_google_access_token(os.environ.get("GOOGLE_ACCESS_TOKEN", "")):
+        return True
+    async with SessionLocal() as session:
+        row = await session.get(GoogleToken, slack_user_id)
+        return row is not None
+
+
 async def get_valid_access_token(slack_user_id: str) -> str:
     """Return a valid Google access token for this Slack user, refreshing if needed."""
     env_fallback = normalize_google_access_token(os.environ.get("GOOGLE_ACCESS_TOKEN", ""))
