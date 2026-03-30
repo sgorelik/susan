@@ -6,6 +6,11 @@
     "long_description": "Susan is your AI Chief of Staff. Type /susan in any channel or thread and she will read the conversation, generate a preview, and execute actions on your behalf — including creating Google Docs, sending emails via Gmail, creating Google Calendar invites, and opening GitHub PRs. All actions require your approval before executing."
   },
   "features": {
+    "app_home": {
+      "home_tab_enabled": false,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
+    },
     "bot_user": {
       "display_name": "Susan",
       "always_online": true
@@ -15,7 +20,7 @@
         "command": "/susan",
         "url": "https://susan-production.up.railway.app/susan",
         "description": "Ask Susan to act on this channel or thread",
-        "usage_hint": "connect | create a doc [instructions] | send email [instructions] | create invite [instructions] | create pr [instructions]",
+        "usage_hint": "connect | create a doc … (paste message link for thread context) | send email … | create invite … | create pr …",
         "should_escape": false
       }
     ]
@@ -27,6 +32,7 @@
         "chat:write",
         "chat:write.public",
         "channels:history",
+        "channels:join",
         "groups:history",
         "im:history",
         "mpim:history",

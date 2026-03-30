@@ -2,10 +2,18 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
+import re
 import time
 import urllib.parse
 from contextlib import asynccontextmanager
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env before db (engine) or os.environ reads — uvicorn does not load .env by itself.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 import httpx
 from db import (
@@ -17,8 +25,8 @@ from db import (
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
-SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
+SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"].strip()
+SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"].strip()
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
@@ -30,7 +38,7 @@ GOOGLE_SCOPES = [
 
 
 def oauth_state_secret() -> str:
-    return os.environ.get("OAUTH_STATE_SECRET", os.environ["SLACK_SIGNING_SECRET"])
+    return os.environ.get("OAUTH_STATE_SECRET", SLACK_SIGNING_SECRET).strip()
 
 
 def make_oauth_state(slack_user_id: str) -> str:
@@ -82,11 +90,26 @@ def google_authorize_url(state: str) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    susan_log = logging.getLogger("susan")
+    susan_log.setLevel(logging.INFO)
+    if not susan_log.handlers:
+        _h = logging.StreamHandler()
+        _h.setFormatter(logging.Formatter("%(levelname)s [susan] %(message)s"))
+        susan_log.addHandler(_h)
     await init_db()
     yield
 
 
 app = FastAPI(lifespan=lifespan)
+
+logger = logging.getLogger("susan")
+
+
+def _slack_form_fields(body: bytes) -> dict[str, str]:
+    """Parse application/x-www-form-urlencoded body into single string per key (Slack sends one value each)."""
+    q = urllib.parse.parse_qs(body.decode("utf-8"), keep_blank_values=True, strict_parsing=False)
+    return {k: v[0] for k, v in q.items() if v}
+
 
 ACTIONS = {
     "doc": ("create a doc", ["doc", "document", "notes"]),
@@ -97,13 +120,38 @@ ACTIONS = {
 
 
 def verify_slack(req_body: bytes, timestamp: str, signature: str) -> bool:
-    if abs(time.time() - int(timestamp)) > 60 * 5:
+    if not timestamp or not signature:
+        logger.warning("Slack verify: missing X-Slack-Request-Timestamp or X-Slack-Signature")
         return False
-    sig_base = f"v0:{timestamp}:{req_body.decode()}"
+    try:
+        ts = int(timestamp)
+    except ValueError:
+        logger.warning("Slack verify: timestamp is not an integer")
+        return False
+    now = time.time()
+    if abs(now - ts) > 60 * 5:
+        logger.warning(
+            "Slack verify: request too old or clock skew (server_time=%s slack_ts=%s)",
+            int(now),
+            ts,
+        )
+        return False
+    try:
+        raw = req_body.decode("utf-8")
+    except UnicodeDecodeError:
+        logger.warning("Slack verify: body is not valid UTF-8")
+        return False
+    sig_base = f"v0:{timestamp}:{raw}"
     expected = "v0=" + hmac.new(
         SLACK_SIGNING_SECRET.encode(), sig_base.encode(), hashlib.sha256
     ).hexdigest()
-    return hmac.compare_digest(expected, signature)
+    if not hmac.compare_digest(expected, signature):
+        logger.warning(
+            "Slack verify: HMAC mismatch — copy Signing Secret from api.slack.com → "
+            "Your App → Basic Information (must be the same app that owns /susan)"
+        )
+        return False
+    return True
 
 
 def detect_action(text: str) -> str | None:
@@ -114,7 +162,79 @@ def detect_action(text: str) -> str | None:
     return None
 
 
-async def fetch_slack_history(channel: str, thread_ts: str | None) -> str:
+def extract_slack_archives_link(text: str) -> tuple[str | None, str | None]:
+    """Parse (channel_id, message_ts) from a message permalink (⋯ → Copy link).
+
+    Use when /susan is run in the main channel (no thread_ts): pass any message
+    in the thread as a link so we can call conversations.replies.
+    """
+    m = re.search(
+        r"(?:https?://)?(?:[\w-]+\.)?slack\.com/archives/([CGD][A-Z0-9]+)/p([0-9]+)(?:\?|[\s>]|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if not m:
+        return None, None
+    channel_id = m.group(1).upper()
+    digits = m.group(2)
+    if len(digits) < 10:
+        return None, None
+    ts = f"{digits[:10]}.{digits[10:]}" if len(digits) > 10 else digits
+    return channel_id, ts
+
+
+def _is_public_slack_channel(channel_id: str) -> bool:
+    """conversations.join is only valid for public channels (ids start with C)."""
+    return bool(channel_id) and channel_id.upper().startswith("C")
+
+
+def _history_error_hint(channel_id: str) -> str:
+    c = (channel_id or "").upper()
+    if c.startswith("D"):
+        return (
+            "For a *group DM*: add **Susan** to the conversation (⋮ or header → *Add people* / include the app like a member). "
+            "For *1:1* with the bot, open **Messages** → Susan. "
+            "The app needs `im:history` + `mpim:history` (and reinstall after scope changes)."
+        )
+    if c.startswith("G"):
+        return (
+            "Private channel or *multi-person DM* (often `G…`): add **Susan** under channel details → *Integrations* or participants. "
+            "Use `groups:history` / `mpim:history` on the app as appropriate."
+        )
+    return (
+        "This is a *public channel*: the bot must be a member. In the channel, run **`/invite @Susan`** "
+        "(or *Channel details → Integrations → Add apps*). That works **without** the `channels:join` scope. "
+        "Optional: add Bot scope **`channels:join`** in api.slack.com → *reinstall app* so Susan can auto-join public channels. "
+        "For a thread, paste a message permalink (⋯ → Copy link) in your `/susan` command."
+    )
+
+
+async def _try_slack_join_channel(channel: str) -> None:
+    """Join public channels so history + ephemerals work (requires channels:join scope)."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            "https://slack.com/api/conversations.join",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            json={"channel": channel},
+        )
+    data = r.json()
+    if data.get("ok"):
+        logger.info("Slack: joined channel %s", channel)
+        return
+    err = data.get("error", "")
+    if err == "already_in_channel":
+        return
+    if err == "missing_scope" and "channels:join" in str(data.get("needed", "")):
+        logger.error(
+            "Slack: token is missing channels:join. In api.slack.com → Your App → "
+            "OAuth & Permissions → Scopes → Bot Token Scopes → add channels:join → "
+            "Save, then reinstall the app to your workspace (Install to Workspace)."
+        )
+    else:
+        logger.warning("Slack: conversations.join failed: %s", data)
+
+
+async def _fetch_slack_history_once(channel: str, thread_ts: str | None) -> dict:
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
     params = {"channel": channel, "limit": 50}
     endpoint = (
@@ -124,9 +244,29 @@ async def fetch_slack_history(channel: str, thread_ts: str | None) -> str:
     )
     if thread_ts:
         params["ts"] = thread_ts
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(endpoint, headers=headers, params=params)
-    data = r.json()
+    return r.json()
+
+
+async def fetch_slack_history(channel: str, thread_ts: str | None) -> str:
+    data = await _fetch_slack_history_once(channel, thread_ts)
+    if not data.get("ok"):
+        err = data.get("error", "unknown_error")
+        if err in ("channel_not_found", "not_in_channel") and _is_public_slack_channel(channel):
+            await _try_slack_join_channel(channel)
+            data = await _fetch_slack_history_once(channel, thread_ts)
+        elif err in ("channel_not_found", "not_in_channel"):
+            logger.info(
+                "Slack: skip conversations.join (DM/private/mpim — not a public C… channel): %s",
+                channel[:12] if channel else "",
+            )
+    if not data.get("ok"):
+        err = data.get("error", "unknown_error")
+        logger.error("Slack conversations API failed: %s full=%s", err, data)
+        raise RuntimeError(
+            f"Could not load channel history ({err}). {_history_error_hint(channel)}"
+        )
     msgs = data.get("messages", [])
     lines = []
     for m in reversed(msgs):
@@ -137,7 +277,7 @@ async def fetch_slack_history(channel: str, thread_ts: str | None) -> str:
 
 
 async def call_claude(system: str, user: str) -> str:
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -153,19 +293,62 @@ async def call_claude(system: str, user: str) -> str:
             },
         )
     data = r.json()
-    return data["content"][0]["text"]
+    if r.status_code >= 400:
+        logger.error("Anthropic HTTP %s: %s", r.status_code, data)
+        raise RuntimeError(data.get("error", {}).get("message", r.text) if isinstance(data.get("error"), dict) else str(data))
+    if data.get("type") == "error":
+        logger.error("Anthropic error payload: %s", data)
+        raise RuntimeError(str(data.get("error", data)))
+    content = data.get("content") or []
+    if not content or content[0].get("type") != "text":
+        logger.error("Unexpected Anthropic response: %s", data)
+        raise RuntimeError("Unexpected response from Claude API")
+    return content[0]["text"]
 
 
 async def post_ephemeral(channel: str, user: str, text: str, blocks: list | None = None):
     payload = {"channel": channel, "user": user, "text": text}
     if blocks:
         payload["blocks"] = blocks
-    async with httpx.AsyncClient() as client:
-        await client.post(
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
             "https://slack.com/api/chat.postEphemeral",
             headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
             json=payload,
         )
+    data = r.json()
+    if not data.get("ok"):
+        logger.error("chat.postEphemeral failed: %s", data)
+        raise RuntimeError(data.get("error", "chat.postEphemeral failed"))
+
+
+async def post_slack_delayed_response(response_url: str, payload: dict) -> None:
+    """Follow-up message for slash commands (same payload shape as slash JSON response)."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(response_url, json=payload)
+    if r.status_code >= 400:
+        logger.error("response_url POST failed: %s %s", r.status_code, r.text)
+        raise RuntimeError(f"response_url failed: HTTP {r.status_code}")
+
+
+async def notify_user_ephemeral(
+    channel: str,
+    user: str,
+    text: str,
+    blocks: list | None = None,
+    response_url: str | None = None,
+) -> None:
+    """Prefer chat.postEphemeral; if channel is not visible to the bot, use slash response_url."""
+    try:
+        await post_ephemeral(channel, user, text, blocks)
+    except Exception as e:
+        logger.warning("post_ephemeral failed (%s), trying response_url", e)
+        if not response_url:
+            raise
+        payload: dict = {"response_type": "ephemeral", "text": text}
+        if blocks:
+            payload["blocks"] = blocks
+        await post_slack_delayed_response(response_url, payload)
 
 
 async def post_message(channel: str, text: str, thread_ts: str | None = None):
@@ -189,7 +372,13 @@ SYSTEM_PROMPTS = {
 
 
 async def process_command(
-    action: str, convo: str, instructions: str, channel: str, user: str, thread_ts: str | None
+    action: str,
+    convo: str,
+    instructions: str,
+    channel: str,
+    user: str,
+    thread_ts: str | None,
+    response_url: str | None = None,
 ):
     try:
         preview = await call_claude(
@@ -225,9 +414,15 @@ async def process_command(
                 ],
             },
         ]
-        await post_ephemeral(channel, user, f"Susan preview ready for: {ACTIONS[action][0]}", blocks)
+        await notify_user_ephemeral(
+            channel, user, f"Susan preview ready for: {ACTIONS[action][0]}", blocks, response_url
+        )
     except Exception as e:
-        await post_ephemeral(channel, user, f"Susan error: {str(e)}")
+        logger.exception("process_command failed")
+        try:
+            await notify_user_ephemeral(channel, user, f"Susan error: {str(e)}", None, response_url)
+        except Exception as e2:
+            logger.error("Could not notify user in Slack: %s", e2)
 
 
 @app.get("/auth/google")
@@ -274,19 +469,36 @@ async def auth_google_callback(code: str, state: str):
     )
 
 
+@app.get("/susan")
+async def slash_susan_get():
+    """Slack invokes POST /susan with a form body; GET is probes/browsers only."""
+    return {
+        "message": "This URL is for Slack slash commands only (POST from Slack). Use /susan in Slack.",
+        "method": "POST",
+    }
+
+
 @app.post("/susan")
 async def slash_susan(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
     ts = request.headers.get("X-Slack-Request-Timestamp", "")
     sig = request.headers.get("X-Slack-Signature", "")
+    logger.info(
+        "Slack POST /susan: %d bytes, X-Slack-Signature=%s, X-Slack-Request-Timestamp=%s",
+        len(body),
+        "set" if sig else "MISSING",
+        "set" if ts else "MISSING",
+    )
     if not verify_slack(body, ts, sig):
         raise HTTPException(status_code=403, detail="Invalid signature")
-    form = await request.form()
+    form = _slack_form_fields(body)
     text = form.get("text", "").strip()
     channel = form.get("channel_id", "")
     user = form.get("user_id", "")
-    thread_ts = form.get("thread_ts")
+    thread_ts = form.get("thread_ts") or None
+    response_url = form.get("response_url") or None
     text_lower = text.lower()
+    logger.info("Slack slash verified: user=%s channel=%s text=%r", user, channel, text[:120] if text else "")
 
     if text_lower == "connect" or text_lower.startswith("connect "):
         base = public_base_url()
@@ -347,8 +559,25 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
         )
 
     async def run():
-        convo = await fetch_slack_history(channel, thread_ts)
-        await process_command(action, convo, text, channel, user, thread_ts)
+        try:
+            link_ch, link_ts = extract_slack_archives_link(text)
+            hist_channel = link_ch or channel
+            hist_thread_ts = thread_ts or link_ts
+            logger.info(
+                "Susan background: fetch history channel=%s thread_ts=%s (from_link channel=%s ts=%s)",
+                hist_channel,
+                hist_thread_ts,
+                link_ch,
+                link_ts,
+            )
+            convo = await fetch_slack_history(hist_channel, hist_thread_ts)
+            await process_command(action, convo, text, channel, user, thread_ts, response_url)
+        except Exception as e:
+            logger.exception("Susan background task failed: %s", e)
+            try:
+                await notify_user_ephemeral(channel, user, f"Susan error: {str(e)}", None, response_url)
+            except Exception as e2:
+                logger.error("Could not notify user in Slack: %s", e2)
 
     background_tasks.add_task(run)
     return JSONResponse(
@@ -366,8 +595,12 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
     sig = request.headers.get("X-Slack-Signature", "")
     if not verify_slack(body, ts, sig):
         raise HTTPException(status_code=403, detail="Invalid signature")
-    form = await request.form()
-    payload = json.loads(urllib.parse.unquote(form.get("payload", "{}")))
+    form = _slack_form_fields(body)
+    payload_raw = form.get("payload", "{}")
+    try:
+        payload = json.loads(payload_raw)
+    except json.JSONDecodeError:
+        payload = json.loads(urllib.parse.unquote(payload_raw))
     action_id = payload["actions"][0]["action_id"]
     value = payload["actions"][0].get("value", "")
     channel = payload["container"]["channel_id"]
@@ -504,6 +737,12 @@ async def create_github_pr(content: str) -> str:
         )
     pr = pr_r.json()
     return f"PR created: {pr.get('html_url', pr)}"
+
+
+@app.get("/")
+async def root():
+    """Avoid 404 noise from bots and uptime probes hitting the base URL."""
+    return {"service": "susan", "docs": "POST /susan (Slack slash), GET /health"}
 
 
 @app.get("/health")
