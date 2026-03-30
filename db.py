@@ -184,6 +184,71 @@ async def consume_repo_pick_pending(pick_id: str, slack_user_id: str) -> dict | 
         return out
 
 
+class OauthResumePending(Base):
+    """Remembers a /susan command so we can continue it after Google/GitHub OAuth."""
+
+    __tablename__ = "oauth_resume_pending"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    slack_user_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    command_text: Mapped[str] = mapped_column(Text, nullable=False)
+    channel_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    thread_ts: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+async def create_oauth_resume_pending(
+    slack_user_id: str,
+    channel_id: str,
+    thread_ts: str | None,
+    command_text: str,
+    action: str,
+    provider: str,
+) -> str:
+    rid = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        session.add(
+            OauthResumePending(
+                id=rid,
+                slack_user_id=slack_user_id,
+                provider=provider,
+                action=action,
+                command_text=command_text,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                created_at=now,
+            )
+        )
+        await session.commit()
+    return rid
+
+
+async def consume_oauth_resume_pending(
+    resume_id: str, slack_user_id: str, provider: str
+) -> dict | None:
+    async with SessionLocal() as session:
+        row = await session.get(OauthResumePending, resume_id)
+        if not row or row.slack_user_id != slack_user_id or row.provider != provider:
+            return None
+        if datetime.now(timezone.utc) - row.created_at > timedelta(hours=24):
+            await session.delete(row)
+            await session.commit()
+            return None
+        out = {
+            "slack_user_id": row.slack_user_id,
+            "action": row.action,
+            "command_text": row.command_text,
+            "channel_id": row.channel_id,
+            "thread_ts": row.thread_ts,
+        }
+        await session.delete(row)
+        await session.commit()
+        return out
+
+
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
 

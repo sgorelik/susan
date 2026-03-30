@@ -17,7 +17,9 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 import httpx
 from db import (
+    consume_oauth_resume_pending,
     consume_repo_pick_pending,
+    create_oauth_resume_pending,
     create_repo_pick_pending,
     exchange_code_for_tokens,
     exchange_github_code_for_token,
@@ -47,19 +49,33 @@ def oauth_state_secret() -> str:
     return os.environ.get("OAUTH_STATE_SECRET", SLACK_SIGNING_SECRET).strip()
 
 
-def make_oauth_state(slack_user_id: str, channel_id: str | None = None) -> str:
-    """Signed state for OAuth (Google/GitHub). Optional channel_id enables Slack follow-up after connect."""
-    exp = int(time.time()) + 3600
+def oauth_state_ttl_seconds() -> int:
+    """How long the OAuth link stays valid (default 24h). Override with OAUTH_STATE_TTL_SECONDS."""
+    try:
+        return max(300, int(os.environ.get("OAUTH_STATE_TTL_SECONDS", "86400")))
+    except ValueError:
+        return 86400
+
+
+def make_oauth_state(
+    slack_user_id: str,
+    channel_id: str | None = None,
+    resume_id: str | None = None,
+) -> str:
+    """Signed state for OAuth (Google/GitHub). Optional resume_id continues a /susan command after connect."""
+    exp = int(time.time()) + oauth_state_ttl_seconds()
     payload: dict = {"u": slack_user_id, "exp": exp}
     if channel_id:
         payload["ch"] = channel_id
+    if resume_id:
+        payload["rid"] = resume_id
     body = json.dumps(payload, separators=(",", ":")).encode()
     sig = hmac.new(oauth_state_secret().encode(), body, hashlib.sha256).digest()
     return base64.urlsafe_b64encode(body + sig).decode()
 
 
-def parse_oauth_state(state: str) -> tuple[str, str | None] | None:
-    """Returns (slack_user_id, channel_id_or_none). channel_id is absent in older signed links."""
+def parse_oauth_state(state: str) -> tuple[str, str | None, str | None] | None:
+    """Returns (slack_user_id, channel_id_or_none, resume_id_or_none)."""
     try:
         raw = base64.urlsafe_b64decode(state.encode())
         body, sig = raw[:-32], raw[-32:]
@@ -73,7 +89,10 @@ def parse_oauth_state(state: str) -> tuple[str, str | None] | None:
         ch = payload.get("ch")
         if not isinstance(ch, str) or not ch.strip():
             ch = None
-        return uid, ch
+        rid = payload.get("rid")
+        if not isinstance(rid, str) or not rid.strip():
+            rid = None
+        return uid, ch, rid
     except Exception:
         return None
 
@@ -770,6 +789,67 @@ async def process_command(
             logger.error("Could not notify user in Slack: %s", e2)
 
 
+async def resume_slash_after_oauth(row: dict) -> None:
+    """Re-run the same logic as the /susan background task after OAuth completes."""
+    text = row["command_text"]
+    channel = row["channel_id"]
+    user = row["slack_user_id"]
+    thread_ts = row["thread_ts"]
+    action = row["action"]
+    response_url = None
+    try:
+        await post_ephemeral(
+            channel,
+            user,
+            f"Resuming your *{ACTIONS[action][0]}* request after sign-in…",
+        )
+    except Exception as e:
+        logger.warning("resume_slash_after_oauth intro ephemeral: %s", e)
+    try:
+        link_ch, link_ts = extract_slack_archives_link(text)
+        hist_channel = link_ch or channel
+        hist_thread_ts = thread_ts or link_ts
+        convo = await fetch_slack_history(hist_channel, hist_thread_ts, user)
+        if action in GITHUB_ACTIONS:
+            if action == "pr":
+                repo, err, need_pick = resolve_github_repo_for_pr(text)
+            else:
+                repo, err, need_pick = resolve_github_repo_for_issue(text)
+            if need_pick:
+                allow = _pr_allowlist() if action == "pr" else _issue_allowlist()
+                await post_github_repo_picker_ephemeral(
+                    channel, user, action, text, thread_ts, response_url, allow
+                )
+                return
+            if err:
+                await notify_user_ephemeral(channel, user, err, None, response_url)
+                return
+            await process_command(
+                action,
+                convo,
+                text,
+                channel,
+                user,
+                thread_ts,
+                response_url,
+                github_repo=repo,
+            )
+        else:
+            await process_command(action, convo, text, channel, user, thread_ts, response_url)
+    except Exception as e:
+        logger.exception("resume_slash_after_oauth failed")
+        try:
+            await notify_user_ephemeral(
+                channel,
+                user,
+                f"Could not resume your command after sign-in: {e}",
+                None,
+                response_url,
+            )
+        except Exception as e2:
+            logger.error("resume_slash_after_oauth notify: %s", e2)
+
+
 @app.get("/auth/google")
 async def auth_google_start(state: str):
     parsed = parse_oauth_state(state)
@@ -785,15 +865,18 @@ async def auth_google_start(state: str):
 
 
 @app.get("/auth/google/callback")
-async def auth_google_callback(code: str, state: str):
+async def auth_google_callback(
+    code: str, state: str, background_tasks: BackgroundTasks
+):
     parsed = parse_oauth_state(state)
     if not parsed:
         return HTMLResponse(
             "<html><body><p>Invalid or expired session. Close this window and run <code>/susan connect</code> again in Slack.</p></body></html>",
             status_code=400,
         )
-    uid, slack_channel_id = parsed
+    uid, slack_channel_id, resume_id = parsed
     redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI", "")
+    resumed = False
     try:
         data = await exchange_code_for_tokens(code, redirect_uri)
         access = data["access_token"]
@@ -810,6 +893,11 @@ async def auth_google_callback(code: str, state: str):
             uid,
             slack_channel_id or "(none)",
         )
+        if resume_id:
+            row = await consume_oauth_resume_pending(resume_id, uid, "google")
+            if row:
+                background_tasks.add_task(resume_slash_after_oauth, row)
+                resumed = True
     except Exception as e:
         logger.exception("Google OAuth callback failed for user=%s", uid)
         return HTMLResponse(
@@ -819,17 +907,26 @@ async def auth_google_callback(code: str, state: str):
 
     if slack_channel_id:
         try:
+            if resumed:
+                msg = "✓ *Google connected.* Continuing your previous `/susan` command in this channel…"
+            else:
+                msg = "✓ *Google connected.* You can use `/susan` anytime."
             await post_ephemeral(
                 slack_channel_id,
                 uid,
-                "✓ *Google connected.* Run your `/susan` command again (e.g. *create a doc*) so Susan can use your account.",
+                msg,
             )
             logger.info("Posted Google connect confirmation to Slack channel=%s user=%s", slack_channel_id, uid)
         except Exception as e:
             logger.warning("Could not post Slack confirmation after Google OAuth: %s", e)
 
+    html_note = (
+        "Susan is continuing your request in Slack."
+        if resumed
+        else "You can close this tab."
+    )
     return HTMLResponse(
-        "<html><body><p><strong>Google connected.</strong> You can close this tab. Check Slack for a confirmation message in the channel where you started.</p></body></html>"
+        f"<html><body><p><strong>Google connected.</strong> {html_note}</p></body></html>"
     )
 
 
@@ -848,15 +945,18 @@ async def auth_github_start(state: str):
 
 
 @app.get("/auth/github/callback")
-async def auth_github_callback(code: str, state: str):
+async def auth_github_callback(
+    code: str, state: str, background_tasks: BackgroundTasks
+):
     parsed = parse_oauth_state(state)
     if not parsed:
         return HTMLResponse(
             "<html><body><p>Invalid or expired session. Close this window and run <code>/susan connect github</code> again in Slack.</p></body></html>",
             status_code=400,
         )
-    uid, slack_channel_id = parsed
+    uid, slack_channel_id, resume_id = parsed
     redirect_uri = os.environ.get("GITHUB_REDIRECT_URI", "")
+    resumed = False
     try:
         data = await exchange_github_code_for_token(code, redirect_uri)
         access = data.get("access_token")
@@ -871,6 +971,11 @@ async def auth_github_callback(code: str, state: str):
             uid,
             slack_channel_id or "(none)",
         )
+        if resume_id:
+            row = await consume_oauth_resume_pending(resume_id, uid, "github")
+            if row:
+                background_tasks.add_task(resume_slash_after_oauth, row)
+                resumed = True
     except Exception as e:
         logger.exception("GitHub OAuth callback failed for user=%s", uid)
         return HTMLResponse(
@@ -880,24 +985,37 @@ async def auth_github_callback(code: str, state: str):
 
     if slack_channel_id:
         try:
+            if resumed:
+                msg = "✓ *GitHub connected.* Continuing your previous `/susan` command in this channel…"
+            else:
+                msg = "✓ *GitHub connected.* You can use `/susan` anytime."
             await post_ephemeral(
                 slack_channel_id,
                 uid,
-                "✓ *GitHub connected.* Run your `/susan` command again (e.g. *create pr*) so Susan can use your GitHub account.",
+                msg,
             )
             logger.info("Posted GitHub connect confirmation to Slack channel=%s user=%s", slack_channel_id, uid)
         except Exception as e:
             logger.warning("Could not post Slack confirmation after GitHub OAuth: %s", e)
 
+    html_note = (
+        "Susan is continuing your request in Slack."
+        if resumed
+        else "You can close this tab."
+    )
     return HTMLResponse(
-        "<html><body><p><strong>GitHub connected.</strong> You can close this tab. Check Slack for a confirmation message in the channel where you started.</p></body></html>"
+        f"<html><body><p><strong>GitHub connected.</strong> {html_note}</p></body></html>"
     )
 
 
 def connect_google_slack_response(
-    user: str, intro: str | None = None, channel_id: str | None = None
+    user: str,
+    intro: str | None = None,
+    channel_id: str | None = None,
+    resume_id: str | None = None,
 ) -> JSONResponse:
-    """Ephemeral message with link to Google OAuth. Pass channel_id so we can notify Slack after connect."""
+    """Ephemeral message with link to Google OAuth. Pass channel_id so we can notify Slack after connect.
+    Optional resume_id continues the same /susan command after OAuth (embedded in signed state)."""
     base = public_base_url()
     if not base:
         return JSONResponse(
@@ -918,7 +1036,9 @@ def connect_google_slack_response(
             }
         )
     intro = intro or "Connect your Google account so Susan uses *your* Docs, Gmail, and Calendar."
-    state = make_oauth_state(user, channel_id=channel_id or None)
+    state = make_oauth_state(
+        user, channel_id=channel_id or None, resume_id=resume_id
+    )
     auth_path = f"{base}/auth/google?state={urllib.parse.quote(state, safe='')}"
     # Use a mrkdwn link, not a Block Kit url button: Slack often treats url-less or
     # invalid-url buttons as interactive (random action_id → POST /susan/actions).
@@ -942,9 +1062,12 @@ def connect_google_slack_response(
 
 
 def connect_github_slack_response(
-    user: str, intro: str | None = None, channel_id: str | None = None
+    user: str,
+    intro: str | None = None,
+    channel_id: str | None = None,
+    resume_id: str | None = None,
 ) -> JSONResponse:
-    """Ephemeral message with link to GitHub OAuth."""
+    """Ephemeral message with link to GitHub OAuth. Optional resume_id continues the command after OAuth."""
     base = public_base_url()
     if not base:
         return JSONResponse(
@@ -961,7 +1084,9 @@ def connect_github_slack_response(
             }
         )
     intro = intro or "Connect your GitHub account so Susan can open **issues** and **PRs**. Repos: `GITHUB_REPO` / `GITHUB_REPOS` (allowlist) on the server, or type `owner/repo` in the command."
-    state = make_oauth_state(user, channel_id=channel_id or None)
+    state = make_oauth_state(
+        user, channel_id=channel_id or None, resume_id=resume_id
+    )
     auth_path = f"{base}/auth/github?state={urllib.parse.quote(state, safe='')}"
     link = f"<{auth_path}|Connect GitHub Account>"
     blocks = [
@@ -1077,17 +1202,25 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
         )
 
     if action in GOOGLE_ACTIONS and not await user_has_google_tokens(user):
+        resume_id = await create_oauth_resume_pending(
+            user, channel, thread_ts, text, action, "google"
+        )
         return connect_google_slack_response(
             user,
-            intro="*Google isn’t connected yet.* Use the link below to sign in, then run your command again (or use `/susan connect google` anytime).",
+            intro="*Google isn’t connected yet.* Use the link below to sign in — Susan will continue this command when you’re done (or use `/susan connect google` anytime).",
             channel_id=channel or None,
+            resume_id=resume_id,
         )
 
     if action in GITHUB_ACTIONS and not await user_has_github_tokens(user):
+        resume_id = await create_oauth_resume_pending(
+            user, channel, thread_ts, text, action, "github"
+        )
         return connect_github_slack_response(
             user,
-            intro="*GitHub isn’t connected yet.* Use the link below to sign in, then run your command again (or use `/susan connect github` anytime).",
+            intro="*GitHub isn’t connected yet.* Use the link below to sign in — Susan will continue this command when you’re done (or use `/susan connect github` anytime).",
             channel_id=channel or None,
+            resume_id=resume_id,
         )
 
     async def run():
