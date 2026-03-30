@@ -544,6 +544,12 @@ async def call_claude(system: str, user: str) -> str:
     raise RuntimeError(_anthropic_error_payload(last_data) if last_data else last_text or "Claude API error")
 
 
+SLACK_JSON_HEADERS = {
+    "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+    "Content-Type": "application/json; charset=utf-8",
+}
+
+
 async def post_ephemeral(channel: str, user: str, text: str, blocks: list | None = None):
     payload = {"channel": channel, "user": user, "text": text}
     if blocks:
@@ -551,7 +557,7 @@ async def post_ephemeral(channel: str, user: str, text: str, blocks: list | None
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             "https://slack.com/api/chat.postEphemeral",
-            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            headers=SLACK_JSON_HEADERS,
             json=payload,
         )
     data = r.json()
@@ -637,7 +643,7 @@ async def post_message(
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             "https://slack.com/api/chat.postMessage",
-            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            headers=SLACK_JSON_HEADERS,
             json=payload,
         )
     try:
@@ -1352,7 +1358,7 @@ async def post_github_repo_picker_ephemeral(
 
 
 def _slack_multi_summary_selected_repos(payload: dict, pick_id: str) -> list[str]:
-    """Read multi_static_select choices from block_actions `state` (Run PR summary button)."""
+    """Read multi_static_select choices from block_actions `state` (values are allowlist indices)."""
     nid = pick_id.replace("-", "")
     blk = f"m{nid}"
     state = payload.get("state") or {}
@@ -1393,9 +1399,14 @@ async def post_github_repo_multi_summary_picker_ephemeral(
     pick_id = await create_repo_pick_pending(user, channel, thread_ts, "summary", text)
     nid = pick_id.replace("-", "")
     blk_multi = f"m{nid}"
+    # Slack option `value` must be ≤75 chars; long owner/repo breaks validation (invalid_blocks).
+    picked_allow = allow[:100]
     options = [
-        {"text": {"type": "plain_text", "text": r[:75]}, "value": r}
-        for r in allow[:100]
+        {
+            "text": {"type": "plain_text", "text": r[:75]},
+            "value": str(i),
+        }
+        for i, r in enumerate(picked_allow)
     ]
     blocks: list[dict] = [
         {
@@ -2669,25 +2680,28 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                         "text": "Picker expired. Run `/susan` again.",
                     }
                 )
-            allow = _pr_allowlist()
-            if allow:
-                bad = [r for r in repos_sel if r not in allow]
-                if bad:
-                    return JSONResponse(
-                        {
-                            "response_type": "ephemeral",
-                            "text": (
-                                f"Repo(s) not allowed: {', '.join(f'`{b}`' for b in bad)}. "
-                                f"Allowed: {', '.join(allow)}."
-                            ),
-                        }
-                    )
-            seen: set[str] = set()
+            allow_now = _pr_allowlist()
+            seen_idx: set[int] = set()
             repos_ordered: list[str] = []
-            for r in repos_sel:
-                if r not in seen:
-                    seen.add(r)
-                    repos_ordered.append(r)
+            for v in repos_sel:
+                vs = (v or "").strip()
+                if not vs.isdigit():
+                    continue
+                idx = int(vs)
+                if idx in seen_idx or idx < 0 or idx >= len(allow_now):
+                    continue
+                seen_idx.add(idx)
+                repos_ordered.append(allow_now[idx].strip().lower())
+            if not repos_ordered:
+                return JSONResponse(
+                    {
+                        "response_type": "ephemeral",
+                        "text": (
+                            "Could not resolve the selected repositories "
+                            "(try again or run `/susan summarize prs …`)."
+                        ),
+                    }
+                )
 
             async def run_pr_summary_multi():
                 try:
