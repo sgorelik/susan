@@ -641,6 +641,15 @@ async def create_google_doc(content: str, slack_user_id: str) -> str:
             json={"title": "Susan — Meeting Notes"},
         )
         doc = r.json()
+        if r.status_code >= 400:
+            hint = (
+                " Enable **Google Docs API** for the same GCP project as your OAuth client "
+                "(APIs & Services → Library → Google Docs API). "
+                "Then revoke Susan at https://myaccount.google.com/permissions and run `/susan connect` again."
+            )
+            if r.status_code in (401, 403):
+                return f"Google Docs rejected this token ({r.status_code}).{hint} Raw: {doc}"
+            return f"Failed to create doc: {doc}"
         doc_id = doc.get("documentId")
         if not doc_id:
             return f"Failed to create doc: {doc}"
