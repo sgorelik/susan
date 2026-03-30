@@ -499,6 +499,104 @@ SYSTEM_PROMPTS = {
     "pr": "You are Susan. Given a Slack conversation about code, draft a GitHub PR. Output ONLY:\nTitle: ...\n\nDescription:\n...\n\nFiles changed:\n<filename>\n```\n<code>\n```",
 }
 
+REPO_PREFIX = "__REPO__:"
+
+
+def _comma_repo_list(raw: str) -> list[str]:
+    if not (raw or "").strip():
+        return []
+    return [p.strip().lower() for p in raw.split(",") if p.strip()]
+
+
+def _pr_allowlist() -> list[str]:
+    return _comma_repo_list(os.environ.get("GITHUB_REPOS", ""))
+
+
+def _issue_allowlist() -> list[str]:
+    """GITHUB_ISSUES_REPOS if set, else same allowlist as PR (GITHUB_REPOS)."""
+    raw = (os.environ.get("GITHUB_ISSUES_REPOS") or "").strip()
+    if raw:
+        return _comma_repo_list(raw)
+    return _pr_allowlist()
+
+
+def parse_repo_slug_from_text(text: str) -> str | None:
+    """Extract owner/repo from slash command text (repo: x/y, in x/y, or first x/y)."""
+    m = re.search(r"\b(?:repo|in)\s*:?\s*([a-z0-9_.-]+/[a-z0-9_.-]+)\b", text, re.I)
+    if m:
+        return m.group(1).lower()
+    m = re.search(r"\b([a-z0-9_.-]+/[a-z0-9_.-]+)\b", text)
+    if m:
+        return m.group(1).lower()
+    return None
+
+
+def resolve_github_repo_for_pr(text: str) -> tuple[str | None, str | None]:
+    """Returns (repo, error_ephemeral)."""
+    allow = _pr_allowlist()
+    parsed = parse_repo_slug_from_text(text)
+    default = (os.environ.get("GITHUB_REPO") or "").strip().lower()
+    if parsed:
+        if allow and parsed not in allow:
+            return None, f"Repo `{parsed}` is not allowed. Allowed: {', '.join(allow)}."
+        return parsed, None
+    if default:
+        if allow and default not in allow:
+            return None, f"Default `GITHUB_REPO` (`{default}`) is not in `GITHUB_REPOS`: {', '.join(allow)}."
+        return default, None
+    if len(allow) == 1:
+        return allow[0], None
+    if len(allow) > 1:
+        return None, (
+            f"*Which GitHub repo?* Put `owner/repo` in your command, e.g. `create pr {allow[0]} …`.\n"
+            f"Allowed: {', '.join(allow)}.\n"
+            "Or set a single default with `GITHUB_REPO` on the server."
+        )
+    return None, (
+        "No GitHub repo configured. Set `GITHUB_REPO` (default) or `GITHUB_REPOS` (comma-separated allowlist) "
+        "on the server, or include `owner/repo` in your command."
+    )
+
+
+def resolve_github_repo_for_issue(text: str) -> tuple[str | None, str | None]:
+    allow = _issue_allowlist()
+    parsed = parse_repo_slug_from_text(text)
+    default = (
+        os.environ.get("GITHUB_ISSUES_REPO") or os.environ.get("GITHUB_REPO") or ""
+    ).strip().lower()
+    if parsed:
+        if allow and parsed not in allow:
+            return None, f"Repo `{parsed}` is not allowed for issues. Allowed: {', '.join(allow)}."
+        return parsed, None
+    if default:
+        if allow and default not in allow:
+            return None, f"Default issues repo (`{default}`) is not in the allowlist: {', '.join(allow)}."
+        return default, None
+    if len(allow) == 1:
+        return allow[0], None
+    if len(allow) > 1:
+        return None, (
+            f"*Which repo for the issue?* e.g. `create issue {allow[0]} …`.\n"
+            f"Allowed: {', '.join(allow)}.\n"
+            "Or set `GITHUB_ISSUES_REPO` / `GITHUB_REPO` as default."
+        )
+    return None, (
+        "No repo for issues. Set `GITHUB_REPO` or `GITHUB_ISSUES_REPO`, or `GITHUB_REPOS` (allowlist), "
+        "or include `owner/repo` in your command."
+    )
+
+
+def split_repo_prefix_from_approve_value(value: str) -> tuple[str | None, str]:
+    """Approve button value may start with REPO_PREFIX line from process_command."""
+    if value.startswith(REPO_PREFIX):
+        nl = value.find("\n")
+        if nl != -1:
+            line = value[:nl]
+            rest = value[nl + 1 :]
+            slug = line[len(REPO_PREFIX) :].strip().lower()
+            return slug or None, rest
+    return None, value
+
 
 async def process_command(
     action: str,
@@ -510,11 +608,30 @@ async def process_command(
     response_url: str | None = None,
 ):
     try:
+        repo_line = ""
+        if action == "pr":
+            repo, err = resolve_github_repo_for_pr(instructions)
+            if err:
+                await notify_user_ephemeral(channel, user, err, None, response_url)
+                return
+            repo_line = f"{REPO_PREFIX}{repo}\n"
+        elif action == "issue":
+            repo, err = resolve_github_repo_for_issue(instructions)
+            if err:
+                await notify_user_ephemeral(channel, user, err, None, response_url)
+                return
+            repo_line = f"{REPO_PREFIX}{repo}\n"
+
         preview = await call_claude(
             SYSTEM_PROMPTS[action],
             f"Slack conversation:\n{convo}\n\nExtra instructions: {instructions}",
         )
-        truncated = preview[:2800] + ("..." if len(preview) > 2800 else "")
+        display_truncated = preview[:2800] + ("..." if len(preview) > 2800 else "")
+        max_val = 2000 - len(repo_line)
+        if max_val < 200:
+            max_val = 200
+        value_truncated = preview[:max_val] + ("..." if len(preview) > max_val else "")
+        approve_value = f"{repo_line}{value_truncated}"
         blocks = [
             {
                 "type": "section",
@@ -523,7 +640,7 @@ async def process_command(
                     "text": f"*Susan preview — {ACTIONS[action][0]}*\n_(Only visible to you)_",
                 },
             },
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"```{truncated}```"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"```{display_truncated}```"}},
             {
                 "type": "actions",
                 "block_id": f"susan_{action}_{channel}_{thread_ts or 'none'}",
@@ -533,7 +650,7 @@ async def process_command(
                         "text": {"type": "plain_text", "text": "✓ Approve & execute"},
                         "style": "primary",
                         "action_id": f"approve_{action}",
-                        "value": preview[:2000],
+                        "value": approve_value[:2000],
                     },
                     {
                         "type": "button",
@@ -744,7 +861,7 @@ def connect_github_slack_response(
                 "text": "GitHub OAuth is not configured. Set GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, and GITHUB_REDIRECT_URI.",
             }
         )
-    intro = intro or "Connect your GitHub account so Susan can open **issues** and **PRs** (`GITHUB_ISSUES_REPO` / `GITHUB_REPO` on the server)."
+    intro = intro or "Connect your GitHub account so Susan can open **issues** and **PRs**. Repos: `GITHUB_REPO` / `GITHUB_REPOS` (allowlist) on the server, or type `owner/repo` in the command."
     state = make_oauth_state(user, channel_id=channel_id or None)
     auth_path = f"{base}/auth/github?state={urllib.parse.quote(state, safe='')}"
     link = f"<{auth_path}|Connect GitHub Account>"
@@ -1066,15 +1183,6 @@ async def create_calendar_invite(content: str, slack_user_id: str) -> str:
     return f"Calendar invite created: {link}" if link else f"Calendar error: {data}"
 
 
-def _github_issues_repo() -> str:
-    """Issues target repo; optional GITHUB_ISSUES_REPO overrides GITHUB_REPO."""
-    return (os.environ.get("GITHUB_ISSUES_REPO") or os.environ.get("GITHUB_REPO") or "").strip()
-
-
-def _github_pr_repo() -> str:
-    return (os.environ.get("GITHUB_REPO") or "").strip()
-
-
 async def create_github_issue(content: str, slack_user_id: str) -> str:
     import re
 
@@ -1082,9 +1190,11 @@ async def create_github_issue(content: str, slack_user_id: str) -> str:
         token = await get_github_token(slack_user_id)
     except ValueError as e:
         return str(e)
-    repo = _github_issues_repo()
+    repo_meta, body = split_repo_prefix_from_approve_value(content)
+    repo = repo_meta or (os.environ.get("GITHUB_ISSUES_REPO") or os.environ.get("GITHUB_REPO") or "").strip()
     if not repo:
-        return "Issue not created — set `GITHUB_REPO` or `GITHUB_ISSUES_REPO` on the server (e.g. `org/repo`)."
+        return "Issue not created — no repo (approve payload missing `__REPO__` line)."
+    content = body
     title_m = re.search(r"^Title:\s*(.+)", content, re.M)
     title = title_m.group(1).strip() if title_m else "Susan: issue from Slack"
     desc_m = re.search(r"^Description:\s*", content, re.M)
@@ -1109,10 +1219,12 @@ async def create_github_pr(content: str, slack_user_id: str) -> str:
         token = await get_github_token(slack_user_id)
     except ValueError as e:
         return str(e)
-    repo = _github_pr_repo()
-    base = os.environ.get("GITHUB_BASE_BRANCH", "main")
+    repo_meta, body = split_repo_prefix_from_approve_value(content)
+    repo = repo_meta or (os.environ.get("GITHUB_REPO") or "").strip()
     if not repo:
-        return "PR not created — GITHUB_REPO is not set on the server (e.g. `org/repo`)."
+        return "PR not created — no repo (approve payload missing `__REPO__` line)."
+    content = body
+    base = os.environ.get("GITHUB_BASE_BRANCH", "main")
     title_m = re.search(r"^Title:\s*(.+)", content, re.M)
     desc_m = re.search(r"Description:\s*([\s\S]+?)(?=Files changed:|$)", content)
     title = title_m.group(1).strip() if title_m else "Susan: changes from Slack"
