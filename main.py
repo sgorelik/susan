@@ -560,6 +560,40 @@ async def post_ephemeral(channel: str, user: str, text: str, blocks: list | None
         raise RuntimeError(data.get("error", "chat.postEphemeral failed"))
 
 
+def _strip_blank_modal_initial_values(view: dict) -> None:
+    """Slack rejects some modals when plain_text_input has initial_value: \"\"."""
+    for block in view.get("blocks") or []:
+        el = block.get("element")
+        if isinstance(el, dict) and el.get("type") == "plain_text_input":
+            if not (el.get("initial_value") or "").strip():
+                el.pop("initial_value", None)
+
+
+async def slack_views_open(trigger_id: str, view: dict) -> tuple[bool, str]:
+    """Open a modal; required for buttons on *ephemeral* messages (response_action push often does nothing)."""
+    if not trigger_id:
+        return False, "missing_trigger_id"
+    _strip_blank_modal_initial_values(view)
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(
+            "https://slack.com/api/views.open",
+            headers={
+                "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={"trigger_id": trigger_id, "view": view},
+        )
+    try:
+        data = r.json()
+    except json.JSONDecodeError:
+        return False, r.text[:200]
+    if data.get("ok"):
+        return True, ""
+    err = str(data.get("error", data))
+    logger.error("views.open failed: %s", data)
+    return False, err
+
+
 async def post_slack_delayed_response(response_url: str, payload: dict) -> None:
     """Follow-up message for slash commands (same payload shape as slash JSON response)."""
     async with httpx.AsyncClient(timeout=30) as client:
@@ -1970,6 +2004,7 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
             continue
         if aid in ("open_modal_email", "open_modal_invite"):
             draft_id = (a.get("value") or "").strip()
+            trigger_id = (payload.get("trigger_id") or "").strip()
             row = await get_user_draft(draft_id, user)
             if not row:
                 return JSONResponse(
@@ -1988,7 +2023,19 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                 return JSONResponse(
                     {"response_type": "ephemeral", "text": "Unknown draft type."}
                 )
-            return JSONResponse({"response_action": "push", "view": view})
+            ok, err = await slack_views_open(trigger_id, view)
+            if not ok:
+                return JSONResponse(
+                    {
+                        "response_type": "ephemeral",
+                        "text": (
+                            f"Could not open the editor (`{err}`). "
+                            "Try *Approve & send* or run `/susan` again. "
+                            "If this persists, confirm the app has **interactivity** enabled for `/susan/actions`."
+                        ),
+                    }
+                )
+            return JSONResponse({})
         # Buttons use github_repo_pick_0, github_repo_pick_1, … (unique action_ids).
         if aid.startswith("github_repo_pick"):
             try:
