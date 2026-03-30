@@ -20,12 +20,15 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 import httpx
 from db import (
     consume_oauth_resume_pending,
+    consume_user_draft,
     consume_repo_pick_pending,
     create_oauth_resume_pending,
     create_repo_pick_pending,
+    create_user_draft,
     exchange_code_for_tokens,
     exchange_github_code_for_token,
     get_github_token,
+    get_user_draft,
     get_valid_access_token,
     init_db,
     upsert_github_token,
@@ -586,8 +589,8 @@ async def post_message(channel: str, text: str, thread_ts: str | None = None):
 
 SYSTEM_PROMPTS = {
     "doc": "You are Susan. Given a Slack conversation, write a structured document with sections: ## Summary, ## Key Decisions, ## Action Items, ## Open Questions. Be concise and professional.",
-    "email": "You are Susan. Given a Slack conversation, draft a professional email. Output ONLY:\nSubject: <subject>\n\n<body>",
-    "invite": "You are Susan. Given a Slack conversation, draft a calendar invite. Output ONLY:\nTitle: ...\nDate/Time: ...\nDuration: ...\nAttendees: ...\nAgenda: ...\nInfer details from context.",
+    "email": "You are Susan. Given a Slack conversation, draft a professional email. Output ONLY this structure:\nTo: email1@domain.com, email2@domain.com\nSubject: <subject>\n\n<body>\n\nPut every recipient in To: (comma-separated). If the user names people or gives addresses in their instructions, use those addresses in To:. If they give no recipients, use To: with DEFAULT_EMAIL_TO from the server only if you know it; otherwise leave To: empty and they will set it in Slack.",
+    "invite": "You are Susan. Given a Slack conversation, draft a calendar invite. Output ONLY:\nTitle: <short title>\nAttendees: email1@..., email2@... (comma-separated)\nStart: <ISO8601 e.g. 2026-04-15T14:00:00>\nEnd: <ISO8601>\nTimeZone: <IANA e.g. America/New_York or UTC>\nDescription:\n<agenda / notes>\n\nInfer date/time from the thread. If the user names attendees or emails, use them in Attendees:.",
     "issue": "You are Susan. Given a Slack conversation, draft a GitHub issue. Output ONLY:\nTitle: <short title>\n\nDescription:\n<markdown body with context, steps to reproduce, expected vs actual, or acceptance criteria as appropriate>\n",
     "pr": "You are Susan. Given a Slack conversation about code, draft a GitHub PR. Output ONLY:\nTitle: ...\n\nDescription:\n...\n\nFiles changed:\nFor each file: one repo-relative path on its own line, then a fenced code block with the full file contents. Example:\nsrc/foo.py\n```python\n...\n```\nRepeat for more files.",
 }
@@ -855,6 +858,207 @@ def split_repo_prefix_from_approve_value(value: str) -> tuple[str | None, str]:
     return None, value
 
 
+SLACK_CB_EMAIL_MODAL = "susan_submit_email"
+SLACK_CB_INVITE_MODAL = "susan_submit_invite"
+
+
+def _looks_like_draft_id(value: str) -> bool:
+    v = (value or "").strip()
+    if len(v) != 36:
+        return False
+    try:
+        uuid.UUID(v)
+        return True
+    except ValueError:
+        return False
+
+
+def parse_email_draft(text: str) -> dict[str, str]:
+    """Parse To:/Subject:/body from Claude email output."""
+    raw = text.strip()
+    to_m = re.search(r"(?im)^To:\s*(.+)$", raw)
+    subj_m = re.search(r"(?im)^Subject:\s*(.+)$", raw)
+    to_val = (to_m.group(1).strip() if to_m else "")[:4000]
+    subj = (subj_m.group(1).strip() if subj_m else "Email from Susan")[:2000]
+    body = raw
+    body = re.sub(r"(?im)^To:\s*.+$", "", body, count=1)
+    body = re.sub(r"(?im)^Subject:\s*.+$", "", body, count=1)
+    body = body.strip()
+    return {"to": to_val, "subject": subj, "body": body[:12000]}
+
+
+def parse_invite_draft(text: str) -> dict[str, str]:
+    """Parse structured invite from Claude output."""
+    raw = text.strip()
+
+    def one(name: str) -> str | None:
+        m = re.search(rf"(?im)^{name}:\s*(.+)$", raw)
+        return m.group(1).strip() if m else None
+
+    title = (one("Title") or "Meeting")[:2000]
+    attendees = (one("Attendees") or "")[:2000]
+    start = (one("Start") or "2026-04-01T10:00:00Z")[:500]
+    end = (one("End") or "2026-04-01T11:00:00Z")[:500]
+    tz = (one("TimeZone") or one("Timezone") or "UTC")[:100]
+    desc = ""
+    if re.search(r"(?im)^Description:\s*", raw):
+        desc = re.split(r"(?im)^Description:\s*", raw, maxsplit=1)[-1].strip()[:12000]
+    return {
+        "title": title,
+        "attendees": attendees,
+        "start": start,
+        "end": end,
+        "timezone": tz,
+        "description": desc,
+    }
+
+
+def format_email_content(parsed: dict[str, str]) -> str:
+    return f"To: {parsed['to']}\nSubject: {parsed['subject']}\n\n{parsed['body']}"
+
+
+def format_invite_content(parsed: dict[str, str]) -> str:
+    return (
+        f"Title: {parsed['title']}\n"
+        f"Attendees: {parsed['attendees']}\n"
+        f"Start: {parsed['start']}\n"
+        f"End: {parsed['end']}\n"
+        f"TimeZone: {parsed['timezone']}\n"
+        f"Description:\n{parsed['description']}"
+    )
+
+
+def _slack_block_input_value(values: dict, block_id: str, action_id: str) -> str:
+    try:
+        el = (values.get(block_id) or {}).get(action_id) or {}
+        return (el.get("value") or "").strip()
+    except (AttributeError, TypeError):
+        return ""
+
+
+def build_email_modal_view(draft_id: str, channel_id: str, parsed: dict[str, str]) -> dict:
+    meta = json.dumps({"draft_id": draft_id, "channel_id": channel_id})
+    return {
+        "type": "modal",
+        "callback_id": SLACK_CB_EMAIL_MODAL,
+        "private_metadata": meta[:3000],
+        "title": {"type": "plain_text", "text": "Send email"},
+        "submit": {"type": "plain_text", "text": "Send"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "em_to",
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "em_to_val",
+                    "initial_value": (parsed.get("to") or "")[:2000],
+                    "placeholder": {"type": "plain_text", "text": "a@x.com, b@y.com"},
+                },
+                "label": {"type": "plain_text", "text": "To (comma-separated)"},
+            },
+            {
+                "type": "input",
+                "block_id": "em_sub",
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "em_sub_val",
+                    "initial_value": (parsed.get("subject") or "")[:2000],
+                },
+                "label": {"type": "plain_text", "text": "Subject"},
+            },
+            {
+                "type": "input",
+                "block_id": "em_body",
+                "element": {
+                    "type": "plain_text_input",
+                    "multiline": True,
+                    "action_id": "em_body_val",
+                    "initial_value": (parsed.get("body") or "")[:3000],
+                },
+                "label": {"type": "plain_text", "text": "Body"},
+            },
+        ],
+    }
+
+
+def build_invite_modal_view(draft_id: str, channel_id: str, parsed: dict[str, str]) -> dict:
+    meta = json.dumps({"draft_id": draft_id, "channel_id": channel_id})
+    return {
+        "type": "modal",
+        "callback_id": SLACK_CB_INVITE_MODAL,
+        "private_metadata": meta[:3000],
+        "title": {"type": "plain_text", "text": "Calendar invite"},
+        "submit": {"type": "plain_text", "text": "Create invite"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "in_tt",
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "in_tt_val",
+                    "initial_value": (parsed.get("title") or "")[:2000],
+                },
+                "label": {"type": "plain_text", "text": "Title"},
+            },
+            {
+                "type": "input",
+                "block_id": "in_att",
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "in_att_val",
+                    "initial_value": (parsed.get("attendees") or "")[:2000],
+                    "placeholder": {"type": "plain_text", "text": "emails, comma-separated"},
+                },
+                "label": {"type": "plain_text", "text": "Attendees"},
+            },
+            {
+                "type": "input",
+                "block_id": "in_st",
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "in_st_val",
+                    "initial_value": (parsed.get("start") or "")[:2000],
+                    "placeholder": {"type": "plain_text", "text": "2026-04-15T14:00:00"},
+                },
+                "label": {"type": "plain_text", "text": "Start (ISO8601)"},
+            },
+            {
+                "type": "input",
+                "block_id": "in_en",
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "in_en_val",
+                    "initial_value": (parsed.get("end") or "")[:2000],
+                },
+                "label": {"type": "plain_text", "text": "End (ISO8601)"},
+            },
+            {
+                "type": "input",
+                "block_id": "in_tz",
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "in_tz_val",
+                    "initial_value": (parsed.get("timezone") or "UTC")[:2000],
+                },
+                "label": {"type": "plain_text", "text": "Time zone (IANA)"},
+            },
+            {
+                "type": "input",
+                "block_id": "in_de",
+                "element": {
+                    "type": "plain_text_input",
+                    "multiline": True,
+                    "action_id": "in_de_val",
+                    "initial_value": (parsed.get("description") or "")[:3000],
+                },
+                "label": {"type": "plain_text", "text": "Description"},
+            },
+        ],
+    }
+
+
 async def process_command(
     action: str,
     convo: str,
@@ -895,39 +1099,80 @@ async def process_command(
             f"Slack conversation:\n{convo}\n\nExtra instructions: {instructions}",
         )
         display_truncated = preview[:2800] + ("..." if len(preview) > 2800 else "")
-        max_val = 2000 - len(repo_line)
-        if max_val < 200:
-            max_val = 200
-        value_truncated = preview[:max_val] + ("..." if len(preview) > max_val else "")
-        approve_value = f"{repo_line}{value_truncated}"
-        blocks = [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*Susan preview — {ACTIONS[action][0]}*\n_(Only visible to you)_",
+
+        if action in ("email", "invite"):
+            draft_id = await create_user_draft(user, action, preview)
+            hint = (
+                "_Use *Edit & send* to change recipients and wording, or *Approve & send* to send this draft as-is._"
+            )
+            blocks = [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Susan preview — {ACTIONS[action][0]}*\n_(Only visible to you)_\n{hint}",
+                    },
                 },
-            },
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"```{display_truncated}```"}},
-            {
-                "type": "actions",
-                "block_id": f"susan_{action}_{channel}_{thread_ts or 'none'}",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "✓ Approve & execute"},
-                        "style": "primary",
-                        "action_id": f"approve_{action}",
-                        "value": approve_value[:2000],
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"```{display_truncated}```"}},
+                {
+                    "type": "actions",
+                    "block_id": f"susan_{action}_{channel}_{thread_ts or 'none'}",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "✏️ Edit & send"},
+                            "action_id": f"open_modal_{action}",
+                            "value": draft_id,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "✓ Approve & send"},
+                            "style": "primary",
+                            "action_id": f"approve_{action}",
+                            "value": draft_id,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "✗ Cancel"},
+                            "action_id": "cancel_susan",
+                        },
+                    ],
+                },
+            ]
+        else:
+            max_val = 2000 - len(repo_line)
+            if max_val < 200:
+                max_val = 200
+            value_truncated = preview[:max_val] + ("..." if len(preview) > max_val else "")
+            approve_value = f"{repo_line}{value_truncated}"
+            blocks = [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Susan preview — {ACTIONS[action][0]}*\n_(Only visible to you)_",
                     },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "✗ Cancel"},
-                        "action_id": "cancel_susan",
-                    },
-                ],
-            },
-        ]
+                },
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"```{display_truncated}```"}},
+                {
+                    "type": "actions",
+                    "block_id": f"susan_{action}_{channel}_{thread_ts or 'none'}",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "✓ Approve & execute"},
+                            "style": "primary",
+                            "action_id": f"approve_{action}",
+                            "value": approve_value[:2000],
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "✗ Cancel"},
+                            "action_id": "cancel_susan",
+                        },
+                    ],
+                },
+            ]
         await notify_user_ephemeral(
             channel, user, f"Susan preview ready for: {ACTIONS[action][0]}", blocks, response_url
         )
@@ -1428,6 +1673,76 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
     )
 
 
+EMAIL_IN_TEXT_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+
+
+async def handle_slack_view_submission(payload: dict, background_tasks: BackgroundTasks) -> JSONResponse:
+    """Modal submit for editable email / calendar drafts."""
+    user = (payload.get("user") or {}).get("id") or ""
+    view = payload.get("view") or {}
+    callback_id = view.get("callback_id") or ""
+    values = (view.get("state") or {}).get("values") or {}
+    meta: dict = {}
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+    except json.JSONDecodeError:
+        meta = {}
+    draft_id = (meta.get("draft_id") or "").strip()
+    channel_id = (meta.get("channel_id") or "").strip()
+
+    async def notify_done(text: str) -> None:
+        if channel_id and user:
+            try:
+                await post_ephemeral(channel_id, user, text)
+            except Exception as e:
+                logger.error("view_submission notify: %s", e)
+
+    if callback_id == SLACK_CB_EMAIL_MODAL:
+        to = _slack_block_input_value(values, "em_to", "em_to_val")
+        subj = _slack_block_input_value(values, "em_sub", "em_sub_val")
+        body = _slack_block_input_value(values, "em_body", "em_body_val")
+        content = format_email_content({"to": to, "subject": subj, "body": body})
+
+        async def run_email():
+            if draft_id:
+                await consume_user_draft(draft_id, user)
+            try:
+                result = await send_gmail(content, user)
+                await notify_done(f"✓ Susan done: {result}")
+            except Exception as e:
+                logger.exception("Modal send email failed")
+                await notify_done(f"Susan error: {e}")
+
+        background_tasks.add_task(run_email)
+        return JSONResponse({"response_action": "clear"})
+
+    if callback_id == SLACK_CB_INVITE_MODAL:
+        parsed = {
+            "title": _slack_block_input_value(values, "in_tt", "in_tt_val"),
+            "attendees": _slack_block_input_value(values, "in_att", "in_att_val"),
+            "start": _slack_block_input_value(values, "in_st", "in_st_val"),
+            "end": _slack_block_input_value(values, "in_en", "in_en_val"),
+            "timezone": _slack_block_input_value(values, "in_tz", "in_tz_val") or "UTC",
+            "description": _slack_block_input_value(values, "in_de", "in_de_val"),
+        }
+        content = format_invite_content(parsed)
+
+        async def run_inv():
+            if draft_id:
+                await consume_user_draft(draft_id, user)
+            try:
+                result = await create_calendar_invite(content, user)
+                await notify_done(f"✓ Susan done: {result}")
+            except Exception as e:
+                logger.exception("Modal calendar invite failed")
+                await notify_done(f"Susan error: {e}")
+
+        background_tasks.add_task(run_inv)
+        return JSONResponse({"response_action": "clear"})
+
+    return JSONResponse({"response_action": "clear"})
+
+
 @app.post("/susan/actions")
 async def handle_action(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
@@ -1443,6 +1758,9 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
         payload = json.loads(urllib.parse.unquote(payload_raw))
 
     ptype = payload.get("type")
+    if ptype == "view_submission":
+        return await handle_slack_view_submission(payload, background_tasks)
+
     if ptype and ptype != "block_actions":
         logger.info("Ignoring Slack interaction type=%s", ptype)
         return JSONResponse({})
@@ -1464,6 +1782,27 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
         aid = (a.get("action_id") or "").strip()
         if not aid:
             continue
+        if aid in ("open_modal_email", "open_modal_invite"):
+            draft_id = (a.get("value") or "").strip()
+            row = await get_user_draft(draft_id, user)
+            if not row:
+                return JSONResponse(
+                    {
+                        "response_type": "ephemeral",
+                        "text": "That draft expired. Run `/susan` again.",
+                    }
+                )
+            kind = row["kind"]
+            content = row["content"]
+            if kind == "email":
+                view = build_email_modal_view(draft_id, channel, parse_email_draft(content))
+            elif kind == "invite":
+                view = build_invite_modal_view(draft_id, channel, parse_invite_draft(content))
+            else:
+                return JSONResponse(
+                    {"response_type": "ephemeral", "text": "Unknown draft type."}
+                )
+            return JSONResponse({"response_action": "push", "view": view})
         # Buttons use github_repo_pick_0, github_repo_pick_1, … (unique action_ids).
         if aid.startswith("github_repo_pick"):
             try:
@@ -1583,9 +1922,31 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
             if action_type == "doc":
                 result = await create_google_doc(value, user)
             elif action_type == "email":
-                result = await send_gmail(value, user)
+                text = value
+                if _looks_like_draft_id(value):
+                    row = await consume_user_draft(value, user)
+                    if not row:
+                        await post_ephemeral(
+                            channel,
+                            user,
+                            "That draft expired. Run `/susan send email …` again.",
+                        )
+                        return
+                    text = row["content"]
+                result = await send_gmail(text, user)
             elif action_type == "invite":
-                result = await create_calendar_invite(value, user)
+                text = value
+                if _looks_like_draft_id(value):
+                    row = await consume_user_draft(value, user)
+                    if not row:
+                        await post_ephemeral(
+                            channel,
+                            user,
+                            "That draft expired. Run `/susan create invite …` again.",
+                        )
+                        return
+                    text = row["content"]
+                result = await create_calendar_invite(text, user)
             elif action_type == "issue":
                 result = await create_github_issue(value, user)
             else:
@@ -1638,16 +1999,20 @@ async def send_gmail(content: str, slack_user_id: str) -> str:
         token = await get_valid_access_token(slack_user_id)
     except ValueError as e:
         return str(e)
-    lines = content.split("\n")
-    subj_line = next((l for l in lines if l.lower().startswith("subject:")), "Subject: Update from Susan")
-    subject = subj_line.split(":", 1)[1].strip()
-    body = "\n".join(lines[lines.index(subj_line) + 2 :]) if subj_line in lines else content
-    to_addr = os.environ.get("DEFAULT_EMAIL_TO", "")
-    if not to_addr:
-        return "Email not sent — DEFAULT_EMAIL_TO not set."
+    parsed = parse_email_draft(content)
+    to_raw = (parsed.get("to") or "").strip()
+    if not to_raw:
+        to_raw = (os.environ.get("DEFAULT_EMAIL_TO") or "").strip()
+    if not to_raw:
+        return (
+            "Email not sent — add *To:* recipients in the draft (or set DEFAULT_EMAIL_TO on the server)."
+        )
+    recipients = [x.strip() for x in to_raw.replace(";", ",").split(",") if x.strip()]
+    subject = (parsed.get("subject") or "Email from Susan").strip()
+    body = parsed.get("body") or ""
     msg = MIMEText(body)
     msg["Subject"] = subject
-    msg["To"] = to_addr
+    msg["To"] = ", ".join(recipients)
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     async with httpx.AsyncClient() as client:
         r = await client.post(
@@ -1655,31 +2020,56 @@ async def send_gmail(content: str, slack_user_id: str) -> str:
             headers={"Authorization": f"Bearer {token}"},
             json={"raw": raw},
         )
-    return "Email sent via Gmail." if r.status_code == 200 else f"Gmail error: {r.text}"
+    if r.status_code == 200:
+        return "Email sent via Gmail."
+    try:
+        err = r.json()
+    except json.JSONDecodeError:
+        err = r.text
+    return f"Gmail error ({r.status_code}): {err}"
 
 
 async def create_calendar_invite(content: str, slack_user_id: str) -> str:
-    import re
-
     try:
         token = await get_valid_access_token(slack_user_id)
     except ValueError as e:
         return str(e)
-    title = re.search(r"Title:\s*(.+)", content)
-    title = title.group(1).strip() if title else "Meeting"
-    event = {
+    p = parse_invite_draft(content)
+    title = p["title"]
+    tz = p["timezone"] or "UTC"
+    start = p["start"]
+    end = p["end"]
+    desc = p["description"]
+    att_raw = p["attendees"]
+    emails: list[str] = []
+    for part in att_raw.replace(";", ",").split(","):
+        part = part.strip()
+        if part:
+            emails.extend(EMAIL_IN_TEXT_RE.findall(part))
+    if not emails:
+        fallback = (os.environ.get("DEFAULT_EMAIL_TO") or "").strip()
+        if fallback:
+            emails = EMAIL_IN_TEXT_RE.findall(fallback) or ([fallback] if "@" in fallback else [])
+    event: dict = {
         "summary": title,
-        "description": content,
-        "start": {"dateTime": "2026-04-01T10:00:00Z", "timeZone": "UTC"},
-        "end": {"dateTime": "2026-04-01T11:00:00Z", "timeZone": "UTC"},
+        "description": desc or content,
+        "start": {"dateTime": start, "timeZone": tz},
+        "end": {"dateTime": end, "timeZone": tz},
     }
+    if emails:
+        event["attendees"] = [{"email": e} for e in emails]
+    url = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+    if emails:
+        url = f"{url}?sendUpdates=all"
     async with httpx.AsyncClient() as client:
         r = await client.post(
-            "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+            url,
             headers={"Authorization": f"Bearer {token}"},
             json=event,
         )
     data = r.json()
+    if r.status_code >= 400:
+        return f"Calendar error ({r.status_code}): {data}"
     link = data.get("htmlLink", "")
     return f"Calendar invite created: {link}" if link else f"Calendar error: {data}"
 

@@ -227,6 +227,62 @@ async def create_oauth_resume_pending(
     return rid
 
 
+class UserDraftPending(Base):
+    """Full Claude draft for email/invite — button payloads only store id (Slack 2000-char limit)."""
+
+    __tablename__ = "user_draft_pending"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    slack_user_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+async def create_user_draft(slack_user_id: str, kind: str, content: str) -> str:
+    did = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        session.add(
+            UserDraftPending(
+                id=did,
+                slack_user_id=slack_user_id,
+                kind=kind,
+                content=content,
+                created_at=now,
+            )
+        )
+        await session.commit()
+    return did
+
+
+async def get_user_draft(draft_id: str, slack_user_id: str) -> dict | None:
+    async with SessionLocal() as session:
+        row = await session.get(UserDraftPending, draft_id)
+        if not row or row.slack_user_id != slack_user_id:
+            return None
+        created = _as_utc_aware(row.created_at)
+        if datetime.now(timezone.utc) - created > timedelta(hours=2):
+            return None
+        return {"kind": row.kind, "content": row.content}
+
+
+async def consume_user_draft(draft_id: str, slack_user_id: str) -> dict | None:
+    async with SessionLocal() as session:
+        row = await session.get(UserDraftPending, draft_id)
+        if not row or row.slack_user_id != slack_user_id:
+            return None
+        created = _as_utc_aware(row.created_at)
+        if datetime.now(timezone.utc) - created > timedelta(hours=2):
+            await session.delete(row)
+            await session.commit()
+            return None
+        out = {"kind": row.kind, "content": row.content}
+        await session.delete(row)
+        await session.commit()
+        return out
+
+
 async def consume_oauth_resume_pending(
     resume_id: str, slack_user_id: str, provider: str
 ) -> dict | None:
