@@ -641,11 +641,55 @@ EMAIL_IN_TEXT_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}
 SLACK_USER_MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]+)?>")
 
 
+def _slack_unresolved_recipients_help(user_ids: str) -> str:
+    json_example = '{"U08MYEN0NS0":"you@company.com"}'
+    return (
+        f"Slack user(s) `{user_ids}` have no email the bot can use.\n\n"
+        "*Fixes:* Reinstall Susan after adding **`users:read.email`** (the install/OAuth screen must list that scope). "
+        "Some workspaces **hide member emails from apps** (Enterprise: org security / email visibility). "
+        "**Guests** and **Slack Connect** users often cannot be resolved.\n\n"
+        "*Override:* set **`SLACK_USER_EMAIL_MAP`** on the server — e.g. `U08MYEN0NS0:you@company.com` "
+        f"or JSON `{json_example}`. "
+        "Or type plain **`email@domain`** in To:/Attendees:."
+    )
+
+
+def _slack_user_email_overrides() -> dict[str, str]:
+    """Optional env SLACK_USER_EMAIL_MAP when Slack does not expose emails (policy, guests, etc.)."""
+    raw = (os.environ.get("SLACK_USER_EMAIL_MAP") or "").strip()
+    if not raw:
+        return {}
+    if raw.startswith("{"):
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return {
+                    str(k).strip().upper(): str(v).strip()
+                    for k, v in data.items()
+                    if str(k).strip() and str(v).strip()
+                }
+        except json.JSONDecodeError:
+            pass
+    out: dict[str, str] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if ":" not in part:
+            continue
+        sid, em = part.split(":", 1)
+        sid, em = sid.strip().upper(), em.strip()
+        if sid and em:
+            out[sid] = em
+    return out
+
+
 async def slack_users_lookup_email(user_id: str) -> str | None:
-    """Requires bot scope users:read.email; without it profile.email is empty."""
+    """Uses users.info (needs users:read.email) or SLACK_USER_EMAIL_MAP override."""
     uid = user_id.strip().upper()
     if not uid:
         return None
+    ov = _slack_user_email_overrides()
+    if uid in ov:
+        return ov[uid]
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(
             "https://slack.com/api/users.info",
@@ -658,6 +702,12 @@ async def slack_users_lookup_email(user_id: str) -> str | None:
         return None
     profile = (data.get("user") or {}).get("profile") or {}
     email = (profile.get("email") or "").strip()
+    if not email:
+        logger.info(
+            "users.info %s: ok but no profile.email (needs users:read.email + reinstall, "
+            "or workspace hides emails from apps; use SLACK_USER_EMAIL_MAP to override)",
+            uid,
+        )
     return email or None
 
 
@@ -2354,11 +2404,7 @@ async def send_gmail(content: str, slack_user_id: str) -> str:
         to_raw = (os.environ.get("DEFAULT_EMAIL_TO") or "").strip()
     to_raw, slack_unres = await resolve_slack_recipients_to_emails(to_raw)
     if slack_unres and not EMAIL_IN_TEXT_RE.findall(to_raw):
-        return (
-            "Email not sent — could not resolve Slack user(s) to email: "
-            f"`{', '.join(slack_unres)}`. Add the **users:read.email** bot scope and reinstall the app, "
-            "or use plain *email@domain* addresses in To:."
-        )
+        return "Email not sent — " + _slack_unresolved_recipients_help(", ".join(slack_unres))
     if not to_raw:
         return (
             "Email not sent — add *To:* recipients in the draft (or set DEFAULT_EMAIL_TO on the server)."
@@ -2404,10 +2450,8 @@ async def create_calendar_invite(content: str, slack_user_id: str) -> str:
     att_raw, att_unres = await resolve_slack_recipients_to_emails(p["attendees"])
     emails = list(dict.fromkeys(EMAIL_IN_TEXT_RE.findall(att_raw)))
     if not emails and att_unres:
-        return (
-            "Calendar invite not created — could not resolve Slack user(s) to email: "
-            f"`{', '.join(att_unres)}`. Add **users:read.email** to the Slack app and reinstall, "
-            "or use plain *email@domain* in Attendees:."
+        return "Calendar invite not created — " + _slack_unresolved_recipients_help(
+            ", ".join(att_unres)
         )
     if not emails:
         fallback = (os.environ.get("DEFAULT_EMAIL_TO") or "").strip()
