@@ -42,15 +42,19 @@ def oauth_state_secret() -> str:
     return os.environ.get("OAUTH_STATE_SECRET", SLACK_SIGNING_SECRET).strip()
 
 
-def make_oauth_state(slack_user_id: str) -> str:
+def make_oauth_state(slack_user_id: str, channel_id: str | None = None) -> str:
+    """Signed state for Google OAuth. Optional channel_id enables a Slack follow-up after connect."""
     exp = int(time.time()) + 3600
-    payload = {"u": slack_user_id, "exp": exp}
+    payload: dict = {"u": slack_user_id, "exp": exp}
+    if channel_id:
+        payload["ch"] = channel_id
     body = json.dumps(payload, separators=(",", ":")).encode()
     sig = hmac.new(oauth_state_secret().encode(), body, hashlib.sha256).digest()
     return base64.urlsafe_b64encode(body + sig).decode()
 
 
-def parse_oauth_state(state: str) -> str | None:
+def parse_oauth_state(state: str) -> tuple[str, str | None] | None:
+    """Returns (slack_user_id, channel_id_or_none). channel_id is absent in older signed links."""
     try:
         raw = base64.urlsafe_b64decode(state.encode())
         body, sig = raw[:-32], raw[-32:]
@@ -60,7 +64,11 @@ def parse_oauth_state(state: str) -> str | None:
         payload = json.loads(body.decode())
         if payload["exp"] < time.time():
             return None
-        return payload["u"]
+        uid = payload["u"]
+        ch = payload.get("ch")
+        if not isinstance(ch, str) or not ch.strip():
+            ch = None
+        return uid, ch
     except Exception:
         return None
 
@@ -442,8 +450,8 @@ async def process_command(
 
 @app.get("/auth/google")
 async def auth_google_start(state: str):
-    uid = parse_oauth_state(state)
-    if not uid:
+    parsed = parse_oauth_state(state)
+    if not parsed:
         raise HTTPException(status_code=400, detail="Invalid or expired state")
     try:
         _ = os.environ["GOOGLE_CLIENT_ID"]
@@ -456,12 +464,13 @@ async def auth_google_start(state: str):
 
 @app.get("/auth/google/callback")
 async def auth_google_callback(code: str, state: str):
-    uid = parse_oauth_state(state)
-    if not uid:
+    parsed = parse_oauth_state(state)
+    if not parsed:
         return HTMLResponse(
             "<html><body><p>Invalid or expired session. Close this window and run <code>/susan connect</code> again in Slack.</p></body></html>",
             status_code=400,
         )
+    uid, slack_channel_id = parsed
     redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI", "")
     try:
         data = await exchange_code_for_tokens(code, redirect_uri)
@@ -474,18 +483,38 @@ async def auth_google_callback(code: str, state: str):
             )
         expires_in = int(data.get("expires_in", 3600))
         await upsert_tokens(uid, access, refresh, expires_in)
+        logger.info(
+            "Google OAuth tokens stored for Slack user=%s channel_in_state=%s",
+            uid,
+            slack_channel_id or "(none)",
+        )
     except Exception as e:
+        logger.exception("Google OAuth callback failed for user=%s", uid)
         return HTMLResponse(
             f"<html><body><p>Could not complete Google sign-in: {e!s}</p></body></html>",
             status_code=400,
         )
+
+    if slack_channel_id:
+        try:
+            await post_ephemeral(
+                slack_channel_id,
+                uid,
+                "✓ *Google connected.* Run your `/susan` command again (e.g. *create a doc*) so Susan can use your account.",
+            )
+            logger.info("Posted Google connect confirmation to Slack channel=%s user=%s", slack_channel_id, uid)
+        except Exception as e:
+            logger.warning("Could not post Slack confirmation after Google OAuth: %s", e)
+
     return HTMLResponse(
-        "<html><body><p>Google connected. You can close this tab and return to Slack.</p></body></html>"
+        "<html><body><p><strong>Google connected.</strong> You can close this tab. Check Slack for a confirmation message in the channel where you started.</p></body></html>"
     )
 
 
-def connect_google_slack_response(user: str, intro: str | None = None) -> JSONResponse:
-    """Ephemeral message + button to open Google OAuth (same as /susan connect)."""
+def connect_google_slack_response(
+    user: str, intro: str | None = None, channel_id: str | None = None
+) -> JSONResponse:
+    """Ephemeral message with link to Google OAuth. Pass channel_id so we can notify Slack after connect."""
     base = public_base_url()
     if not base:
         return JSONResponse(
@@ -506,7 +535,7 @@ def connect_google_slack_response(user: str, intro: str | None = None) -> JSONRe
             }
         )
     intro = intro or "Connect your Google account so Susan uses *your* Docs, Gmail, and Calendar."
-    state = make_oauth_state(user)
+    state = make_oauth_state(user, channel_id=channel_id or None)
     auth_path = f"{base}/auth/google?state={urllib.parse.quote(state, safe='')}"
     # Use a mrkdwn link, not a Block Kit url button: Slack often treats url-less or
     # invalid-url buttons as interactive (random action_id → POST /susan/actions).
@@ -561,7 +590,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
     logger.info("Slack slash verified: user=%s channel=%s text=%r", user, channel, text[:120] if text else "")
 
     if text_lower == "connect" or text_lower.startswith("connect "):
-        return connect_google_slack_response(user)
+        return connect_google_slack_response(user, channel_id=channel or None)
 
     action = detect_action(text)
     if not action:
@@ -576,6 +605,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
         return connect_google_slack_response(
             user,
             intro="*Google isn’t connected yet.* Use the link below to sign in, then run your command again (or use `/susan connect` anytime).",
+            channel_id=channel or None,
         )
 
     async def run():
