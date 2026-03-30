@@ -211,18 +211,34 @@ def _is_public_slack_channel(channel_id: str) -> bool:
     return bool(channel_id) and channel_id.upper().startswith("C")
 
 
+def _is_dm_slack_channel(channel_id: str) -> bool:
+    """1:1 direct message with a user (incl. bot DM)."""
+    return bool(channel_id) and channel_id.upper().startswith("D")
+
+
+def _is_private_or_mpim_slack_channel(channel_id: str) -> bool:
+    """Private channel or multi-person DM — ids start with G."""
+    return bool(channel_id) and channel_id.upper().startswith("G")
+
+
 def _history_error_hint(channel_id: str) -> str:
-    c = (channel_id or "").upper()
-    if c.startswith("D"):
+    c = (channel_id or "").strip().upper()
+    if not c:
         return (
-            "For a *group DM*: add **Susan** to the conversation (⋮ or header → *Add people* / include the app like a member). "
-            "For *1:1* with the bot, open **Messages** → Susan. "
-            "The app needs `im:history` + `mpim:history` (and reinstall after scope changes)."
+            "Slack did not send a channel id. Try `/susan` again from the channel or DM, "
+            "or reinstall the app so bot scopes include `im:history` and `im:write` for DMs."
         )
-    if c.startswith("G"):
+    if _is_dm_slack_channel(c):
         return (
-            "Private channel or *multi-person DM* (often `G…`): add **Susan** under channel details → *Integrations* or participants. "
-            "Use `groups:history` / `mpim:history` on the app as appropriate."
+            "Susan could not read this DM. The app needs **`im:history`** and **`im:write`** (so the bot can open/resume the DM via the Slack API). "
+            "In [api.slack.com](https://api.slack.com/apps) → your app → *OAuth & Permissions* → add those Bot scopes → **reinstall** the app. "
+            "Then open **Messages** with Susan and run `/susan` again."
+        )
+    if _is_private_or_mpim_slack_channel(c):
+        return (
+            "For a *private channel* or *group DM* (`G…`): add **Susan** (*Channel details* → *Integrations* / *Add apps*, or add the app to the group DM). "
+            "The app needs `groups:history` / `mpim:history` (and `mpim:write` can help for some group DMs). "
+            "For a *thread in another channel*, paste a message permalink in `/susan`."
         )
     return (
         "This is a *public channel*: the bot must be a member. In the channel, run **`/invite @Susan`** "
@@ -230,6 +246,40 @@ def _history_error_hint(channel_id: str) -> str:
         "Optional: add Bot scope **`channels:join`** in api.slack.com → *reinstall app* so Susan can auto-join public channels. "
         "For a thread, paste a message permalink (⋯ → Copy link) in your `/susan` command."
     )
+
+
+async def _try_slack_open_im_with_user(slack_user_id: str) -> str | None:
+    """Open or resume 1:1 DM so conversations.history has a valid channel id (needs im:write)."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            "https://slack.com/api/conversations.open",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            json={"users": slack_user_id},
+        )
+    data = r.json()
+    if data.get("ok") and data.get("channel", {}).get("id"):
+        cid = data["channel"]["id"]
+        logger.info("Slack: conversations.open(users) resolved DM channel=%s for user=%s", cid, slack_user_id)
+        return cid
+    logger.warning("Slack: conversations.open(users) failed: %s", data)
+    return None
+
+
+async def _try_slack_open_by_channel_id(channel: str) -> str | None:
+    """Resume an existing DM/mpim by id (helps some G… group DMs)."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            "https://slack.com/api/conversations.open",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            json={"channel": channel},
+        )
+    data = r.json()
+    if data.get("ok") and data.get("channel", {}).get("id"):
+        cid = data["channel"]["id"]
+        logger.info("Slack: conversations.open(channel) resolved channel=%s", cid)
+        return cid
+    logger.warning("Slack: conversations.open(channel) failed: %s", data)
+    return None
 
 
 async def _try_slack_join_channel(channel: str) -> None:
@@ -272,18 +322,29 @@ async def _fetch_slack_history_once(channel: str, thread_ts: str | None) -> dict
     return r.json()
 
 
-async def fetch_slack_history(channel: str, thread_ts: str | None) -> str:
+async def fetch_slack_history(
+    channel: str, thread_ts: str | None, slack_user_id: str | None = None
+) -> str:
     data = await _fetch_slack_history_once(channel, thread_ts)
     if not data.get("ok"):
         err = data.get("error", "unknown_error")
         if err in ("channel_not_found", "not_in_channel") and _is_public_slack_channel(channel):
             await _try_slack_join_channel(channel)
             data = await _fetch_slack_history_once(channel, thread_ts)
-        elif err in ("channel_not_found", "not_in_channel"):
-            logger.info(
-                "Slack: skip conversations.join (DM/private/mpim — not a public C… channel): %s",
-                channel[:12] if channel else "",
-            )
+        elif (
+            err in ("channel_not_found", "not_in_channel")
+            and _is_dm_slack_channel(channel)
+            and slack_user_id
+        ):
+            new_ch = await _try_slack_open_im_with_user(slack_user_id)
+            if new_ch:
+                data = await _fetch_slack_history_once(new_ch, thread_ts)
+        elif err in ("channel_not_found", "not_in_channel") and _is_private_or_mpim_slack_channel(
+            channel
+        ):
+            new_ch = await _try_slack_open_by_channel_id(channel)
+            if new_ch:
+                data = await _fetch_slack_history_once(new_ch, thread_ts)
     if not data.get("ok"):
         err = data.get("error", "unknown_error")
         logger.error("Slack conversations API failed: %s full=%s", err, data)
@@ -620,7 +681,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                 link_ch,
                 link_ts,
             )
-            convo = await fetch_slack_history(hist_channel, hist_thread_ts)
+            convo = await fetch_slack_history(hist_channel, hist_thread_ts, user)
             await process_command(action, convo, text, channel, user, thread_ts, response_url)
         except Exception as e:
             logger.exception("Susan background task failed: %s", e)

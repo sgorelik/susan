@@ -35,7 +35,9 @@
         "channels:join",
         "groups:history",
         "im:history",
+        "im:write",
         "mpim:history",
+        "mpim:write",
         "users:read"
       ]
     },
