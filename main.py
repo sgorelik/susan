@@ -203,11 +203,25 @@ ACTIONS = {
         "open a GitHub issue",
         ["github issue", "open issue", "file issue", "create issue", "issue"],
     ),
+    # Before "pr" so "summarize prs …" does not match the bare "pr" keyword.
+    "pr_summary": (
+        "summarize merged GitHub PRs",
+        [
+            "summarize pull requests",
+            "summarize prs",
+            "summarize merged pr",
+            "pr summary",
+            "pull request summary",
+            "github pr summary",
+            "prs summary",
+            "pr summaries",
+        ],
+    ),
     "pr": ("create a GitHub PR", ["pull request", "create pr", "open pr", "pr"]),
 }
 
 GOOGLE_ACTIONS = frozenset({"doc", "email", "invite"})
-GITHUB_ACTIONS = frozenset({"pr", "issue"})
+GITHUB_ACTIONS = frozenset({"pr", "issue", "pr_summary"})
 
 APPROVE_ACTION_TYPES = frozenset({"doc", "email", "invite", "pr", "issue"})
 
@@ -756,6 +770,161 @@ def resolve_github_repo_for_pr(text: str) -> tuple[str | None, str | None, bool]
     ), False
 
 
+def parse_pr_summary_time_range(text: str) -> tuple[str, str]:
+    """Return inclusive merged-date range as YYYY-MM-DD (UTC) for GitHub search."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    lower = text.lower()
+
+    m = re.search(r"last\s+(\d+)\s+days?", lower)
+    if m:
+        n = max(1, min(365, int(m.group(1))))
+        start = today - timedelta(days=n)
+        return start.isoformat(), today.isoformat()
+
+    if re.search(r"\b(last|past)\s+week\b", lower):
+        start = today - timedelta(days=7)
+        return start.isoformat(), today.isoformat()
+
+    if re.search(r"\b(last|past)\s+month\b", lower):
+        start = today - timedelta(days=30)
+        return start.isoformat(), today.isoformat()
+
+    m = re.search(r"\bsince\s+(\d{4}-\d{2}-\d{2})\b", lower)
+    if m:
+        return m.group(1), today.isoformat()
+
+    m = re.search(
+        r"\b(?:between|from)\s+(\d{4}-\d{2}-\d{2})\s+(?:and|to)\s+(\d{4}-\d{2}-\d{2})\b",
+        lower,
+    )
+    if m:
+        return m.group(1), m.group(2)
+
+    m = re.search(r"\bin\s+(?:the\s+)?last\s+(\d+)\s+weeks?\b", lower)
+    if m:
+        w = max(1, min(52, int(m.group(1))))
+        start = today - timedelta(weeks=w)
+        return start.isoformat(), today.isoformat()
+
+    start = today - timedelta(days=7)
+    return start.isoformat(), today.isoformat()
+
+
+async def fetch_merged_prs_for_repo_range(
+    repo: str, since_d: str, until_d: str, token: str
+) -> list[dict]:
+    """GitHub search API: merged PRs in repo between since_d and until_d (YYYY-MM-DD)."""
+    q = f"repo:{repo} is:pr is:merged merged:>={since_d} merged:<={until_d}"
+    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    items: list[dict] = []
+    async with httpx.AsyncClient(timeout=60) as client:
+        for page in range(1, 11):
+            r = await client.get(
+                "https://api.github.com/search/issues",
+                headers=hdrs,
+                params={"q": q, "per_page": 100, "page": page},
+            )
+            data = r.json()
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"GitHub search failed ({r.status_code}): {data.get('message', data)}"
+                )
+            batch = data.get("items") or []
+            items.extend(batch)
+            if len(batch) < 100:
+                break
+    return items
+
+
+async def post_long_ephemeral(
+    channel: str,
+    user: str,
+    title: str,
+    body: str,
+    response_url: str | None = None,
+) -> None:
+    """Slack mrkdwn sections are limited ~3000 chars; split long summaries."""
+    chunk = 2800
+    parts: list[str] = []
+    s = body.strip()
+    while s:
+        parts.append(s[:chunk])
+        s = s[chunk:]
+    if not parts:
+        parts = ["_(empty)_"]
+    blocks: list[dict] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*{title}*\n_(only visible to you)_"},
+        }
+    ]
+    for p in parts:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": p[:2900]}})
+    await notify_user_ephemeral(channel, user, title, blocks, response_url)
+
+
+async def process_pr_summary(
+    repo: str,
+    command_text: str,
+    convo: str,
+    channel: str,
+    user: str,
+    thread_ts: str | None,
+    response_url: str | None,
+) -> None:
+    since_d, until_d = parse_pr_summary_time_range(command_text)
+    try:
+        token = await get_github_token(user)
+    except ValueError as e:
+        await notify_user_ephemeral(channel, user, str(e), None, response_url)
+        return
+    try:
+        items = await fetch_merged_prs_for_repo_range(repo, since_d, until_d, token)
+    except Exception as e:
+        logger.exception("GitHub PR fetch failed")
+        await notify_user_ephemeral(channel, user, f"Susan error: {e}", None, response_url)
+        return
+    lines: list[str] = []
+    for it in items:
+        num = it.get("number")
+        title = (it.get("title") or "").replace("\n", " ")
+        url = it.get("html_url") or ""
+        pr_meta = it.get("pull_request") or {}
+        merged = pr_meta.get("merged_at") or it.get("closed_at") or ""
+        login = (it.get("user") or {}).get("login") or "?"
+        lines.append(f"#{num} | {merged[:10] if merged else '?'} | @{login} | {title} | {url}")
+    raw_list = "\n".join(lines) if lines else "(No merged PRs in this window.)"
+    prompt = (
+        f"Repository `{repo}`.\n"
+        f"Merged date range (UTC, inclusive): {since_d} through {until_d}.\n"
+        f"Merged PRs ({len(items)}):\n{raw_list}\n"
+    )
+    if (convo or "").strip():
+        prompt += f"\nSlack thread context (optional):\n{convo.strip()[:6000]}\n"
+    system = (
+        "You are Susan. Write a concise Slack-ready summary (mrkdwn) of merged pull requests. "
+        "Use short ## headings, bullets, and link PRs as <url|#123 short title>. "
+        "Group by theme or area if obvious. Note the date range and repo at the top. "
+        "If there were zero PRs, say so and suggest widening the time range."
+    )
+    try:
+        summary = await call_claude(system, prompt)
+    except Exception as e:
+        logger.exception("PR summary Claude failed")
+        await notify_user_ephemeral(channel, user, f"Susan error: {e}", None, response_url)
+        return
+    await post_long_ephemeral(
+        channel,
+        user,
+        f"PR summary — `{repo}` ({since_d} → {until_d})",
+        summary,
+        response_url,
+    )
+
+
 def resolve_github_repo_for_issue(text: str) -> tuple[str | None, str | None, bool]:
     allow = _issue_allowlist()
     parsed = parse_repo_slug_from_text(text)
@@ -790,7 +959,12 @@ async def post_github_repo_picker_ephemeral(
     allow: list[str],
 ) -> None:
     """Ephemeral blocks: buttons (≤8 repos) or dropdown (>8). Uses DB-backed session id."""
-    label = "PR" if kind == "pr" else "issue"
+    if kind == "pr":
+        label = "PR"
+    elif kind == "summary":
+        label = "PR summary"
+    else:
+        label = "issue"
     pick_id = await create_repo_pick_pending(user, channel, thread_ts, kind, text)
     blocks: list[dict] = [
         {
@@ -1206,29 +1380,35 @@ async def resume_slash_after_oauth(row: dict) -> None:
         hist_thread_ts = thread_ts or link_ts
         convo = await fetch_slack_history(hist_channel, hist_thread_ts, user)
         if action in GITHUB_ACTIONS:
-            if action == "pr":
-                repo, err, need_pick = resolve_github_repo_for_pr(text)
-            else:
+            if action == "issue":
                 repo, err, need_pick = resolve_github_repo_for_issue(text)
+            else:
+                repo, err, need_pick = resolve_github_repo_for_pr(text)
             if need_pick:
-                allow = _pr_allowlist() if action == "pr" else _issue_allowlist()
+                pick_kind = "summary" if action == "pr_summary" else action
+                allow = _pr_allowlist() if action in ("pr", "pr_summary") else _issue_allowlist()
                 await post_github_repo_picker_ephemeral(
-                    channel, user, action, text, thread_ts, response_url, allow
+                    channel, user, pick_kind, text, thread_ts, response_url, allow
                 )
                 return
             if err:
                 await notify_user_ephemeral(channel, user, err, None, response_url)
                 return
-            await process_command(
-                action,
-                convo,
-                text,
-                channel,
-                user,
-                thread_ts,
-                response_url,
-                github_repo=repo,
-            )
+            if action == "pr_summary":
+                await process_pr_summary(
+                    repo, text, convo, channel, user, thread_ts, response_url
+                )
+            else:
+                await process_command(
+                    action,
+                    convo,
+                    text,
+                    channel,
+                    user,
+                    thread_ts,
+                    response_url,
+                    github_repo=repo,
+                )
         else:
             await process_command(action, convo, text, channel, user, thread_ts, response_url)
     except Exception as e:
@@ -1592,7 +1772,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
         return JSONResponse(
             {
                 "response_type": "ephemeral",
-                "text": "Susan doesn't understand that command. Try: `connect` / `connect google` / `connect github`, `create a doc`, `send email`, `create invite`, `create issue`, or `create pr`.",
+                "text": "Susan doesn't understand that command. Try: `connect`, `create a doc`, `send email`, `create invite`, `create issue`, `create pr`, or `summarize prs …` (GitHub merged PRs for a repo + time range).",
             }
         )
 
@@ -1632,29 +1812,35 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
             )
             convo = await fetch_slack_history(hist_channel, hist_thread_ts, user)
             if action in GITHUB_ACTIONS:
-                if action == "pr":
-                    repo, err, need_pick = resolve_github_repo_for_pr(text)
-                else:
+                if action == "issue":
                     repo, err, need_pick = resolve_github_repo_for_issue(text)
+                else:
+                    repo, err, need_pick = resolve_github_repo_for_pr(text)
                 if need_pick:
-                    allow = _pr_allowlist() if action == "pr" else _issue_allowlist()
+                    pick_kind = "summary" if action == "pr_summary" else action
+                    allow = _pr_allowlist() if action in ("pr", "pr_summary") else _issue_allowlist()
                     await post_github_repo_picker_ephemeral(
-                        channel, user, action, text, thread_ts, response_url, allow
+                        channel, user, pick_kind, text, thread_ts, response_url, allow
                     )
                     return
                 if err:
                     await notify_user_ephemeral(channel, user, err, None, response_url)
                     return
-                await process_command(
-                    action,
-                    convo,
-                    text,
-                    channel,
-                    user,
-                    thread_ts,
-                    response_url,
-                    github_repo=repo,
-                )
+                if action == "pr_summary":
+                    await process_pr_summary(
+                        repo, text, convo, channel, user, thread_ts, response_url
+                    )
+                else:
+                    await process_command(
+                        action,
+                        convo,
+                        text,
+                        channel,
+                        user,
+                        thread_ts,
+                        response_url,
+                        github_repo=repo,
+                    )
             else:
                 await process_command(action, convo, text, channel, user, thread_ts, response_url)
         except Exception as e:
@@ -1665,12 +1851,12 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                 logger.error("Could not notify user in Slack: %s", e2)
 
     background_tasks.add_task(run)
-    return JSONResponse(
-        {
-            "response_type": "ephemeral",
-            "text": f"Got it — Susan is reading the channel and preparing a *{ACTIONS[action][0]}* preview...",
-        }
+    ack = (
+        "Got it — Susan is fetching *merged PRs* from GitHub for that repo and date range, then drafting a summary (only visible to you)."
+        if action == "pr_summary"
+        else f"Got it — Susan is reading the channel and preparing a *{ACTIONS[action][0]}* preview..."
     )
+    return JSONResponse({"response_type": "ephemeral", "text": ack})
 
 
 EMAIL_IN_TEXT_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
@@ -1823,9 +2009,11 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                         "text": "Picker expired. Run `/susan` again.",
                     }
                 )
-            if row["kind"] not in ("pr", "issue"):
+            if row["kind"] not in ("pr", "issue", "summary"):
                 return JSONResponse({})
-            allow = _pr_allowlist() if row["kind"] == "pr" else _issue_allowlist()
+            allow = (
+                _pr_allowlist() if row["kind"] in ("pr", "summary") else _issue_allowlist()
+            )
             if allow and repo not in allow:
                 return JSONResponse(
                     {"response_type": "ephemeral", "text": f"Repo `{repo}` is not allowed."}
@@ -1834,24 +2022,38 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
             async def run_repo_pick():
                 try:
                     convo = await fetch_slack_history(row["channel_id"], row["thread_ts"], user)
-                    await process_command(
-                        row["kind"],
-                        convo,
-                        row["command_text"],
-                        row["channel_id"],
-                        user,
-                        row["thread_ts"],
-                        None,
-                        github_repo=repo,
-                    )
+                    if row["kind"] == "summary":
+                        await process_pr_summary(
+                            repo,
+                            row["command_text"],
+                            convo,
+                            row["channel_id"],
+                            user,
+                            row["thread_ts"],
+                            None,
+                        )
+                    else:
+                        await process_command(
+                            row["kind"],
+                            convo,
+                            row["command_text"],
+                            row["channel_id"],
+                            user,
+                            row["thread_ts"],
+                            None,
+                            github_repo=repo,
+                        )
                 except Exception as e:
                     logger.exception("GitHub repo pick follow-up failed")
                     await post_ephemeral(channel, user, f"Susan error: {e}")
 
             background_tasks.add_task(run_repo_pick)
-            return JSONResponse(
-                {"response_type": "ephemeral", "text": f"Using `{repo}` — preparing preview…"}
+            pick_msg = (
+                f"Using `{repo}` — fetching merged PRs…"
+                if row["kind"] == "summary"
+                else f"Using `{repo}` — preparing preview…"
             )
+            return JSONResponse({"response_type": "ephemeral", "text": pick_msg})
 
         if aid.startswith("github_repo_menu_"):
             pick_id = aid.removeprefix("github_repo_menu_")
@@ -1869,7 +2071,11 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                         "text": "Picker expired. Run `/susan` again.",
                     }
                 )
-            allow = _pr_allowlist() if row["kind"] == "pr" else _issue_allowlist()
+            if row["kind"] not in ("pr", "issue", "summary"):
+                return JSONResponse({})
+            allow = (
+                _pr_allowlist() if row["kind"] in ("pr", "summary") else _issue_allowlist()
+            )
             if allow and repo not in allow:
                 return JSONResponse(
                     {"response_type": "ephemeral", "text": f"Repo `{repo}` is not allowed."}
@@ -1878,24 +2084,38 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
             async def run_repo_select():
                 try:
                     convo = await fetch_slack_history(row["channel_id"], row["thread_ts"], user)
-                    await process_command(
-                        row["kind"],
-                        convo,
-                        row["command_text"],
-                        row["channel_id"],
-                        user,
-                        row["thread_ts"],
-                        None,
-                        github_repo=repo,
-                    )
+                    if row["kind"] == "summary":
+                        await process_pr_summary(
+                            repo,
+                            row["command_text"],
+                            convo,
+                            row["channel_id"],
+                            user,
+                            row["thread_ts"],
+                            None,
+                        )
+                    else:
+                        await process_command(
+                            row["kind"],
+                            convo,
+                            row["command_text"],
+                            row["channel_id"],
+                            user,
+                            row["thread_ts"],
+                            None,
+                            github_repo=repo,
+                        )
                 except Exception as e:
                     logger.exception("GitHub repo menu follow-up failed")
                     await post_ephemeral(channel, user, f"Susan error: {e}")
 
             background_tasks.add_task(run_repo_select)
-            return JSONResponse(
-                {"response_type": "ephemeral", "text": f"Using `{repo}` — preparing preview…"}
+            sel_msg = (
+                f"Using `{repo}` — fetching merged PRs…"
+                if row["kind"] == "summary"
+                else f"Using `{repo}` — preparing preview…"
             )
+            return JSONResponse({"response_type": "ephemeral", "text": sel_msg})
 
         if aid == "cancel_susan":
             return JSONResponse({"response_type": "ephemeral", "text": "Susan cancelled. No action taken."})

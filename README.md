@@ -10,6 +10,7 @@ A FastAPI backend powering `/susan` in Slack.
 - `/susan create invite [instructions]`
 - `/susan create issue [instructions]` — open a GitHub issue (repo: `GITHUB_ISSUES_REPO` or `GITHUB_REPO`)
 - `/susan create pr [instructions]` — open a PR (repo: `GITHUB_REPO`)
+- `/susan summarize prs …` — Slack summary of **merged** PRs for a repo over a time range (same repo rules as PRs; needs GitHub + Claude). Examples: `last 7 days`, `last week`, `since 2026-01-01`, `from 2026-03-01 to 2026-03-15`. Default window: last 7 days.
 
 ## Deploy on Railway
 1. Connect this repo in Railway
