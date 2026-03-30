@@ -65,13 +65,23 @@ def parse_oauth_state(state: str) -> str | None:
         return None
 
 
+def _ensure_url_with_scheme(base: str) -> str:
+    """Slack link buttons and mrkdwn links need an absolute URL with a scheme."""
+    u = base.strip().rstrip("/")
+    if not u:
+        return ""
+    if not u.startswith(("http://", "https://")):
+        u = "https://" + u.lstrip("/")
+    return u
+
+
 def public_base_url() -> str:
-    explicit = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    explicit = _ensure_url_with_scheme(os.environ.get("PUBLIC_BASE_URL", ""))
     if explicit:
         return explicit
     redir = os.environ.get("GOOGLE_REDIRECT_URI", "")
     if redir.endswith("/auth/google/callback"):
-        return redir[: -len("/auth/google/callback")]
+        return _ensure_url_with_scheme(redir[: -len("/auth/google/callback")])
     return ""
 
 
@@ -498,20 +508,16 @@ def connect_google_slack_response(user: str, intro: str | None = None) -> JSONRe
     intro = intro or "Connect your Google account so Susan uses *your* Docs, Gmail, and Calendar."
     state = make_oauth_state(user)
     auth_path = f"{base}/auth/google?state={urllib.parse.quote(state, safe='')}"
+    # Use a mrkdwn link, not a Block Kit url button: Slack often treats url-less or
+    # invalid-url buttons as interactive (random action_id → POST /susan/actions).
+    link = f"<{auth_path}|Connect Google Account>"
     blocks = [
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": intro},
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Connect Google Account"},
-                    "url": auth_path,
-                }
-            ],
+            "text": {
+                "type": "mrkdwn",
+                "text": f"{intro}\n\n{link}",
+            },
         },
     ]
     return JSONResponse(
@@ -569,7 +575,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
     if action in GOOGLE_ACTIONS and not await user_has_google_tokens(user):
         return connect_google_slack_response(
             user,
-            intro="*Google isn’t connected yet.* Use the button to link your account, then run your command again (or use `/susan connect` anytime).",
+            intro="*Google isn’t connected yet.* Use the link below to sign in, then run your command again (or use `/susan connect` anytime).",
         )
 
     async def run():
