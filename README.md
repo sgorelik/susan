@@ -30,7 +30,7 @@ A FastAPI backend powering `/susan` in Slack.
 | `GITHUB_REDIRECT_URI` | Must match the app exactly, e.g. `https://<host>/auth/github/callback` |
 | `GITHUB_OAUTH_SCOPE` | Optional; default `repo` (use `public_repo` for public repos only) |
 | `GITHUB_REPO` | Default repo for PRs (e.g. `myorg/myrepo`) when you don’t type `owner/repo` in the command |
-| `GITHUB_REPOS` | Optional comma-separated **allowlist** (e.g. `org/a,org/b`). If set with multiple entries, users must include `owner/repo` in `/susan` **or** you set `GITHUB_REPO` as the default (must be one of the allowed slugs). |
+| `GITHUB_REPOS` | Optional comma-separated **allowlist** (e.g. `org/a,org/b`). If several repos are listed and `GITHUB_REPO` is not set, Susan sends a **repo picker** (buttons or dropdown) in Slack instead of mis-parsing URLs. |
 | `GITHUB_ISSUES_REPO` | Optional; default repo for issues if not set in the command |
 | `GITHUB_ISSUES_REPOS` | Optional; comma allowlist for issues (defaults to `GITHUB_REPOS` if unset) |
 | `GITHUB_BASE_BRANCH` | e.g. `main` |

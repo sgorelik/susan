@@ -17,6 +17,8 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 import httpx
 from db import (
+    consume_repo_pick_pending,
+    create_repo_pick_pending,
     exchange_code_for_tokens,
     exchange_github_code_for_token,
     get_github_token,
@@ -520,45 +522,72 @@ def _issue_allowlist() -> list[str]:
     return _pr_allowlist()
 
 
+def is_plausible_github_repo_slug(slug: str) -> bool:
+    """Reject Slack URLs and other false positives (e.g. frontier-one.slack.com/archives)."""
+    if not slug or "/" not in slug:
+        return False
+    parts = slug.split("/", 1)
+    if len(parts) != 2:
+        return False
+    owner, name = parts[0].strip(), parts[1].strip()
+    if not owner or not name:
+        return False
+    low = slug.lower()
+    if "slack.com" in low or "archives" in name.lower():
+        return False
+    if "http://" in low or "https://" in low:
+        return False
+    if "." in owner:
+        return False
+    if not re.match(r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,38}[a-zA-Z0-9])?/[a-zA-Z0-9._-]+$", slug):
+        return False
+    return True
+
+
 def parse_repo_slug_from_text(text: str) -> str | None:
-    """Extract owner/repo from slash command text (repo: x/y, in x/y, or first x/y)."""
-    m = re.search(r"\b(?:repo|in)\s*:?\s*([a-z0-9_.-]+/[a-z0-9_.-]+)\b", text, re.I)
+    """Extract owner/repo from slash text; validated so Slack links are never treated as repos."""
+    m = re.search(r"\b(?:repo|in)\s*:?\s*([^\s]+/[^\s]+)", text, re.I)
     if m:
-        return m.group(1).lower()
-    m = re.search(r"\b([a-z0-9_.-]+/[a-z0-9_.-]+)\b", text)
+        cand = m.group(1).strip().rstrip(".,;)")
+        if is_plausible_github_repo_slug(cand):
+            return cand.lower()
+    m = re.search(r"github\.com/([^/\s]+)/([^/\s?#]+)", text, re.I)
     if m:
-        return m.group(1).lower()
+        cand = f"{m.group(1)}/{m.group(2)}"
+        if is_plausible_github_repo_slug(cand):
+            return cand.lower()
+    m = re.search(r"\b([a-zA-Z0-9][a-zA-Z0-9-]{0,38}/[a-zA-Z0-9._-]+)\b", text)
+    if m:
+        cand = m.group(1)
+        if is_plausible_github_repo_slug(cand):
+            return cand.lower()
     return None
 
 
-def resolve_github_repo_for_pr(text: str) -> tuple[str | None, str | None]:
-    """Returns (repo, error_ephemeral)."""
+def resolve_github_repo_for_pr(text: str) -> tuple[str | None, str | None, bool]:
+    """Returns (repo, error_ephemeral, needs_interactive_picker)."""
     allow = _pr_allowlist()
     parsed = parse_repo_slug_from_text(text)
     default = (os.environ.get("GITHUB_REPO") or "").strip().lower()
     if parsed:
         if allow and parsed not in allow:
-            return None, f"Repo `{parsed}` is not allowed. Allowed: {', '.join(allow)}."
-        return parsed, None
+            return None, f"Repo `{parsed}` is not allowed. Allowed: {', '.join(allow)}.", False
+        return parsed, None, False
     if default:
         if allow and default not in allow:
-            return None, f"Default `GITHUB_REPO` (`{default}`) is not in `GITHUB_REPOS`: {', '.join(allow)}."
-        return default, None
+            return None, f"Default `GITHUB_REPO` (`{default}`) is not in `GITHUB_REPOS`: {', '.join(allow)}.", False
+        return default, None, False
     if len(allow) == 1:
-        return allow[0], None
+        return allow[0], None, False
     if len(allow) > 1:
-        return None, (
-            f"*Which GitHub repo?* Put `owner/repo` in your command, e.g. `create pr {allow[0]} …`.\n"
-            f"Allowed: {', '.join(allow)}.\n"
-            "Or set a single default with `GITHUB_REPO` on the server."
-        )
+        return None, None, True
     return None, (
         "No GitHub repo configured. Set `GITHUB_REPO` (default) or `GITHUB_REPOS` (comma-separated allowlist) "
         "on the server, or include `owner/repo` in your command."
-    )
+    ), False
 
 
-def resolve_github_repo_for_issue(text: str) -> tuple[str | None, str | None]:
+def resolve_github_repo_for_issue(text: str) -> tuple[str | None, str | None, bool]:
     allow = _issue_allowlist()
     parsed = parse_repo_slug_from_text(text)
     default = (
@@ -566,23 +595,82 @@ def resolve_github_repo_for_issue(text: str) -> tuple[str | None, str | None]:
     ).strip().lower()
     if parsed:
         if allow and parsed not in allow:
-            return None, f"Repo `{parsed}` is not allowed for issues. Allowed: {', '.join(allow)}."
-        return parsed, None
+            return None, f"Repo `{parsed}` is not allowed for issues. Allowed: {', '.join(allow)}.", False
+        return parsed, None, False
     if default:
         if allow and default not in allow:
-            return None, f"Default issues repo (`{default}`) is not in the allowlist: {', '.join(allow)}."
-        return default, None
+            return None, f"Default issues repo (`{default}`) is not in the allowlist: {', '.join(allow)}.", False
+        return default, None, False
     if len(allow) == 1:
-        return allow[0], None
+        return allow[0], None, False
     if len(allow) > 1:
-        return None, (
-            f"*Which repo for the issue?* e.g. `create issue {allow[0]} …`.\n"
-            f"Allowed: {', '.join(allow)}.\n"
-            "Or set `GITHUB_ISSUES_REPO` / `GITHUB_REPO` as default."
-        )
+        return None, None, True
     return None, (
         "No repo for issues. Set `GITHUB_REPO` or `GITHUB_ISSUES_REPO`, or `GITHUB_REPOS` (allowlist), "
         "or include `owner/repo` in your command."
+    ), False
+
+
+async def post_github_repo_picker_ephemeral(
+    channel: str,
+    user: str,
+    kind: str,
+    text: str,
+    thread_ts: str | None,
+    response_url: str | None,
+    allow: list[str],
+) -> None:
+    """Ephemeral blocks: buttons (≤8 repos) or dropdown (>8). Uses DB-backed session id."""
+    label = "PR" if kind == "pr" else "issue"
+    pick_id = await create_repo_pick_pending(user, channel, thread_ts, kind, text)
+    blocks: list[dict] = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Choose a GitHub repo* for this {label} (from `GITHUB_REPOS`):",
+            },
+        }
+    ]
+    if len(allow) <= 8:
+        for i in range(0, len(allow), 5):
+            chunk = allow[i : i + 5]
+            elements = []
+            for repo in chunk:
+                payload = json.dumps({"i": pick_id, "r": repo}, separators=(",", ":"))
+                elements.append(
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": repo[:75]},
+                        "action_id": "github_repo_pick",
+                        "value": payload[:2000],
+                    }
+                )
+            blocks.append({"type": "actions", "elements": elements})
+    else:
+        options = []
+        for r in allow[:100]:
+            options.append(
+                {
+                    "text": {"type": "plain_text", "text": r[:75]},
+                    "value": r[:75],
+                }
+            )
+        blocks.append(
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "static_select",
+                        "action_id": f"github_repo_menu_{pick_id}",
+                        "placeholder": {"type": "plain_text", "text": "Select repository"},
+                        "options": options,
+                    }
+                ],
+            }
+        )
+    await notify_user_ephemeral(
+        channel, user, f"Pick a repo for this {label}", blocks, response_url
     )
 
 
@@ -606,21 +694,32 @@ async def process_command(
     user: str,
     thread_ts: str | None,
     response_url: str | None = None,
+    github_repo: str | None = None,
 ):
     try:
         repo_line = ""
         if action == "pr":
-            repo, err = resolve_github_repo_for_pr(instructions)
-            if err:
-                await notify_user_ephemeral(channel, user, err, None, response_url)
+            if not github_repo:
+                await notify_user_ephemeral(
+                    channel,
+                    user,
+                    "Internal error: missing GitHub repo for PR. Run `/susan` again.",
+                    None,
+                    response_url,
+                )
                 return
-            repo_line = f"{REPO_PREFIX}{repo}\n"
+            repo_line = f"{REPO_PREFIX}{github_repo}\n"
         elif action == "issue":
-            repo, err = resolve_github_repo_for_issue(instructions)
-            if err:
-                await notify_user_ephemeral(channel, user, err, None, response_url)
+            if not github_repo:
+                await notify_user_ephemeral(
+                    channel,
+                    user,
+                    "Internal error: missing GitHub repo for issue. Run `/susan` again.",
+                    None,
+                    response_url,
+                )
                 return
-            repo_line = f"{REPO_PREFIX}{repo}\n"
+            repo_line = f"{REPO_PREFIX}{github_repo}\n"
 
         preview = await call_claude(
             SYSTEM_PROMPTS[action],
@@ -1004,7 +1103,32 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                 link_ts,
             )
             convo = await fetch_slack_history(hist_channel, hist_thread_ts, user)
-            await process_command(action, convo, text, channel, user, thread_ts, response_url)
+            if action in GITHUB_ACTIONS:
+                if action == "pr":
+                    repo, err, need_pick = resolve_github_repo_for_pr(text)
+                else:
+                    repo, err, need_pick = resolve_github_repo_for_issue(text)
+                if need_pick:
+                    allow = _pr_allowlist() if action == "pr" else _issue_allowlist()
+                    await post_github_repo_picker_ephemeral(
+                        channel, user, action, text, thread_ts, response_url, allow
+                    )
+                    return
+                if err:
+                    await notify_user_ephemeral(channel, user, err, None, response_url)
+                    return
+                await process_command(
+                    action,
+                    convo,
+                    text,
+                    channel,
+                    user,
+                    thread_ts,
+                    response_url,
+                    github_repo=repo,
+                )
+            else:
+                await process_command(action, convo, text, channel, user, thread_ts, response_url)
         except Exception as e:
             logger.exception("Susan background task failed: %s", e)
             try:
@@ -1057,6 +1181,99 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
         aid = (a.get("action_id") or "").strip()
         if not aid:
             continue
+        if aid == "github_repo_pick":
+            try:
+                pdata = json.loads(a.get("value") or "{}")
+            except json.JSONDecodeError:
+                return JSONResponse(
+                    {"response_type": "ephemeral", "text": "Invalid picker payload."}
+                )
+            pick_id = pdata.get("i")
+            repo = (pdata.get("r") or "").strip().lower()
+            if not pick_id or not repo:
+                return JSONResponse({"response_type": "ephemeral", "text": "Invalid picker."})
+            row = await consume_repo_pick_pending(pick_id, user)
+            if not row:
+                return JSONResponse(
+                    {
+                        "response_type": "ephemeral",
+                        "text": "Picker expired. Run `/susan` again.",
+                    }
+                )
+            if row["kind"] not in ("pr", "issue"):
+                return JSONResponse({})
+            allow = _pr_allowlist() if row["kind"] == "pr" else _issue_allowlist()
+            if allow and repo not in allow:
+                return JSONResponse(
+                    {"response_type": "ephemeral", "text": f"Repo `{repo}` is not allowed."}
+                )
+
+            async def run_repo_pick():
+                try:
+                    convo = await fetch_slack_history(row["channel_id"], row["thread_ts"], user)
+                    await process_command(
+                        row["kind"],
+                        convo,
+                        row["command_text"],
+                        row["channel_id"],
+                        user,
+                        row["thread_ts"],
+                        None,
+                        github_repo=repo,
+                    )
+                except Exception as e:
+                    logger.exception("GitHub repo pick follow-up failed")
+                    await post_ephemeral(channel, user, f"Susan error: {e}")
+
+            background_tasks.add_task(run_repo_pick)
+            return JSONResponse(
+                {"response_type": "ephemeral", "text": f"Using `{repo}` — preparing preview…"}
+            )
+
+        if aid.startswith("github_repo_menu_"):
+            pick_id = aid.removeprefix("github_repo_menu_")
+            sel = a.get("selected_option") or {}
+            repo = (sel.get("value") or "").strip().lower()
+            if not pick_id or not repo:
+                return JSONResponse(
+                    {"response_type": "ephemeral", "text": "No repository selected."}
+                )
+            row = await consume_repo_pick_pending(pick_id, user)
+            if not row:
+                return JSONResponse(
+                    {
+                        "response_type": "ephemeral",
+                        "text": "Picker expired. Run `/susan` again.",
+                    }
+                )
+            allow = _pr_allowlist() if row["kind"] == "pr" else _issue_allowlist()
+            if allow and repo not in allow:
+                return JSONResponse(
+                    {"response_type": "ephemeral", "text": f"Repo `{repo}` is not allowed."}
+                )
+
+            async def run_repo_select():
+                try:
+                    convo = await fetch_slack_history(row["channel_id"], row["thread_ts"], user)
+                    await process_command(
+                        row["kind"],
+                        convo,
+                        row["command_text"],
+                        row["channel_id"],
+                        user,
+                        row["thread_ts"],
+                        None,
+                        github_repo=repo,
+                    )
+                except Exception as e:
+                    logger.exception("GitHub repo menu follow-up failed")
+                    await post_ephemeral(channel, user, f"Susan error: {e}")
+
+            background_tasks.add_task(run_repo_select)
+            return JSONResponse(
+                {"response_type": "ephemeral", "text": f"Using `{repo}` — preparing preview…"}
+            )
+
         if aid == "cancel_susan":
             return JSONResponse({"response_type": "ephemeral", "text": "Susan cancelled. No action taken."})
         if aid.startswith("approve_"):

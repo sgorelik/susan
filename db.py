@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -118,9 +119,69 @@ class GithubToken(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class RepoPickPending(Base):
+    """Short-lived state for GitHub repo picker (Slack button value size limits)."""
+
+    __tablename__ = "repo_pick_pending"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    slack_user_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    channel_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    thread_ts: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    kind: Mapped[str] = mapped_column(String(8), nullable=False)
+    command_text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
+async def create_repo_pick_pending(
+    slack_user_id: str,
+    channel_id: str,
+    thread_ts: str | None,
+    kind: str,
+    command_text: str,
+) -> str:
+    pick_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        session.add(
+            RepoPickPending(
+                id=pick_id,
+                slack_user_id=slack_user_id,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                kind=kind,
+                command_text=command_text,
+                created_at=now,
+            )
+        )
+        await session.commit()
+    return pick_id
+
+
+async def consume_repo_pick_pending(pick_id: str, slack_user_id: str) -> dict | None:
+    """Load and delete pending row if it matches the user and is not expired (~2h)."""
+    async with SessionLocal() as session:
+        row = await session.get(RepoPickPending, pick_id)
+        if not row or row.slack_user_id != slack_user_id:
+            return None
+        if datetime.now(timezone.utc) - row.created_at > timedelta(hours=2):
+            await session.delete(row)
+            await session.commit()
+            return None
+        out = {
+            "channel_id": row.channel_id,
+            "thread_ts": row.thread_ts,
+            "kind": row.kind,
+            "command_text": row.command_text,
+        }
+        await session.delete(row)
+        await session.commit()
+        return out
 
 
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
