@@ -1360,11 +1360,12 @@ async def post_github_repo_picker_ephemeral(
 def _slack_multi_summary_selected_repos(payload: dict, pick_id: str) -> list[str]:
     """Read multi_static_select choices from block_actions `state` (values are allowlist indices)."""
     nid = pick_id.replace("-", "")
-    blk = f"m{nid}"
+    blk_section = f"s{nid}"
+    act_id = f"grms_{nid}"
     state = payload.get("state") or {}
     values = state.get("values") or {}
-    inner = values.get(blk) or {}
-    sel_el = inner.get("sel") or {}
+    inner = values.get(blk_section) or {}
+    sel_el = inner.get(act_id) or {}
     opts = sel_el.get("selected_options") or []
     out = [o.get("value", "").strip().lower() for o in opts if o.get("value")]
     if out:
@@ -1398,41 +1399,53 @@ async def post_github_repo_multi_summary_picker_ephemeral(
     """Ephemeral multi-select + confirm for PR summary when several repos are allowed."""
     pick_id = await create_repo_pick_pending(user, channel, thread_ts, "summary", text)
     nid = pick_id.replace("-", "")
-    blk_multi = f"m{nid}"
+    blk_section = f"s{nid}"
+    blk_go = f"g{nid}"
+    act_sel = f"grms_{nid}"
     # Slack option `value` must be ≤75 chars; long owner/repo breaks validation (invalid_blocks).
-    picked_allow = allow[:100]
+    picked_allow = [
+        x.strip().lower() for x in allow[:100] if (x or "").strip()
+    ]
+    if not picked_allow:
+        await notify_user_ephemeral(
+            channel,
+            user,
+            "`GITHUB_REPOS` is empty on the server — set it (comma-separated owner/repo) and try again.",
+            None,
+            response_url,
+        )
+        return
     options = [
         {
-            "text": {"type": "plain_text", "text": r[:75]},
+            "text": {"type": "plain_text", "text": r[:75] if r else "?"},
             "value": str(i),
         }
         for i, r in enumerate(picked_allow)
     ]
+    # multi_static_select in an actions block often yields invalid_blocks on chat.postEphemeral;
+    # use a section accessory instead.
     blocks: list[dict] = [
         {
             "type": "section",
+            "block_id": blk_section,
             "text": {
-                "type": "mrkdwn",
+                "type": "plain_text",
                 "text": (
-                    "*Choose one or more repositories* for this PR summary (from `GITHUB_REPOS`). "
-                    "Pick repos below, then click *Run PR summary*."
+                    "Choose one or more repositories for this PR summary, "
+                    "then click Run PR summary."
                 ),
+                "emoji": True,
+            },
+            "accessory": {
+                "type": "multi_static_select",
+                "action_id": act_sel,
+                "placeholder": {"type": "plain_text", "text": "Repositories"},
+                "options": options,
             },
         },
         {
             "type": "actions",
-            "block_id": blk_multi,
-            "elements": [
-                {
-                    "type": "multi_static_select",
-                    "action_id": "sel",
-                    "placeholder": {"type": "plain_text", "text": "Select repositories"},
-                    "options": options,
-                }
-            ],
-        },
-        {
-            "type": "actions",
+            "block_id": blk_go,
             "elements": [
                 {
                     "type": "button",
@@ -2681,6 +2694,10 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                     }
                 )
             allow_now = _pr_allowlist()
+            # Indices match post_github_repo_multi_summary_picker_ephemeral's picked_allow order.
+            picked_now = [
+                x.strip().lower() for x in allow_now[:100] if (x or "").strip()
+            ]
             seen_idx: set[int] = set()
             repos_ordered: list[str] = []
             for v in repos_sel:
@@ -2688,10 +2705,10 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                 if not vs.isdigit():
                     continue
                 idx = int(vs)
-                if idx in seen_idx or idx < 0 or idx >= len(allow_now):
+                if idx in seen_idx or idx < 0 or idx >= len(picked_now):
                     continue
                 seen_idx.add(idx)
-                repos_ordered.append(allow_now[idx].strip().lower())
+                repos_ordered.append(picked_now[idx])
             if not repos_ordered:
                 return JSONResponse(
                     {
