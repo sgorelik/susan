@@ -652,6 +652,8 @@ async def post_github_repo_picker_ephemeral(
         }
     ]
     if len(allow) <= 8:
+        # Slack requires unique action_id per interactive element in one message.
+        btn_idx = 0
         for i in range(0, len(allow), 5):
             chunk = allow[i : i + 5]
             elements = []
@@ -661,10 +663,11 @@ async def post_github_repo_picker_ephemeral(
                     {
                         "type": "button",
                         "text": {"type": "plain_text", "text": repo[:75]},
-                        "action_id": "github_repo_pick",
+                        "action_id": f"github_repo_pick_{btn_idx}",
                         "value": payload[:2000],
                     }
                 )
+                btn_idx += 1
             blocks.append({"type": "actions", "elements": elements})
     else:
         options = []
@@ -1314,7 +1317,8 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
         aid = (a.get("action_id") or "").strip()
         if not aid:
             continue
-        if aid == "github_repo_pick":
+        # Buttons use github_repo_pick_0, github_repo_pick_1, … (unique action_ids).
+        if aid.startswith("github_repo_pick"):
             try:
                 pdata = json.loads(a.get("value") or "{}")
             except json.JSONDecodeError:
