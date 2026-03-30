@@ -1,9 +1,9 @@
 {
   "display_information": {
     "name": "Susan",
-    "description": "AI Chief of Staff — creates docs, sends emails, books meetings and opens PRs from Slack conversations.",
+    "description": "AI Chief of Staff — docs, email, calendar, GitHub issues & PRs from Slack.",
     "background_color": "#534AB7",
-    "long_description": "Susan is your AI Chief of Staff. Type /susan in any channel or thread and she will read the conversation, generate a preview, and execute actions on your behalf — including creating Google Docs, sending emails via Gmail, creating Google Calendar invites, and opening GitHub PRs. All actions require your approval before executing."
+    "long_description": "Susan is your AI Chief of Staff. Type /susan in any channel or thread and she will read the conversation, generate a preview, and execute actions on your behalf — including Google Docs, Gmail, Google Calendar, GitHub issues, and GitHub PRs. All actions require your approval before executing."
   },
   "features": {
     "app_home": {
@@ -20,7 +20,7 @@
         "command": "/susan",
         "url": "https://susan-production.up.railway.app/susan",
         "description": "Ask Susan to act on this channel or thread",
-        "usage_hint": "connect | connect google | connect github | create a doc … | send email … | create invite … | create pr …",
+        "usage_hint": "connect | create a doc … | create issue … | create pr … | send email … | create invite …",
         "should_escape": false
       }
     ]

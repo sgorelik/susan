@@ -172,13 +172,18 @@ ACTIONS = {
     "doc": ("create a doc", ["doc", "document", "notes"]),
     "email": ("send email", ["email", "mail"]),
     "invite": ("create invite", ["invite", "calendar", "meeting", "event"]),
-    "pr": ("create pr", ["pr", "pull request", "github"]),
+    # "issue" before "pr" — keywords like "github issue" must match issue, not bare "github" on pr.
+    "issue": (
+        "open a GitHub issue",
+        ["github issue", "open issue", "file issue", "create issue", "issue"],
+    ),
+    "pr": ("create a GitHub PR", ["pull request", "create pr", "open pr", "pr"]),
 }
 
 GOOGLE_ACTIONS = frozenset({"doc", "email", "invite"})
-GITHUB_PR_ACTIONS = frozenset({"pr"})
+GITHUB_ACTIONS = frozenset({"pr", "issue"})
 
-APPROVE_ACTION_TYPES = frozenset({"doc", "email", "invite", "pr"})
+APPROVE_ACTION_TYPES = frozenset({"doc", "email", "invite", "pr", "issue"})
 
 
 def verify_slack(req_body: bytes, timestamp: str, signature: str) -> bool:
@@ -490,6 +495,7 @@ SYSTEM_PROMPTS = {
     "doc": "You are Susan. Given a Slack conversation, write a structured document with sections: ## Summary, ## Key Decisions, ## Action Items, ## Open Questions. Be concise and professional.",
     "email": "You are Susan. Given a Slack conversation, draft a professional email. Output ONLY:\nSubject: <subject>\n\n<body>",
     "invite": "You are Susan. Given a Slack conversation, draft a calendar invite. Output ONLY:\nTitle: ...\nDate/Time: ...\nDuration: ...\nAttendees: ...\nAgenda: ...\nInfer details from context.",
+    "issue": "You are Susan. Given a Slack conversation, draft a GitHub issue. Output ONLY:\nTitle: <short title>\n\nDescription:\n<markdown body with context, steps to reproduce, expected vs actual, or acceptance criteria as appropriate>\n",
     "pr": "You are Susan. Given a Slack conversation about code, draft a GitHub PR. Output ONLY:\nTitle: ...\n\nDescription:\n...\n\nFiles changed:\n<filename>\n```\n<code>\n```",
 }
 
@@ -738,7 +744,7 @@ def connect_github_slack_response(
                 "text": "GitHub OAuth is not configured. Set GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, and GITHUB_REDIRECT_URI.",
             }
         )
-    intro = intro or "Connect your GitHub account so Susan can open **PRs** as you (using `GITHUB_REPO` in the server config)."
+    intro = intro or "Connect your GitHub account so Susan can open **issues** and **PRs** (`GITHUB_ISSUES_REPO` / `GITHUB_REPO` on the server)."
     state = make_oauth_state(user, channel_id=channel_id or None)
     auth_path = f"{base}/auth/github?state={urllib.parse.quote(state, safe='')}"
     link = f"<{auth_path}|Connect GitHub Account>"
@@ -850,7 +856,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
         return JSONResponse(
             {
                 "response_type": "ephemeral",
-                "text": "Susan doesn't understand that command. Try: `connect` / `connect google` / `connect github`, `create a doc`, `send email`, `create invite`, or `create pr`.",
+                "text": "Susan doesn't understand that command. Try: `connect` / `connect google` / `connect github`, `create a doc`, `send email`, `create invite`, `create issue`, or `create pr`.",
             }
         )
 
@@ -861,7 +867,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
             channel_id=channel or None,
         )
 
-    if action in GITHUB_PR_ACTIONS and not await user_has_github_tokens(user):
+    if action in GITHUB_ACTIONS and not await user_has_github_tokens(user):
         return connect_github_slack_response(
             user,
             intro="*GitHub isn’t connected yet.* Use the link below to sign in, then run your command again (or use `/susan connect github` anytime).",
@@ -962,6 +968,8 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                 result = await send_gmail(value, user)
             elif action_type == "invite":
                 result = await create_calendar_invite(value, user)
+            elif action_type == "issue":
+                result = await create_github_issue(value, user)
             else:
                 result = await create_github_pr(value, user)
             await post_ephemeral(channel, user, f"✓ Susan done: {result}")
@@ -1058,6 +1066,42 @@ async def create_calendar_invite(content: str, slack_user_id: str) -> str:
     return f"Calendar invite created: {link}" if link else f"Calendar error: {data}"
 
 
+def _github_issues_repo() -> str:
+    """Issues target repo; optional GITHUB_ISSUES_REPO overrides GITHUB_REPO."""
+    return (os.environ.get("GITHUB_ISSUES_REPO") or os.environ.get("GITHUB_REPO") or "").strip()
+
+
+def _github_pr_repo() -> str:
+    return (os.environ.get("GITHUB_REPO") or "").strip()
+
+
+async def create_github_issue(content: str, slack_user_id: str) -> str:
+    import re
+
+    try:
+        token = await get_github_token(slack_user_id)
+    except ValueError as e:
+        return str(e)
+    repo = _github_issues_repo()
+    if not repo:
+        return "Issue not created — set `GITHUB_REPO` or `GITHUB_ISSUES_REPO` on the server (e.g. `org/repo`)."
+    title_m = re.search(r"^Title:\s*(.+)", content, re.M)
+    title = title_m.group(1).strip() if title_m else "Susan: issue from Slack"
+    desc_m = re.search(r"^Description:\s*", content, re.M)
+    body = content[desc_m.end() :].strip() if desc_m else content
+    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"https://api.github.com/repos/{repo}/issues",
+            headers=hdrs,
+            json={"title": title, "body": body},
+        )
+    data = r.json()
+    if r.status_code >= 400:
+        return f"GitHub issue error ({r.status_code}): {data}"
+    return f"Issue created: {data.get('html_url', data)}"
+
+
 async def create_github_pr(content: str, slack_user_id: str) -> str:
     import re
 
@@ -1065,7 +1109,7 @@ async def create_github_pr(content: str, slack_user_id: str) -> str:
         token = await get_github_token(slack_user_id)
     except ValueError as e:
         return str(e)
-    repo = os.environ.get("GITHUB_REPO", "")
+    repo = _github_pr_repo()
     base = os.environ.get("GITHUB_BASE_BRANCH", "main")
     if not repo:
         return "PR not created — GITHUB_REPO is not set on the server (e.g. `org/repo`)."

@@ -8,7 +8,8 @@ A FastAPI backend powering `/susan` in Slack.
 - `/susan create a doc [instructions]`
 - `/susan send email [instructions]`
 - `/susan create invite [instructions]`
-- `/susan create pr [instructions]`
+- `/susan create issue [instructions]` — open a GitHub issue (repo: `GITHUB_ISSUES_REPO` or `GITHUB_REPO`)
+- `/susan create pr [instructions]` — open a PR (repo: `GITHUB_REPO`)
 
 ## Deploy on Railway
 1. Connect this repo in Railway
@@ -29,6 +30,7 @@ A FastAPI backend powering `/susan` in Slack.
 | `GITHUB_REDIRECT_URI` | Must match the app exactly, e.g. `https://<host>/auth/github/callback` |
 | `GITHUB_OAUTH_SCOPE` | Optional; default `repo` (use `public_repo` for public repos only) |
 | `GITHUB_REPO` | Target repo for PRs, e.g. `myorg/myrepo` |
+| `GITHUB_ISSUES_REPO` | Optional; issues go here if set, else same as `GITHUB_REPO` |
 | `GITHUB_BASE_BRANCH` | e.g. `main` |
 
 See the full README in the artifacts for detailed setup instructions.
