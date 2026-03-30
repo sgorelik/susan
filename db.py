@@ -169,7 +169,8 @@ async def consume_repo_pick_pending(pick_id: str, slack_user_id: str) -> dict | 
         row = await session.get(RepoPickPending, pick_id)
         if not row or row.slack_user_id != slack_user_id:
             return None
-        if datetime.now(timezone.utc) - row.created_at > timedelta(hours=2):
+        created = _as_utc_aware(row.created_at)
+        if datetime.now(timezone.utc) - created > timedelta(hours=2):
             await session.delete(row)
             await session.commit()
             return None
@@ -233,7 +234,8 @@ async def consume_oauth_resume_pending(
         row = await session.get(OauthResumePending, resume_id)
         if not row or row.slack_user_id != slack_user_id or row.provider != provider:
             return None
-        if datetime.now(timezone.utc) - row.created_at > timedelta(hours=24):
+        created = _as_utc_aware(row.created_at)
+        if datetime.now(timezone.utc) - created > timedelta(hours=24):
             await session.delete(row)
             await session.commit()
             return None
