@@ -121,6 +121,8 @@ ACTIONS = {
 
 GOOGLE_ACTIONS = frozenset({"doc", "email", "invite"})
 
+APPROVE_ACTION_TYPES = frozenset({"doc", "email", "invite", "pr"})
+
 
 def verify_slack(req_body: bytes, timestamp: str, signature: str) -> bool:
     if not timestamp or not signature:
@@ -613,13 +615,48 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
         payload = json.loads(payload_raw)
     except json.JSONDecodeError:
         payload = json.loads(urllib.parse.unquote(payload_raw))
-    action_id = payload["actions"][0]["action_id"]
-    value = payload["actions"][0].get("value", "")
-    channel = payload["container"]["channel_id"]
-    user = payload["user"]["id"]
-    if action_id == "cancel_susan":
-        return JSONResponse({"response_type": "ephemeral", "text": "Susan cancelled. No action taken."})
-    action_type = action_id.replace("approve_", "")
+
+    ptype = payload.get("type")
+    if ptype and ptype != "block_actions":
+        logger.info("Ignoring Slack interaction type=%s", ptype)
+        return JSONResponse({})
+
+    actions = payload.get("actions") or []
+    if not actions:
+        logger.warning("block_actions with empty actions payload keys=%s", list(payload.keys()))
+        return JSONResponse({})
+
+    channel = (payload.get("container") or {}).get("channel_id") or (payload.get("channel") or {}).get("id") or ""
+    user = (payload.get("user") or {}).get("id") or ""
+    if not channel or not user:
+        logger.warning("block_actions missing channel or user: container=%s", payload.get("container"))
+        return JSONResponse({})
+
+    action_type: str | None = None
+    value = ""
+    for a in actions:
+        aid = (a.get("action_id") or "").strip()
+        if not aid:
+            continue
+        if aid == "cancel_susan":
+            return JSONResponse({"response_type": "ephemeral", "text": "Susan cancelled. No action taken."})
+        if aid.startswith("approve_"):
+            suffix = aid[len("approve_") :].strip().casefold()
+            value = a.get("value") or ""
+            if suffix in APPROVE_ACTION_TYPES:
+                action_type = suffix
+                break
+            logger.warning(
+                "Unknown approve button: action_id=%r normalized=%r user=%s",
+                aid,
+                suffix,
+                user,
+            )
+
+    if action_type is None:
+        # Wrong [0], link-only quirks, or stale payload — do not post "Unknown action."
+        logger.warning("No recognized approve/cancel in actions: %s", actions)
+        return JSONResponse({})
 
     async def execute():
         try:
@@ -629,10 +666,8 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                 result = await send_gmail(value, user)
             elif action_type == "invite":
                 result = await create_calendar_invite(value, user)
-            elif action_type == "pr":
-                result = await create_github_pr(value)
             else:
-                result = "Unknown action."
+                result = await create_github_pr(value)
             await post_ephemeral(channel, user, f"✓ Susan done: {result}")
         except Exception as e:
             await post_ephemeral(channel, user, f"Susan error during execution: {str(e)}")
