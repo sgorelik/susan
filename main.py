@@ -18,9 +18,13 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 import httpx
 from db import (
     exchange_code_for_tokens,
+    exchange_github_code_for_token,
+    get_github_token,
     get_valid_access_token,
     init_db,
+    upsert_github_token,
     upsert_tokens,
+    user_has_github_tokens,
     user_has_google_tokens,
 )
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
@@ -29,7 +33,6 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"].strip()
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"].strip()
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/documents",
@@ -43,7 +46,7 @@ def oauth_state_secret() -> str:
 
 
 def make_oauth_state(slack_user_id: str, channel_id: str | None = None) -> str:
-    """Signed state for Google OAuth. Optional channel_id enables a Slack follow-up after connect."""
+    """Signed state for OAuth (Google/GitHub). Optional channel_id enables Slack follow-up after connect."""
     exp = int(time.time()) + 3600
     payload: dict = {"u": slack_user_id, "exp": exp}
     if channel_id:
@@ -90,6 +93,9 @@ def public_base_url() -> str:
     redir = os.environ.get("GOOGLE_REDIRECT_URI", "")
     if redir.endswith("/auth/google/callback"):
         return _ensure_url_with_scheme(redir[: -len("/auth/google/callback")])
+    redir = os.environ.get("GITHUB_REDIRECT_URI", "")
+    if redir.endswith("/auth/github/callback"):
+        return _ensure_url_with_scheme(redir[: -len("/auth/github/callback")])
     return ""
 
 
@@ -105,6 +111,38 @@ def google_authorize_url(state: str) -> str:
         "state": state,
     }
     return "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
+
+
+def _google_oauth_configured() -> bool:
+    try:
+        _ = os.environ["GOOGLE_CLIENT_ID"]
+        _ = os.environ["GOOGLE_CLIENT_SECRET"]
+        _ = os.environ["GOOGLE_REDIRECT_URI"]
+        return True
+    except KeyError:
+        return False
+
+
+def _github_oauth_configured() -> bool:
+    try:
+        _ = os.environ["GITHUB_CLIENT_ID"]
+        _ = os.environ["GITHUB_CLIENT_SECRET"]
+        _ = os.environ["GITHUB_REDIRECT_URI"]
+        return True
+    except KeyError:
+        return False
+
+
+def github_authorize_url(state: str) -> str:
+    redirect_uri = os.environ["GITHUB_REDIRECT_URI"]
+    scope = (os.environ.get("GITHUB_OAUTH_SCOPE") or "repo").strip() or "repo"
+    params = {
+        "client_id": os.environ["GITHUB_CLIENT_ID"],
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "scope": scope,
+    }
+    return "https://github.com/login/oauth/authorize?" + urllib.parse.urlencode(params)
 
 
 @asynccontextmanager
@@ -138,6 +176,7 @@ ACTIONS = {
 }
 
 GOOGLE_ACTIONS = frozenset({"doc", "email", "invite"})
+GITHUB_PR_ACTIONS = frozenset({"pr"})
 
 APPROVE_ACTION_TYPES = frozenset({"doc", "email", "invite", "pr"})
 
@@ -572,6 +611,67 @@ async def auth_google_callback(code: str, state: str):
     )
 
 
+@app.get("/auth/github")
+async def auth_github_start(state: str):
+    parsed = parse_oauth_state(state)
+    if not parsed:
+        raise HTTPException(status_code=400, detail="Invalid or expired state")
+    try:
+        _ = os.environ["GITHUB_CLIENT_ID"]
+        _ = os.environ["GITHUB_CLIENT_SECRET"]
+        _ = os.environ["GITHUB_REDIRECT_URI"]
+    except KeyError:
+        raise HTTPException(status_code=500, detail="GitHub OAuth not configured")
+    return RedirectResponse(github_authorize_url(state))
+
+
+@app.get("/auth/github/callback")
+async def auth_github_callback(code: str, state: str):
+    parsed = parse_oauth_state(state)
+    if not parsed:
+        return HTMLResponse(
+            "<html><body><p>Invalid or expired session. Close this window and run <code>/susan connect github</code> again in Slack.</p></body></html>",
+            status_code=400,
+        )
+    uid, slack_channel_id = parsed
+    redirect_uri = os.environ.get("GITHUB_REDIRECT_URI", "")
+    try:
+        data = await exchange_github_code_for_token(code, redirect_uri)
+        access = data.get("access_token")
+        if not access:
+            return HTMLResponse(
+                "<html><body><p>GitHub did not return an access token. Try <code>/susan connect github</code> again.</p></body></html>",
+                status_code=400,
+            )
+        await upsert_github_token(uid, access)
+        logger.info(
+            "GitHub OAuth token stored for Slack user=%s channel_in_state=%s",
+            uid,
+            slack_channel_id or "(none)",
+        )
+    except Exception as e:
+        logger.exception("GitHub OAuth callback failed for user=%s", uid)
+        return HTMLResponse(
+            f"<html><body><p>Could not complete GitHub sign-in: {e!s}</p></body></html>",
+            status_code=400,
+        )
+
+    if slack_channel_id:
+        try:
+            await post_ephemeral(
+                slack_channel_id,
+                uid,
+                "✓ *GitHub connected.* Run your `/susan` command again (e.g. *create pr*) so Susan can use your GitHub account.",
+            )
+            logger.info("Posted GitHub connect confirmation to Slack channel=%s user=%s", slack_channel_id, uid)
+        except Exception as e:
+            logger.warning("Could not post Slack confirmation after GitHub OAuth: %s", e)
+
+    return HTMLResponse(
+        "<html><body><p><strong>GitHub connected.</strong> You can close this tab. Check Slack for a confirmation message in the channel where you started.</p></body></html>"
+    )
+
+
 def connect_google_slack_response(
     user: str, intro: str | None = None, channel_id: str | None = None
 ) -> JSONResponse:
@@ -619,6 +719,86 @@ def connect_google_slack_response(
     )
 
 
+def connect_github_slack_response(
+    user: str, intro: str | None = None, channel_id: str | None = None
+) -> JSONResponse:
+    """Ephemeral message with link to GitHub OAuth."""
+    base = public_base_url()
+    if not base:
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": "Set PUBLIC_BASE_URL or GITHUB_REDIRECT_URI (e.g. https://your-app.up.railway.app/auth/github/callback) so the Connect link works.",
+            }
+        )
+    if not _github_oauth_configured():
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": "GitHub OAuth is not configured. Set GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, and GITHUB_REDIRECT_URI.",
+            }
+        )
+    intro = intro or "Connect your GitHub account so Susan can open **PRs** as you (using `GITHUB_REPO` in the server config)."
+    state = make_oauth_state(user, channel_id=channel_id or None)
+    auth_path = f"{base}/auth/github?state={urllib.parse.quote(state, safe='')}"
+    link = f"<{auth_path}|Connect GitHub Account>"
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"{intro}\n\n{link}",
+            },
+        },
+    ]
+    return JSONResponse(
+        {
+            "response_type": "ephemeral",
+            "text": "GitHub connection (only visible to you).",
+            "blocks": blocks,
+        }
+    )
+
+
+def connect_slack_response_combined(user: str, channel_id: str | None = None) -> JSONResponse:
+    """Ephemeral with Google and/or GitHub connect links."""
+    base = public_base_url()
+    g_ok = _google_oauth_configured()
+    h_ok = _github_oauth_configured()
+    if not g_ok and not h_ok:
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": "OAuth is not configured. Set Google (`GOOGLE_*`) and/or GitHub (`GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GITHUB_REDIRECT_URI`) env vars.",
+            }
+        )
+    if not base:
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": "Set PUBLIC_BASE_URL or a redirect URI so OAuth links work.",
+            }
+        )
+    parts: list[str] = ["*Link your accounts* (only visible to you):\n"]
+    blocks: list[dict] = [{"type": "section", "text": {"type": "mrkdwn", "text": ""}}]
+    if g_ok:
+        state = make_oauth_state(user, channel_id=channel_id or None)
+        gurl = f"{base}/auth/google?state={urllib.parse.quote(state, safe='')}"
+        parts.append(f"• *Google* (Docs, Gmail, Calendar): <{gurl}|Connect Google>")
+    if h_ok:
+        state = make_oauth_state(user, channel_id=channel_id or None)
+        hurl = f"{base}/auth/github?state={urllib.parse.quote(state, safe='')}"
+        parts.append(f"• *GitHub* (create PRs): <{hurl}|Connect GitHub>")
+    blocks[0]["text"]["text"] = "\n".join(parts)
+    return JSONResponse(
+        {
+            "response_type": "ephemeral",
+            "text": "Connect Google and/or GitHub (only visible to you).",
+            "blocks": blocks,
+        }
+    )
+
+
 @app.get("/susan")
 async def slash_susan_get():
     """Slack invokes POST /susan with a form body; GET is probes/browsers only."""
@@ -651,21 +831,40 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
     logger.info("Slack slash verified: user=%s channel=%s text=%r", user, channel, text[:120] if text else "")
 
     if text_lower == "connect" or text_lower.startswith("connect "):
-        return connect_google_slack_response(user, channel_id=channel or None)
+        rest = text_lower[len("connect") :].strip()
+        if rest in ("github", "gh"):
+            return connect_github_slack_response(user, channel_id=channel or None)
+        if rest in ("google",):
+            return connect_google_slack_response(user, channel_id=channel or None)
+        if rest == "":
+            return connect_slack_response_combined(user, channel_id=channel or None)
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": "Unknown `connect` subcommand. Use `connect`, `connect google`, or `connect github`.",
+            }
+        )
 
     action = detect_action(text)
     if not action:
         return JSONResponse(
             {
                 "response_type": "ephemeral",
-                "text": "Susan doesn't understand that command. Try: `connect`, `create a doc`, `send email`, `create invite`, or `create pr`.",
+                "text": "Susan doesn't understand that command. Try: `connect` / `connect google` / `connect github`, `create a doc`, `send email`, `create invite`, or `create pr`.",
             }
         )
 
     if action in GOOGLE_ACTIONS and not await user_has_google_tokens(user):
         return connect_google_slack_response(
             user,
-            intro="*Google isn’t connected yet.* Use the link below to sign in, then run your command again (or use `/susan connect` anytime).",
+            intro="*Google isn’t connected yet.* Use the link below to sign in, then run your command again (or use `/susan connect google` anytime).",
+            channel_id=channel or None,
+        )
+
+    if action in GITHUB_PR_ACTIONS and not await user_has_github_tokens(user):
+        return connect_github_slack_response(
+            user,
+            intro="*GitHub isn’t connected yet.* Use the link below to sign in, then run your command again (or use `/susan connect github` anytime).",
             channel_id=channel or None,
         )
 
@@ -764,7 +963,7 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
             elif action_type == "invite":
                 result = await create_calendar_invite(value, user)
             else:
-                result = await create_github_pr(value)
+                result = await create_github_pr(value, user)
             await post_ephemeral(channel, user, f"✓ Susan done: {result}")
         except Exception as e:
             await post_ephemeral(channel, user, f"Susan error during execution: {str(e)}")
@@ -859,20 +1058,23 @@ async def create_calendar_invite(content: str, slack_user_id: str) -> str:
     return f"Calendar invite created: {link}" if link else f"Calendar error: {data}"
 
 
-async def create_github_pr(content: str) -> str:
+async def create_github_pr(content: str, slack_user_id: str) -> str:
     import re
 
-    token = GITHUB_TOKEN
+    try:
+        token = await get_github_token(slack_user_id)
+    except ValueError as e:
+        return str(e)
     repo = os.environ.get("GITHUB_REPO", "")
     base = os.environ.get("GITHUB_BASE_BRANCH", "main")
-    if not token or not repo:
-        return "PR not created — GITHUB_TOKEN or GITHUB_REPO not set."
+    if not repo:
+        return "PR not created — GITHUB_REPO is not set on the server (e.g. `org/repo`)."
     title_m = re.search(r"^Title:\s*(.+)", content, re.M)
     desc_m = re.search(r"Description:\s*([\s\S]+?)(?=Files changed:|$)", content)
     title = title_m.group(1).strip() if title_m else "Susan: changes from Slack"
     desc = desc_m.group(1).strip() if desc_m else content
     branch = f"susan/slack-{int(time.time())}"
-    hdrs = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     async with httpx.AsyncClient() as client:
         sha_r = await client.get(f"https://api.github.com/repos/{repo}/git/refs/heads/{base}", headers=hdrs)
         sha = sha_r.json().get("object", {}).get("sha")

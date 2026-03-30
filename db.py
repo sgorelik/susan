@@ -1,4 +1,4 @@
-"""Persistent store for per-Slack-user Google OAuth tokens.
+"""Persistent store for per-Slack-user OAuth tokens (Google, GitHub).
 
 Uses PostgreSQL when DATABASE_URL is set (e.g. Railway Postgres). Otherwise uses a
 local SQLite file (async via aiosqlite) so refresh tokens survive process restarts.
@@ -108,12 +108,82 @@ class GoogleToken(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class GithubToken(Base):
+    """Per-Slack-user GitHub OAuth user access token (no refresh in standard GitHub OAuth app flow)."""
+
+    __tablename__ = "github_tokens"
+
+    slack_user_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    access_token: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
 
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
+
+
+async def exchange_github_code_for_token(code: str, redirect_uri: str) -> dict:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            GITHUB_TOKEN_URL,
+            headers={"Accept": "application/json"},
+            data={
+                "client_id": os.environ["GITHUB_CLIENT_ID"],
+                "client_secret": os.environ["GITHUB_CLIENT_SECRET"],
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+        )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("error"):
+        raise ValueError(data.get("error_description", data.get("error", "oauth_error")))
+    return data
+
+
+async def upsert_github_token(slack_user_id: str, access_token: str) -> None:
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        row = await session.get(GithubToken, slack_user_id)
+        if row:
+            row.access_token = access_token
+            row.updated_at = now
+        else:
+            session.add(
+                GithubToken(
+                    slack_user_id=slack_user_id,
+                    access_token=access_token,
+                    updated_at=now,
+                )
+            )
+        await session.commit()
+
+
+async def user_has_github_tokens(slack_user_id: str) -> bool:
+    if (os.environ.get("GITHUB_TOKEN") or "").strip():
+        return True
+    async with SessionLocal() as session:
+        row = await session.get(GithubToken, slack_user_id)
+        return row is not None
+
+
+async def get_github_token(slack_user_id: str) -> str:
+    """Env GITHUB_TOKEN wins; else stored OAuth token for this Slack user."""
+    env = (os.environ.get("GITHUB_TOKEN") or "").strip()
+    if env:
+        return env
+    async with SessionLocal() as session:
+        row = await session.get(GithubToken, slack_user_id)
+        if row:
+            return row.access_token.strip()
+    raise ValueError(
+        "GitHub is not connected. Type `/susan connect github` in Slack to link your account."
+    )
 
 
 async def _refresh_access_token(refresh_token: str) -> tuple[str, int]:
