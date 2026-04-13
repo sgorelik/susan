@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import re
 
-from app.github_repos import parse_pr_summary_time_range
+from app.github_repos import _pr_allowlist, parse_pr_summary_time_range
 from app.slack_api import slack_api_conversation_channel_name
 
 def utc_date_start_slack_ts(iso_date: str) -> str:
@@ -84,30 +84,6 @@ def _tech_weekly_channel_names() -> frozenset[str]:
 
 def normalize_slack_command_channel_name(raw: str | None) -> str:
     return (raw or "").strip().lstrip("#").lower()
-
-
-async def slack_api_conversation_channel_name(channel_id: str) -> str | None:
-    """Resolve channel name slug via conversations.info (lowercase), or None."""
-    if not (channel_id or "").strip():
-        return None
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(
-            "https://slack.com/api/conversations.info",
-            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-            params={"channel": channel_id},
-        )
-    try:
-        data = r.json()
-    except json.JSONDecodeError:
-        return None
-    if not data.get("ok"):
-        logger.warning(
-            "Slack conversations.info failed for weekly tech check: %s", data.get("error")
-        )
-        return None
-    ch = data.get("channel") or {}
-    name = ch.get("name")
-    return str(name).strip().lower() if name else None
 
 
 async def weekly_status_include_github(
