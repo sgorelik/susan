@@ -217,13 +217,28 @@ ACTIONS = {
             "pr summaries",
         ],
     ),
+    # Before "pr"; distinct from PR summary ("weekly", "status report").
+    "weekly_status": (
+        "weekly team & repo status",
+        [
+            "weekly status",
+            "week status",
+            "weekly report",
+            "status report",
+            "team status",
+            "engineering status",
+        ],
+    ),
     "pr": ("create a GitHub PR", ["pull request", "create pr", "open pr", "pr"]),
 }
 
 GOOGLE_ACTIONS = frozenset({"doc", "email", "invite"})
+# weekly_status is not listed here: non-tech channels get Slack-only weekly status without GitHub OAuth.
 GITHUB_ACTIONS = frozenset({"pr", "issue", "pr_summary"})
 
-APPROVE_ACTION_TYPES = frozenset({"doc", "email", "invite", "pr", "issue", "pr_summary"})
+APPROVE_ACTION_TYPES = frozenset(
+    {"doc", "email", "invite", "pr", "issue", "pr_summary", "weekly_status"}
+)
 
 
 def verify_slack(req_body: bytes, timestamp: str, signature: str) -> bool:
@@ -444,6 +459,362 @@ async def fetch_slack_history(
     return "\n".join(lines)
 
 
+async def _slack_conversations_history_page(
+    channel: str, oldest_ts: str | None, cursor: str | None
+) -> dict:
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    params: dict[str, str] = {"channel": channel, "limit": "200"}
+    if oldest_ts:
+        params["oldest"] = oldest_ts
+    if cursor:
+        params["cursor"] = cursor
+    async with httpx.AsyncClient(timeout=45) as client:
+        r = await client.get(
+            "https://slack.com/api/conversations.history",
+            headers=headers,
+            params=params,
+        )
+    return r.json()
+
+
+async def fetch_slack_channel_history_since(
+    channel: str,
+    oldest_slack_ts: str,
+    slack_user_id: str | None,
+) -> str:
+    """Paginated channel messages at or after oldest_slack_ts (Slack epoch string)."""
+    max_msgs = max(50, min(2000, int(os.environ.get("WEEKLY_STATUS_MAX_SLACK_MESSAGES", "800"))))
+    max_chars = max(5000, min(500_000, int(os.environ.get("WEEKLY_STATUS_MAX_SLACK_CHARS", "120000"))))
+
+    work_channel = channel
+
+    async def fetch_all() -> list[dict]:
+        nonlocal work_channel
+        collected: list[dict] = []
+        cursor: str | None = None
+        first = True
+        while len(collected) < max_msgs:
+            data = await _slack_conversations_history_page(
+                work_channel, oldest_slack_ts if first else None, cursor
+            )
+            if not data.get("ok"):
+                err = data.get("error", "unknown_error")
+                if err in ("channel_not_found", "not_in_channel") and _is_public_slack_channel(
+                    work_channel
+                ):
+                    await _try_slack_join_channel(work_channel)
+                    data = await _slack_conversations_history_page(
+                        work_channel, oldest_slack_ts if first else None, cursor
+                    )
+                elif (
+                    err in ("channel_not_found", "not_in_channel")
+                    and _is_dm_slack_channel(work_channel)
+                    and slack_user_id
+                ):
+                    new_ch = await _try_slack_open_im_with_user(slack_user_id)
+                    if new_ch:
+                        work_channel = new_ch
+                        data = await _slack_conversations_history_page(
+                            work_channel, oldest_slack_ts if first else None, cursor
+                        )
+                elif err in ("channel_not_found", "not_in_channel") and _is_private_or_mpim_slack_channel(
+                    work_channel
+                ):
+                    new_ch = await _try_slack_open_by_channel_id(work_channel)
+                    if new_ch:
+                        work_channel = new_ch
+                        data = await _slack_conversations_history_page(
+                            work_channel, oldest_slack_ts if first else None, cursor
+                        )
+            if not data.get("ok"):
+                err = data.get("error", "unknown_error")
+                logger.error("Slack conversations.history failed: %s full=%s", err, data)
+                raise RuntimeError(
+                    f"Could not load channel history ({err}). {_history_error_hint(work_channel)}"
+                )
+            batch = data.get("messages") or []
+            collected.extend(batch)
+            cursor = (data.get("response_metadata") or {}).get("next_cursor") or None
+            first = False
+            if not cursor or not batch:
+                break
+        return collected
+
+    msgs = await fetch_all()
+    msgs.sort(key=lambda m: float(m.get("ts", "0") or 0))
+    lines: list[str] = []
+    total_len = 0
+    truncated = False
+    for m in msgs:
+        uid = m.get("user", "unknown")
+        text = m.get("text", "")
+        line = f"{uid}: {text}"
+        if total_len + len(line) + 1 > max_chars:
+            truncated = True
+            break
+        lines.append(line)
+        total_len += len(line) + 1
+    out = "\n".join(lines)
+    if truncated:
+        out += (
+            f"\n\n… ({len(msgs) - len(lines)} more messages omitted; cap WEEKLY_STATUS_MAX_SLACK_CHARS)"
+        )
+    if not out.strip():
+        return "(No channel messages in this time window.)"
+    return out
+
+
+def utc_date_start_slack_ts(iso_date: str) -> str:
+    """First instant of YYYY-MM-DD in UTC as Slack message ts."""
+    from datetime import datetime, timezone
+
+    d = datetime.strptime(iso_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return f"{d.timestamp():.6f}"
+
+
+_WEEKLY_AUTO_POST_FLAG_RE = re.compile(
+    r"(?i)(?:^|\s)(?:--no-approval|-no-approval)(?:\s|$)"
+)
+
+
+def strip_weekly_status_auto_post_flags(text: str) -> tuple[str, bool]:
+    """Remove --no-approval / -no-approval; return (text for date/link parsing, auto_publish)."""
+    raw = (text or "").strip()
+    auto = bool(_WEEKLY_AUTO_POST_FLAG_RE.search(raw))
+    cleaned = _WEEKLY_AUTO_POST_FLAG_RE.sub(" ", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned, auto
+
+
+def weekly_status_auto_post_user_allowed(slack_user_id: str) -> bool:
+    """If SUSAN_WEEKLY_AUTO_POST_USER_IDS is set, only those Slack user ids may use --no-approval."""
+    raw = (os.environ.get("SUSAN_WEEKLY_AUTO_POST_USER_IDS") or "").strip()
+    if not raw:
+        return True
+    allowed = {p.strip() for p in raw.split(",") if p.strip()}
+    return (slack_user_id or "").strip() in allowed
+
+
+def parse_weekly_status_time_range(text: str) -> tuple[str, str, str]:
+    """Return (since_d, until_d, human_label) in UTC dates for GitHub + Slack window."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    lower = (text or "").lower()
+
+    if re.search(r"\b(last|previous)\s+calendar\s+week\b", lower):
+        # Previous ISO week Mon–Sun (UTC).
+        this_monday = today - timedelta(days=today.weekday())
+        prev_sun = this_monday - timedelta(days=1)
+        prev_mon = prev_sun - timedelta(days=6)
+        label = f"Calendar week {prev_mon.isoformat()} → {prev_sun.isoformat()} (UTC)"
+        return prev_mon.isoformat(), prev_sun.isoformat(), label
+
+    since_d, until_d = parse_pr_summary_time_range(text)
+    label = f"{since_d} → {until_d} (UTC, inclusive dates)"
+    return since_d, until_d, label
+
+
+def resolve_github_repos_for_weekly_status() -> tuple[list[str] | None, str | None]:
+    """All repos from GITHUB_REPOS, or GITHUB_REPO if the list is empty."""
+    allow = _pr_allowlist()
+    default = (os.environ.get("GITHUB_REPO") or "").strip().lower()
+    if allow:
+        return list(allow), None
+    if default:
+        return [default], None
+    return None, (
+        "No GitHub repos configured. Set `GITHUB_REPOS` or `GITHUB_REPO` for weekly status "
+        "(Dependabot + PR metrics need at least one repo)."
+    )
+
+
+def _tech_weekly_channel_names() -> frozenset[str]:
+    """Slack channel name slugs (lowercase) that get GitHub data in weekly status."""
+    raw = (
+        os.environ.get("SUSAN_TECH_WEEKLY_CHANNEL_NAMES", "").strip()
+        or "team-tech,software,security"
+    )
+    return frozenset(p.strip().lower() for p in raw.split(",") if p.strip())
+
+
+def normalize_slack_command_channel_name(raw: str | None) -> str:
+    return (raw or "").strip().lstrip("#").lower()
+
+
+async def slack_api_conversation_channel_name(channel_id: str) -> str | None:
+    """Resolve channel name slug via conversations.info (lowercase), or None."""
+    if not (channel_id or "").strip():
+        return None
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(
+            "https://slack.com/api/conversations.info",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            params={"channel": channel_id},
+        )
+    try:
+        data = r.json()
+    except json.JSONDecodeError:
+        return None
+    if not data.get("ok"):
+        logger.warning(
+            "Slack conversations.info failed for weekly tech check: %s", data.get("error")
+        )
+        return None
+    ch = data.get("channel") or {}
+    name = ch.get("name")
+    return str(name).strip().lower() if name else None
+
+
+async def weekly_status_include_github(
+    digest_channel_id: str,
+    slash_channel_id: str,
+    slash_channel_name: str | None,
+) -> bool:
+    """True when weekly status should pull GitHub metrics (tech channels only)."""
+    tech = _tech_weekly_channel_names()
+    if digest_channel_id == slash_channel_id:
+        n = normalize_slack_command_channel_name(slash_channel_name)
+        if n and n not in ("directmessage", "mpim", "group"):
+            return n in tech
+    api_name = await slack_api_conversation_channel_name(digest_channel_id)
+    return (api_name or "") in tech
+
+
+def _pr_turnaround_hours(item: dict) -> float | None:
+    from datetime import datetime
+
+    created = item.get("created_at")
+    pr = item.get("pull_request") or {}
+    merged = pr.get("merged_at")
+    if not created or not merged:
+        return None
+    try:
+        c = datetime.fromisoformat(created.replace("Z", "+00:00"))
+        m = datetime.fromisoformat(merged.replace("Z", "+00:00"))
+        return (m - c).total_seconds() / 3600.0
+    except (ValueError, TypeError):
+        return None
+
+
+async def fetch_opened_prs_for_repo_range(
+    repo: str, since_d: str, until_d: str, token: str
+) -> list[dict]:
+    q = f"repo:{repo} is:pr created:>={since_d} created:<={until_d}"
+    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    items: list[dict] = []
+    async with httpx.AsyncClient(timeout=60) as client:
+        for page in range(1, 11):
+            r = await client.get(
+                "https://api.github.com/search/issues",
+                headers=hdrs,
+                params={"q": q, "per_page": 100, "page": page},
+            )
+            data = r.json()
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"GitHub search failed ({r.status_code}): {data.get('message', data)}"
+                )
+            batch = data.get("items") or []
+            items.extend(batch)
+            if len(batch) < 100:
+                break
+    return items
+
+
+async def fetch_dependabot_alert_stats(
+    repo: str, since_d: str, until_d: str, token: str
+) -> dict:
+    """Counts open alerts + fixed/dismissed in date window. On 403, returns error hint."""
+    from datetime import datetime, timezone
+
+    hdrs = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    since_dt = datetime.strptime(since_d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    until_dt = datetime.strptime(until_d, "%Y-%m-%d").replace(
+        hour=23, minute=59, second=59, tzinfo=timezone.utc
+    )
+
+    open_count = 0
+    fixed_in_window = 0
+    dismissed_in_window = 0
+    new_open_in_window = 0
+    url = f"https://api.github.com/repos/{repo}/dependabot/alerts"
+    async with httpx.AsyncClient(timeout=60) as client:
+        page = 1
+        while page <= 20:
+            r = await client.get(
+                url, headers=hdrs, params={"state": "all", "per_page": 100, "page": page}
+            )
+            if r.status_code == 403:
+                return {
+                    "ok": False,
+                    "hint": (
+                        "Dependabot alerts unavailable (403). Add scope **`security_events`** to "
+                        "`GITHUB_OAUTH_SCOPE` (e.g. `repo security_events`) and reconnect GitHub."
+                    ),
+                }
+            if r.status_code != 200:
+                return {
+                    "ok": False,
+                    "hint": f"Dependabot API error {r.status_code}: {r.text[:200]}",
+                }
+            batch = r.json()
+            if not isinstance(batch, list):
+                return {"ok": False, "hint": f"Unexpected Dependabot response: {batch!s}"[:300]}
+            if not batch:
+                break
+            for a in batch:
+                st = (a.get("state") or "").lower()
+                created_s = a.get("created_at") or ""
+                fixed_s = a.get("fixed_at") or ""
+                dismissed_s = a.get("dismissed_at") or ""
+                try:
+                    created = (
+                        datetime.fromisoformat(created_s.replace("Z", "+00:00"))
+                        if created_s
+                        else None
+                    )
+                except ValueError:
+                    created = None
+                in_created_window = (
+                    created is not None and since_dt <= created <= until_dt
+                )
+                if st == "open":
+                    open_count += 1
+                    if in_created_window:
+                        new_open_in_window += 1
+                if st == "fixed" and fixed_s:
+                    try:
+                        fx = datetime.fromisoformat(fixed_s.replace("Z", "+00:00"))
+                        if since_dt <= fx <= until_dt:
+                            fixed_in_window += 1
+                    except ValueError:
+                        pass
+                if st == "dismissed" and dismissed_s:
+                    try:
+                        ds = datetime.fromisoformat(dismissed_s.replace("Z", "+00:00"))
+                        if since_dt <= ds <= until_dt:
+                            dismissed_in_window += 1
+                    except ValueError:
+                        pass
+            if len(batch) < 100:
+                break
+            page += 1
+
+    return {
+        "ok": True,
+        "open_total": open_count,
+        "fixed_in_window": fixed_in_window,
+        "dismissed_in_window": dismissed_in_window,
+        "new_open_in_window": new_open_in_window,
+    }
+
+
 def _anthropic_error_payload(data: dict) -> str:
     err = data.get("error")
     if isinstance(err, dict):
@@ -483,7 +854,7 @@ def _anthropic_should_retry(status: int, data: dict) -> bool:
     return False
 
 
-async def call_claude(system: str, user: str) -> str:
+async def call_claude(system: str, user: str, max_tokens: int | None = None) -> str:
     max_attempts = max(1, min(8, int(os.environ.get("ANTHROPIC_MAX_RETRIES", "5"))))
     base_delay = max(1.0, float(os.environ.get("ANTHROPIC_RETRY_DELAY_SECONDS", "2")))
     last_data: dict = {}
@@ -501,7 +872,7 @@ async def call_claude(system: str, user: str) -> str:
                 },
                 json={
                     "model": "claude-sonnet-4-20250514",
-                    "max_tokens": 1500,
+                    "max_tokens": max_tokens if max_tokens is not None else 1500,
                     "system": system,
                     "messages": [{"role": "user", "content": user}],
                 },
@@ -1122,6 +1493,154 @@ async def fetch_merged_prs_for_repo_range(
     return items
 
 
+_PR_SUMMARY_PARTICIPANT_SEM = asyncio.Semaphore(10)
+
+
+async def _github_list_all_pages(
+    client: httpx.AsyncClient, url: str, headers: dict, max_pages: int = 15
+) -> list[dict]:
+    out: list[dict] = []
+    for page in range(1, max_pages + 1):
+        r = await client.get(url, headers=headers, params={"per_page": 100, "page": page})
+        if r.status_code != 200:
+            break
+        batch = r.json()
+        if not isinstance(batch, list):
+            break
+        out.extend(batch)
+        if len(batch) < 100:
+            break
+    return out
+
+
+async def fetch_merged_pr_participant_logins(repo: str, pr_number: int, token: str) -> set[str]:
+    """Logins from issue comments, pull review comments, and submitted reviews (non-bot)."""
+    hdrs = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+    base = f"https://api.github.com/repos/{repo}"
+    urls = [
+        f"{base}/issues/{pr_number}/comments",
+        f"{base}/pulls/{pr_number}/comments",
+        f"{base}/pulls/{pr_number}/reviews",
+    ]
+    logins: set[str] = set()
+    async with _PR_SUMMARY_PARTICIPANT_SEM:
+        async with httpx.AsyncClient(timeout=45) as client:
+            batches = await asyncio.gather(
+                _github_list_all_pages(client, urls[0], hdrs),
+                _github_list_all_pages(client, urls[1], hdrs),
+                _github_list_all_pages(client, urls[2], hdrs),
+            )
+            for batch in batches:
+                for item in batch:
+                    u = item.get("user")
+                    if isinstance(u, dict):
+                        lg = u.get("login")
+                        if lg and not str(lg).endswith("[bot]"):
+                            logins.add(lg)
+    return logins
+
+
+def _pr_merged_sort_key(pair: tuple[str, dict]) -> float:
+    from datetime import datetime
+
+    it = pair[1]
+    pr_meta = it.get("pull_request") or {}
+    m = pr_meta.get("merged_at") or it.get("closed_at") or ""
+    if not m:
+        return 0.0
+    try:
+        return datetime.fromisoformat(m.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+async def build_pr_summary_engagement_appendix(
+    repos: list[str], batches: list[list[dict]], token: str
+) -> str:
+    """Authors + comment/review participation for the Claude prompt (caps GitHub fan-out)."""
+    from collections import Counter
+
+    author_counts: Counter[str] = Counter()
+    for _repo, items in zip(repos, batches):
+        for it in items:
+            login = (it.get("user") or {}).get("login") or "?"
+            author_counts[login] += 1
+
+    flat: list[tuple[str, dict]] = []
+    for repo, items in zip(repos, batches):
+        for it in items:
+            flat.append((repo, it))
+    flat.sort(key=_pr_merged_sort_key, reverse=True)
+
+    max_fetch = max(0, min(500, int(os.environ.get("PR_SUMMARY_MAX_PARTICIPANT_FETCH", "80"))))
+    slice_pairs = flat[:max_fetch] if max_fetch else []
+
+    commenter_pr_touch: Counter[str] = Counter()
+    if slice_pairs:
+        try:
+
+            async def _participants(repo: str, it: dict) -> set[str]:
+                n = it.get("number")
+                if n is None:
+                    return set()
+                return await fetch_merged_pr_participant_logins(repo, int(n), token)
+
+            results = await asyncio.gather(
+                *[_participants(repo, it) for repo, it in slice_pairs],
+                return_exceptions=True,
+            )
+            for pair, res in zip(slice_pairs, results):
+                if isinstance(res, Exception):
+                    logger.warning(
+                        "PR participant fetch failed for %s #%s: %s",
+                        pair[0],
+                        pair[1].get("number"),
+                        res,
+                    )
+                    continue
+                for lg in res:
+                    commenter_pr_touch[lg] += 1
+        except Exception as e:
+            logger.exception("PR participant gather failed: %s", e)
+
+    lines = [
+        "### Aggregated participation (from GitHub: issue comments, review comments, reviews)",
+    ]
+    if author_counts:
+        lines.append(
+            "Merged-PR authors (@login → count of merged PRs they opened in this window): "
+            + ", ".join(f"@{k} ({v})" for k, v in author_counts.most_common())
+        )
+    else:
+        lines.append("(No merged PRs in window.)")
+
+    if commenter_pr_touch:
+        lines.append(
+            "Commenters & reviewers (@login → number of merged PRs in this window they commented on "
+            "or reviewed; bots excluded): "
+            + ", ".join(f"@{k} ({v})" for k, v in commenter_pr_touch.most_common(40))
+        )
+    elif flat and max_fetch == 0:
+        lines.append(
+            "(Comment/review participation not fetched: PR_SUMMARY_MAX_PARTICIPANT_FETCH is 0.)"
+        )
+    elif slice_pairs:
+        lines.append(
+            "(No non-bot issue/review activity found on the sampled PRs, or GitHub returned errors.)"
+        )
+
+    if len(flat) > max_fetch and max_fetch > 0:
+        lines.append(
+            f"_Note: comment/review data was fetched for the {max_fetch} most recently merged PRs only "
+            f"({len(flat)} total in window); authors above include all merged PRs._"
+        )
+
+    return "\n".join(lines)
+
+
 def _pr_summary_title_line(repos: list[str], since_d: str, until_d: str) -> str:
     if len(repos) == 1:
         return f"PR summary — `{repos[0]}` ({since_d} → {until_d})"
@@ -1175,25 +1694,34 @@ async def process_pr_summary(
             merged = pr_meta.get("merged_at") or it.get("closed_at") or ""
             login = (it.get("user") or {}).get("login") or "?"
             lines.append(
-                f"#{num} | {merged[:10] if merged else '?'} | @{login} | {pr_title} | {url}"
+                f"#{num} | repo=`{repo}` | {merged[:10] if merged else '?'} | @{login} | {pr_title} | {url}"
             )
         raw_list = "\n".join(lines) if lines else "(No merged PRs in this window.)"
         sections.append(
             f"### Repository `{repo}`\nMerged PRs ({len(items)}):\n{raw_list}"
         )
+    engagement = await build_pr_summary_engagement_appendix(repos, batches, token)
     prompt = (
         f"Repositories ({len(repos)}): {', '.join(f'`{r}`' for r in repos)}\n"
         f"Merged date range (UTC, inclusive): {since_d} through {until_d}.\n"
         f"Total merged PRs in range: {total}\n\n" + "\n\n".join(sections)
     )
+    prompt += f"\n\n{engagement}\n"
     if (convo or "").strip():
         prompt += f"\nSlack thread context (optional):\n{convo.strip()[:6000]}\n"
     system = (
         "You are Susan. Write a concise Slack-ready summary (mrkdwn) of merged pull requests "
         "across one or more repositories. "
-        "Use short ## headings, bullets, and link PRs as <url|#123 short title>. "
+        "Use short ## headings and bullets. "
+        "Whenever you mention a specific PR in the body, include its repository slug in parentheses "
+        "using the exact `owner/repo` from the data, e.g. `#35 Model deployment UI cleanup (frontier-one/f1-asgardos)`. "
+        "If you use Slack link syntax, put the same slug in the visible text, e.g. "
+        "<https://github.com/…|#35 Model deployment UI cleanup (frontier-one/f1-asgardos)>. "
         "Group by theme or area when it helps; you may group by repository or combine cross-repo themes. "
         "State the date range and repo list at the top. "
+        "Always end with a ## Contributors & commenters section: briefly highlight who merged the most PRs "
+        "(contributors / authors) and who was most active commenting or reviewing, informed by the "
+        "aggregated participation block in the prompt; use @login handles. "
         "If there were zero PRs everywhere, say so and suggest widening the time range. "
         "Do not say the summary is private, ephemeral, or “only visible to you” — the app handles visibility."
     )
@@ -1257,6 +1785,243 @@ async def process_pr_summary(
         channel,
         user,
         f"Susan PR summary preview ready for {repo_hint}",
+        blocks,
+        response_url,
+    )
+
+
+def _weekly_status_title_line(
+    repos: list[str], range_label: str, *, include_github: bool
+) -> str:
+    if not include_github:
+        return f"Weekly status — {range_label} — Slack"
+    if len(repos) == 1:
+        return f"Weekly status — {range_label} — `{repos[0]}`"
+    shown = ", ".join(f"`{r}`" for r in repos[:5])
+    if len(repos) > 5:
+        shown += f", … (+{len(repos) - 5} more)"
+    return f"Weekly status — {range_label} — {shown}"
+
+
+async def process_weekly_status(
+    repos: list[str],
+    command_text: str,
+    hist_channel: str,
+    channel: str,
+    user: str,
+    thread_ts: str | None,
+    response_url: str | None,
+    *,
+    include_github: bool,
+    auto_publish: bool = False,
+) -> None:
+    from collections import Counter
+
+    since_d, until_d, range_label = parse_weekly_status_time_range(command_text)
+    oldest_ts = utc_date_start_slack_ts(since_d)
+    try:
+        slack_digest = await fetch_slack_channel_history_since(
+            hist_channel, oldest_ts, user
+        )
+    except Exception as e:
+        logger.exception("Weekly status Slack fetch failed")
+        await notify_user_ephemeral(
+            channel, user, f"Susan error (Slack): {e}", None, response_url
+        )
+        return
+
+    if include_github:
+        if not repos:
+            await notify_user_ephemeral(
+                channel, user, "No repositories configured.", None, response_url
+            )
+            return
+
+        try:
+            token = await get_github_token(user)
+        except ValueError as e:
+            await notify_user_ephemeral(channel, user, str(e), None, response_url)
+            return
+
+        async def one_repo(r: str) -> tuple[str, list[dict], list[dict], dict]:
+            merged, opened, dep = await asyncio.gather(
+                fetch_merged_prs_for_repo_range(r, since_d, until_d, token),
+                fetch_opened_prs_for_repo_range(r, since_d, until_d, token),
+                fetch_dependabot_alert_stats(r, since_d, until_d, token),
+            )
+            return r, merged, opened, dep
+
+        try:
+            per_repo = await asyncio.gather(*[one_repo(r) for r in repos])
+        except Exception as e:
+            logger.exception("Weekly status GitHub fetch failed")
+            await notify_user_ephemeral(
+                channel, user, f"Susan error (GitHub): {e}", None, response_url
+            )
+            return
+
+        github_sections: list[str] = []
+        for r, merged, opened, dep in per_repo:
+            authors = Counter()
+            hours: list[float] = []
+            titles: list[str] = []
+            for it in merged:
+                login = (it.get("user") or {}).get("login") or "?"
+                authors[login] += 1
+                th = _pr_turnaround_hours(it)
+                if th is not None:
+                    hours.append(th)
+                titles.append((it.get("title") or "").replace("\n", " "))
+            avg_h = sum(hours) / len(hours) if hours else None
+            top_authors = authors.most_common(6)
+            if dep.get("ok"):
+                dep_lines = (
+                    f"Dependabot: {dep['open_total']} open alerts now; "
+                    f"fixed in window {dep['fixed_in_window']}, dismissed in window "
+                    f"{dep['dismissed_in_window']}, newly opened in window {dep['new_open_in_window']}."
+                )
+            else:
+                dep_lines = f"Dependabot: unavailable — {dep.get('hint', 'unknown')}"
+
+            opened_titles = [(x.get("title") or "").replace("\n", " ") for x in opened[:40]]
+            avg_part = (
+                f"{avg_h:.1f}"
+                if avg_h is not None
+                else "n/a (no merged PRs with created+merged timestamps)"
+            )
+            github_sections.append(
+                f"### `{r}`\n"
+                f"{dep_lines}\n"
+                f"PRs opened in window: {len(opened)}; merged in window: {len(merged)}.\n"
+                f"Average merge turnaround (hours): {avg_part}.\n"
+                f"Top merged-PR authors: {', '.join(f'@{a} ({c})' for a, c in top_authors) or 'none'}.\n"
+                f"Merged PR titles (up to 50): {'; '.join(titles[:50])}\n"
+                f"Opened PR titles (up to 40): {'; '.join(opened_titles)}\n"
+            )
+
+        facts = "\n\n".join(github_sections)
+        user_prompt = (
+            f"Reporting window: {range_label}.\n"
+            f"Slack channel transcript (user ids are opaque U…; infer roles from content only):\n"
+            f"{slack_digest}\n\n"
+            f"---\nGitHub metrics and PR titles per repo:\n{facts}"
+        )
+        system = (
+            "You are Susan. Write a weekly status report as Slack mrkdwn.\n"
+            "Use clear ## headings, e.g. ## Channel (Slack) and ## GitHub (or per-repo ## lines).\n"
+            "Slack section: very high level — notable updates from teammates, decisions, risks, "
+            "open questions; do not quote long messages.\n"
+            "GitHub section: summarize Dependabot/vulnerability posture, PR volume, average turnaround, "
+            "main themes of merged work, and who was most active (authors you infer from the data).\n"
+            "If Dependabot data was unavailable for a repo, say so briefly.\n"
+            "Keep it executive-readable. Do not say the draft is private or ephemeral."
+        )
+    else:
+        user_prompt = (
+            f"Reporting window: {range_label}.\n"
+            "This is a non-engineering Slack channel: produce a weekly status from the transcript only "
+            "(no GitHub or code repository data).\n"
+            f"Slack channel transcript (user ids are opaque U…; infer roles from content only):\n"
+            f"{slack_digest}\n"
+        )
+        system = (
+            "You are Susan. Write a weekly status report as Slack mrkdwn for a general team channel.\n"
+            "Use clear ## headings focused on the conversation (e.g. ## Highlights, ## Decisions, "
+            "## Risks & blockers, ## Open questions).\n"
+            "Stay very high level — notable updates, decisions, and open threads; do not quote long messages.\n"
+            "Do not mention GitHub, pull requests, or repositories unless the transcript explicitly does.\n"
+            "Keep it executive-readable. Do not say the draft is private or ephemeral."
+        )
+
+    max_tok = max(1500, min(32000, int(os.environ.get("WEEKLY_STATUS_MAX_TOKENS", "4096"))))
+    try:
+        summary = await call_claude(system, user_prompt, max_tokens=max_tok)
+    except Exception as e:
+        logger.exception("Weekly status Claude failed")
+        await notify_user_ephemeral(channel, user, f"Susan error: {e}", None, response_url)
+        return
+
+    title = _weekly_status_title_line(repos, range_label, include_github=include_github)
+    if auto_publish:
+        try:
+            await post_pr_summary_to_channel(channel, thread_ts, title, summary)
+        except Exception as e:
+            logger.exception("Weekly status auto-publish failed")
+            await notify_user_ephemeral(
+                channel,
+                user,
+                f"Susan could not post weekly status to the channel: {e}",
+                None,
+                response_url,
+            )
+            return
+        await notify_user_ephemeral(
+            channel,
+            user,
+            "✓ Weekly status was posted to the channel (_no approval step_).",
+            None,
+            response_url,
+        )
+        return
+
+    meta = {
+        "title": title,
+        "body": summary,
+        "channel_id": channel,
+        "thread_ts": thread_ts,
+        "repos": repos if include_github else [],
+        "include_github": include_github,
+    }
+    draft_id = await create_user_draft(
+        user, "weekly_status", json.dumps(meta, ensure_ascii=False)
+    )
+    display_truncated = summary[:2800] + ("..." if len(summary) > 2800 else "")
+    hint = (
+        "_Use *Approve & post to channel* to publish this for everyone in this conversation, "
+        "or *Cancel*._"
+    )
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Susan preview — {ACTIONS['weekly_status'][0]}*\n_(Only visible to you)_\n{hint}",
+            },
+        },
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"```{display_truncated}```"}},
+        {
+            "type": "actions",
+            "block_id": f"susan_weekly_{channel}_{thread_ts or 'none'}",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✓ Approve & post to channel"},
+                    "style": "primary",
+                    "action_id": "approve_weekly_status",
+                    "value": draft_id,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✗ Cancel"},
+                    "action_id": "cancel_susan",
+                    "value": draft_id,
+                },
+            ],
+        },
+    ]
+    if include_github:
+        repo_hint = (
+            f"`{repos[0]}`"
+            if len(repos) == 1
+            else f"{len(repos)} repos ({', '.join(repos[:3])}{'…' if len(repos) > 3 else ''})"
+        )
+        preview_note = f"Susan weekly status preview ready ({repo_hint})"
+    else:
+        preview_note = "Susan weekly status preview ready (Slack only — not a tech channel)"
+    await notify_user_ephemeral(
+        channel,
+        user,
+        preview_note,
         blocks,
         response_url,
     )
@@ -1818,9 +2583,56 @@ async def resume_slash_after_oauth(row: dict) -> None:
     except Exception as e:
         logger.warning("resume_slash_after_oauth intro ephemeral: %s", e)
     try:
-        link_ch, link_ts = extract_slack_archives_link(text)
+        weekly_command_text = text
+        weekly_auto_post = False
+        if action == "weekly_status":
+            weekly_command_text, weekly_auto_post = strip_weekly_status_auto_post_flags(text)
+            if weekly_auto_post and not weekly_status_auto_post_user_allowed(user):
+                await notify_user_ephemeral(
+                    channel,
+                    user,
+                    "Auto-publish (`--no-approval`) is not allowed for your user. Run `/susan weekly status` "
+                    "without the flag, or add your user id to `SUSAN_WEEKLY_AUTO_POST_USER_IDS`.",
+                    None,
+                    response_url,
+                )
+                return
+        link_ch, link_ts = extract_slack_archives_link(
+            weekly_command_text if action == "weekly_status" else text
+        )
         hist_channel = link_ch or channel
         hist_thread_ts = thread_ts or link_ts
+        if action == "weekly_status":
+            tech = await weekly_status_include_github(hist_channel, channel, None)
+            if not tech:
+                await process_weekly_status(
+                    [],
+                    weekly_command_text,
+                    hist_channel,
+                    channel,
+                    user,
+                    thread_ts,
+                    response_url,
+                    include_github=False,
+                    auto_publish=weekly_auto_post,
+                )
+                return
+            repos_w, err_w = resolve_github_repos_for_weekly_status()
+            if err_w:
+                await notify_user_ephemeral(channel, user, err_w, None, response_url)
+                return
+            await process_weekly_status(
+                repos_w,
+                weekly_command_text,
+                hist_channel,
+                channel,
+                user,
+                thread_ts,
+                response_url,
+                include_github=True,
+                auto_publish=weekly_auto_post,
+            )
+            return
         convo = await fetch_slack_history(hist_channel, hist_thread_ts, user)
         if action in GITHUB_ACTIONS:
             if action == "issue":
@@ -2236,13 +3048,14 @@ def susan_slash_help_response() -> JSONResponse:
         "Run `/susan` *in a thread* so Susan reads that thread, or paste a *Slack message link* "
         "(⋯ → Copy link) if you’re not in the thread. You’ll get a *private preview*; then *Approve*, "
         "*Edit* (email & calendar), or *Cancel*. "
-        "For *summarize merged PRs*, approving posts the summary to the *channel* (everyone can see it)."
+        "For *summarize merged PRs* and *weekly status*, approving posts to the *channel* "
+        "(everyone can see it)."
     )
     body_connect = (
         "*Connect accounts*\n"
         "• `/susan connect` — Google + GitHub (whatever is configured on the server)\n"
         "• `/susan connect google` — Docs, Gmail, Calendar\n"
-        "• `/susan connect github` — issues & PRs"
+        "• `/susan connect github` — issues, PRs, PR summaries; *tech-channel* weekly status (see below)"
     )
     body_what = "*What to ask*\n" + actions_body
     body_ex = (
@@ -2253,11 +3066,16 @@ def susan_slash_help_response() -> JSONResponse:
         "`/susan create issue in org/repo login button is misaligned`\n"
         "`/susan create pr in org/repo fixing the typo we discussed`\n"
         "`/susan summarize merged prs for org/repo last 30 days`\n"
-        "`/susan summarize merged prs for org/a org/b org/c last 14 days`"
+        "`/susan summarize merged prs for org/a org/b org/c last 14 days`\n"
+        "`/susan weekly status` · `/susan weekly report last 14 days` · `/susan team status last calendar week`\n"
+        "`/susan weekly status --no-approval` — generate and *post immediately* to the channel (for schedules / Mondays); "
+        "same with `-no-approval`. Optional: set `SUSAN_WEEKLY_AUTO_POST_USER_IDS` to comma-separated Slack user ids "
+        "to restrict who may use that flag."
     )
     body_pr = (
-        "*PR summaries — time ranges* (optional; default is last 7 days)\n"
-        "`last 14 days` · `past week` · `past month` · `since 2026-01-01` · `from 2026-01-01 to 2026-03-01`"
+        "*PR summaries & weekly status — time ranges* (optional; default is last 7 days)\n"
+        "`last 14 days` · `past week` · `past month` · `since 2026-01-01` · `from 2026-01-01 to 2026-03-01` · "
+        "`last calendar week` (Mon–Sun UTC, previous week)"
     )
     body_repo = (
         "*Repos*\n"
@@ -2265,7 +3083,13 @@ def susan_slash_help_response() -> JSONResponse:
         "or use `GITHUB_REPO` / `GITHUB_REPOS` on the server. "
         "For *PR summaries* with multiple entries in `GITHUB_REPOS` and no repos in the text, "
         "Susan shows a *multi-select* — choose repos, then *Run PR summary*. "
-        "For *PRs/issues*, if several repos are allowed she still asks you to pick one."
+        "*Weekly status*: in *tech* Slack channels (default names: `team-tech`, `software`, `security` — set "
+        "`SUSAN_TECH_WEEKLY_CHANNEL_NAMES` to override), Susan includes **every** repo in `GITHUB_REPOS` "
+        "(or `GITHUB_REPO` if the list is empty) and needs GitHub connected. In *other* channels, weekly status is "
+        "**Slack-only** (no GitHub). The digest follows the channel you run `/susan` in, or a pasted archives link.\n"
+        "For *PRs/issues*, if several repos are allowed she still asks you to pick one.\n\n"
+        "*Dependabot / vulnerabilities* (tech weekly status only): set `GITHUB_OAUTH_SCOPE` to include **`security_events`** "
+        "(for example `repo security_events`) and reconnect GitHub; otherwise Susan will note that alerts are unavailable."
     )
     blocks: list[dict] = [
         {
@@ -2348,10 +3172,26 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                 "text": (
                     "Susan doesn’t understand that command. Try `/susan help` for examples, "
                     "or keywords like `connect`, `doc`, `email`, `invite`, `issue`, `pr`, "
-                    "or `summarize prs` (merged PRs for a repo + time range)."
+                    "`summarize prs`, or `weekly status`."
                 ),
             }
         )
+
+    weekly_command_text = text
+    weekly_auto_post = False
+    if action == "weekly_status":
+        weekly_command_text, weekly_auto_post = strip_weekly_status_auto_post_flags(text)
+        if weekly_auto_post and not weekly_status_auto_post_user_allowed(user):
+            return JSONResponse(
+                {
+                    "response_type": "ephemeral",
+                    "text": (
+                        "Auto-publish (`--no-approval` / `-no-approval`) is restricted for your user. "
+                        "Remove the flag for a normal preview, or ask an admin to add your Slack user id to "
+                        "`SUSAN_WEEKLY_AUTO_POST_USER_IDS` on the server."
+                    ),
+                }
+            )
 
     if action in GOOGLE_ACTIONS and not await user_has_google_tokens(user):
         resume_id = await create_oauth_resume_pending(
@@ -2363,6 +3203,30 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
             channel_id=channel or None,
             resume_id=resume_id,
         )
+
+    link_ch_digest, _ = extract_slack_archives_link(
+        weekly_command_text if action == "weekly_status" else text
+    )
+    digest_channel_for_weekly = link_ch_digest or channel
+    weekly_wants_github = False
+    if action == "weekly_status":
+        weekly_wants_github = await weekly_status_include_github(
+            digest_channel_for_weekly, channel, form.get("channel_name")
+        )
+        if weekly_wants_github and not await user_has_github_tokens(user):
+            resume_id = await create_oauth_resume_pending(
+                user, channel, thread_ts, text, action, "github"
+            )
+            return connect_github_slack_response(
+                user,
+                intro=(
+                    "*GitHub isn’t connected yet.* Weekly status in *tech channels* includes repo metrics "
+                    "(PRs, Dependabot). Use the link below to sign in — Susan will continue when you’re done "
+                    "(or use `/susan connect github` anytime)."
+                ),
+                channel_id=channel or None,
+                resume_id=resume_id,
+            )
 
     if action in GITHUB_ACTIONS and not await user_has_github_tokens(user):
         resume_id = await create_oauth_resume_pending(
@@ -2377,7 +3241,9 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
 
     async def run():
         try:
-            link_ch, link_ts = extract_slack_archives_link(text)
+            link_ch, link_ts = extract_slack_archives_link(
+                weekly_command_text if action == "weekly_status" else text
+            )
             hist_channel = link_ch or channel
             hist_thread_ts = thread_ts or link_ts
             logger.info(
@@ -2387,6 +3253,36 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                 link_ch,
                 link_ts,
             )
+            if action == "weekly_status":
+                if not weekly_wants_github:
+                    await process_weekly_status(
+                        [],
+                        weekly_command_text,
+                        hist_channel,
+                        channel,
+                        user,
+                        thread_ts,
+                        response_url,
+                        include_github=False,
+                        auto_publish=weekly_auto_post,
+                    )
+                    return
+                repos_w, err_w = resolve_github_repos_for_weekly_status()
+                if err_w:
+                    await notify_user_ephemeral(channel, user, err_w, None, response_url)
+                    return
+                await process_weekly_status(
+                    repos_w,
+                    weekly_command_text,
+                    hist_channel,
+                    channel,
+                    user,
+                    thread_ts,
+                    response_url,
+                    include_github=True,
+                    auto_publish=weekly_auto_post,
+                )
+                return
             convo = await fetch_slack_history(hist_channel, hist_thread_ts, user)
             if action in GITHUB_ACTIONS:
                 if action == "issue":
@@ -2469,11 +3365,35 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                 logger.error("Could not notify user in Slack: %s", e2)
 
     background_tasks.add_task(run)
-    ack = (
-        "Got it — Susan is fetching *merged PRs* from GitHub for the chosen repo(s) and date range, then drafting a summary (only visible to you)."
-        if action == "pr_summary"
-        else f"Got it — Susan is reading the channel and preparing a *{ACTIONS[action][0]}* preview..."
-    )
+    if action == "pr_summary":
+        ack = (
+            "Got it — Susan is fetching *merged PRs* from GitHub for the chosen repo(s) and date range, "
+            "then drafting a summary (only visible to you)."
+        )
+    elif action == "weekly_status":
+        if weekly_auto_post:
+            if weekly_wants_github:
+                ack = (
+                    "Got it — Susan is generating *weekly status* with *GitHub* metrics and will *post it "
+                    "to this channel* (`--no-approval`). You’ll get a short confirmation when done."
+                )
+            else:
+                ack = (
+                    "Got it — Susan is generating *Slack-only weekly status* and will *post it to this channel* "
+                    "(`--no-approval`). You’ll get a short confirmation when done."
+                )
+        elif weekly_wants_github:
+            ack = (
+                "Got it — Susan is loading *channel history* and *GitHub* metrics (PRs, Dependabot) for "
+                "all repos in `GITHUB_REPOS`, then drafting a *weekly status* preview (only visible to you)."
+            )
+        else:
+            ack = (
+                "Got it — Susan is drafting a *weekly status* from *Slack only* (this channel isn’t a tech "
+                "channel — no GitHub). Preview is only visible to you."
+            )
+    else:
+        ack = f"Got it — Susan is reading the channel and preparing a *{ACTIONS[action][0]}* preview..."
     return JSONResponse({"response_type": "ephemeral", "text": ack})
 
 
@@ -2980,6 +3900,39 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                 except (json.JSONDecodeError, TypeError, RuntimeError) as e:
                     logger.exception("pr_summary post failed")
                     result = f"Susan error posting summary: {e}"
+            elif action_type == "weekly_status":
+                if not _looks_like_draft_id(value):
+                    await post_ephemeral(
+                        channel,
+                        user,
+                        "Invalid weekly status draft. Run `/susan weekly status` again.",
+                    )
+                    return
+                row = await consume_user_draft(value, user)
+                if not row or row.get("kind") != "weekly_status":
+                    await post_ephemeral(
+                        channel,
+                        user,
+                        "That weekly status draft expired. Run `/susan weekly status` again.",
+                    )
+                    return
+                try:
+                    meta = json.loads(row["content"])
+                    title = (meta.get("title") or "Weekly status").strip()
+                    body = meta.get("body") or ""
+                    post_ch = (meta.get("channel_id") or channel or "").strip()
+                    th = meta.get("thread_ts")
+                    if not isinstance(th, str) or not th.strip():
+                        th = None
+                    if not post_ch:
+                        result = "Could not post — missing channel."
+                    else:
+                        notify_ch = notify_ch or post_ch
+                        await post_pr_summary_to_channel(post_ch, th, title, body)
+                        result = "Posted the weekly status to the channel."
+                except (json.JSONDecodeError, TypeError, RuntimeError) as e:
+                    logger.exception("weekly_status post failed")
+                    result = f"Susan error posting weekly status: {e}"
             elif action_type == "pr":
                 result = await create_github_pr(value, user)
             else:
