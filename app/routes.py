@@ -4,6 +4,7 @@ from __future__ import annotations
 import html
 import logging
 import os
+import re
 import urllib.parse
 from contextlib import asynccontextmanager
 
