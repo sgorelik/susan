@@ -18,7 +18,7 @@
     "slash_commands": [
       {
         "command": "/susan",
-        "url": "https://susan-production.up.railway.app/susan",
+        "url": "https://your-host.example/susan",
         "description": "Ask Susan to act on this channel or thread",
         "usage_hint": "help | connect | weekly status [--no-approval] | summarize prs … | create pr … | …",
         "should_escape": false
@@ -47,7 +47,7 @@
   "settings": {
     "interactivity": {
       "is_enabled": true,
-      "request_url": "https://susan-production.up.railway.app/susan/actions"
+      "request_url": "https://your-host.example/susan/actions"
     },
     "org_deploy_enabled": false,
     "socket_mode_enabled": false,

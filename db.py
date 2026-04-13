@@ -357,7 +357,12 @@ async def user_has_github_tokens(slack_user_id: str) -> bool:
 
 
 async def get_github_token(slack_user_id: str) -> str:
-    """Env GITHUB_TOKEN wins; else stored OAuth token for this Slack user."""
+    """Return a GitHub token for API calls.
+
+    If ``GITHUB_TOKEN`` is set in the environment, it is used for **every** user
+    (single shared identity). Otherwise the token from this Slack user's OAuth
+    connect is used. See SECURITY.md before using a shared PAT in multi-user workspaces.
+    """
     env = (os.environ.get("GITHUB_TOKEN") or "").strip()
     if env:
         return env
@@ -437,7 +442,11 @@ async def user_has_google_tokens(slack_user_id: str) -> bool:
 
 
 async def get_valid_access_token(slack_user_id: str) -> str:
-    """Return a valid Google access token for this Slack user, refreshing if needed."""
+    """Return a valid Google access token for this Slack user, refreshing if needed.
+
+    If ``GOOGLE_ACCESS_TOKEN`` is set, it is used as a global fallback when the user
+    has no DB row — same caveats as ``GITHUB_TOKEN``; see SECURITY.md.
+    """
     env_fallback = normalize_google_access_token(os.environ.get("GOOGLE_ACCESS_TOKEN", ""))
     async with SessionLocal() as session:
         row = await session.get(GoogleToken, slack_user_id)
