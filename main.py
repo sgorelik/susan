@@ -1027,6 +1027,65 @@ async def post_message(
     return data
 
 
+def _md_double_star_to_slack_bold(s: str) -> str:
+    """Turn **commonmark bold** into Slack mrkdwn *bold* (non-nested segments)."""
+    out: list[str] = []
+    i = 0
+    while True:
+        a = s.find("**", i)
+        if a == -1:
+            out.append(s[i:])
+            break
+        out.append(s[i:a])
+        b = s.find("**", a + 2)
+        if b == -1:
+            out.append(s[a:])
+            break
+        inner = s[a + 2 : b].replace("*", "")
+        out.append(f"*{inner}*")
+        i = b + 2
+    return "".join(out)
+
+
+def _atx_headers_to_slack_bold(s: str) -> str:
+    """Turn ## ATX headings into a single Slack *bold* line (Slack has no # headings in mrkdwn)."""
+    lines = s.split("\n")
+    out: list[str] = []
+    for line in lines:
+        m = re.match(r"^(\s*)(#{1,6})\s+(.+?)\s*$", line)
+        if not m:
+            out.append(line)
+            continue
+        indent, content = m.group(1), m.group(3).strip()
+        content = re.sub(r"\s+#+\s*$", "", content)
+        content = _md_double_star_to_slack_bold(content)
+        if "*" in content:
+            out.append(indent + content)
+        else:
+            out.append(f"{indent}*{content}*")
+    return "\n".join(out)
+
+
+def markdownish_to_slack_mrkdwn(text: str) -> str:
+    """Claude often emits CommonMark (**bold**, ## headers). Slack Block Kit mrkdwn needs *bold* and no # headings."""
+    if not (text or "").strip():
+        return text or ""
+
+    def convert_segment(seg: str) -> str:
+        seg = _atx_headers_to_slack_bold(seg)
+        seg = _md_double_star_to_slack_bold(seg)
+        return seg
+
+    parts = re.split(r"(```[\s\S]*?```)", text)
+    buf: list[str] = []
+    for i, p in enumerate(parts):
+        if p.startswith("```") and p.endswith("```") and len(p) >= 6:
+            buf.append(p)
+        else:
+            buf.append(convert_segment(p))
+    return "".join(buf)
+
+
 async def post_pr_summary_to_channel(
     channel: str,
     thread_ts: str | None,
@@ -1036,7 +1095,7 @@ async def post_pr_summary_to_channel(
     """Publish PR summary as channel/thread messages (splits long bodies; ≤48 sections per message)."""
     chunk_size = 2800
     max_sections = 48
-    s = (body or "").strip()
+    s = markdownish_to_slack_mrkdwn((body or "").strip())
     parts: list[str] = []
     while s:
         parts.append(s[:chunk_size])
@@ -1710,16 +1769,18 @@ async def process_pr_summary(
     if (convo or "").strip():
         prompt += f"\nSlack thread context (optional):\n{convo.strip()[:6000]}\n"
     system = (
-        "You are Susan. Write a concise Slack-ready summary (mrkdwn) of merged pull requests "
-        "across one or more repositories. "
-        "Use short ## headings and bullets. "
+        "You are Susan. Write a concise summary for Slack Block Kit *mrkdwn* (not GitHub/CommonMark). "
+        "Rules: use *single asterisks* for bold (e.g. *Major updates*); never use **double-asterisk** bold. "
+        "Do not use # or ## headings — use a short bold title on its own line instead (e.g. *Contributors*). "
+        "Use bullets with leading hyphen (-). Italic uses _underscores_ if needed. "
+        "Merged pull requests across one or more repositories. "
         "Whenever you mention a specific PR in the body, include its repository slug in parentheses "
         "using the exact `owner/repo` from the data, e.g. `#35 Model deployment UI cleanup (frontier-one/f1-asgardos)`. "
         "If you use Slack link syntax, put the same slug in the visible text, e.g. "
         "<https://github.com/…|#35 Model deployment UI cleanup (frontier-one/f1-asgardos)>. "
         "Group by theme or area when it helps; you may group by repository or combine cross-repo themes. "
         "State the date range and repo list at the top. "
-        "Always end with a ## Contributors & commenters section: briefly highlight who merged the most PRs "
+        "Always end with a *Contributors & commenters* section (bold title line): briefly highlight who merged the most PRs "
         "(contributors / authors) and who was most active commenting or reviewing, informed by the "
         "aggregated participation block in the prompt; use @login handles. "
         "If there were zero PRs everywhere, say so and suggest widening the time range. "
@@ -1907,8 +1968,9 @@ async def process_weekly_status(
             f"---\nGitHub metrics and PR titles per repo:\n{facts}"
         )
         system = (
-            "You are Susan. Write a weekly status report as Slack mrkdwn.\n"
-            "Use clear ## headings, e.g. ## Channel (Slack) and ## GitHub (or per-repo ## lines).\n"
+            "You are Susan. Write a weekly status for Slack Block Kit *mrkdwn* (not CommonMark).\n"
+            "Use *single asterisks* for bold only; never **double-asterisk** bold. "
+            "Do not use # or ## — use bold title lines instead (e.g. *Channel (Slack)*, *GitHub*, *f1-asgardos*).\n"
             "Slack section: very high level — notable updates from teammates, decisions, risks, "
             "open questions; do not quote long messages.\n"
             "GitHub section: summarize Dependabot/vulnerability posture, PR volume, average turnaround, "
@@ -1925,9 +1987,9 @@ async def process_weekly_status(
             f"{slack_digest}\n"
         )
         system = (
-            "You are Susan. Write a weekly status report as Slack mrkdwn for a general team channel.\n"
-            "Use clear ## headings focused on the conversation (e.g. ## Highlights, ## Decisions, "
-            "## Risks & blockers, ## Open questions).\n"
+            "You are Susan. Write a weekly status for Slack Block Kit *mrkdwn* for a general team channel.\n"
+            "Use *single asterisks* for bold; never **double-asterisk** bold. No # or ## headings — "
+            "use bold lines (e.g. *Highlights*, *Decisions*, *Risks & blockers*, *Open questions*).\n"
             "Stay very high level — notable updates, decisions, and open threads; do not quote long messages.\n"
             "Do not mention GitHub, pull requests, or repositories unless the transcript explicitly does.\n"
             "Keep it executive-readable. Do not say the draft is private or ephemeral."
