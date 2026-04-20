@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Sequence
 
 import httpx
 
@@ -276,9 +277,25 @@ async def weekly_status_drive_activity_block(
     since_d: str,
     until_d: str,
     slack_digest: str,
+    *,
+    extra_google_urls: Sequence[str] | None = None,
 ) -> str:
-    """Facts for Claude: Drive files under linked folders / linked files modified in the status window."""
+    """Facts for Claude: Drive files under linked folders / linked files modified in the status window.
+
+    ``extra_google_urls`` adds Google Docs/Drive links (e.g. from Slack *channel bookmarks*)
+    in addition to URLs parsed from ``slack_digest``.
+    """
     urls = [u for u in extract_google_urls_from_slack_transcript(slack_digest) if "google.com" in u.lower()]
+    seen: set[str] = set(urls)
+    for raw in extra_google_urls or ():
+        u = (raw or "").strip()
+        if not u or "google.com" not in u.lower():
+            continue
+        key = u.split("?", 1)[0] if "drive.google.com" in u.lower() else u
+        if key not in seen:
+            seen.add(key)
+            urls.append(u)
+
     folders, file_ids = parse_google_drive_targets_from_urls(urls)
     if not folders and not file_ids:
         return ""
@@ -289,8 +306,10 @@ async def weekly_status_drive_activity_block(
     max_calls = max(10, min(300, int(os.environ.get("WEEKLY_DRIVE_MAX_API_CALLS", "100"))))
     folders = folders[:max_folders]
 
+    src_note = "URLs from channel messages and channel bookmarks"
     header = (
-        "\n---\n### Google Drive (URLs from channel messages; modifiedTime in UTC within the reporting window)\n"
+        "\n---\n### Google Drive "
+        f"({src_note}; modifiedTime in UTC within the reporting window)\n"
         f"_Window: {since_d} through {until_d}._\n"
     )
 

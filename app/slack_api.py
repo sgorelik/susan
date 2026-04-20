@@ -367,6 +367,70 @@ async def slack_api_conversation_channel_name(channel_id: str) -> str | None:
     return str(name).strip().lower() if name else None
 
 
+async def slack_channel_bookmarks_for_weekly(channel_id: str) -> tuple[list[str], str]:
+    """Read channel bookmarks for weekly status.
+
+    Returns:
+        google_urls: Google Docs/Drive URLs to merge with transcript URLs for Drive scanning.
+        other_md: Slack mrkdwn block listing non-Google bookmark links for the Claude prompt.
+
+    Requires bot scope ``bookmarks:read``. If the scope is missing, returns ``([], "")``.
+    """
+    cid = (channel_id or "").strip()
+    if not cid:
+        return [], ""
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(
+            "https://slack.com/api/bookmarks.list",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            params={"channel_id": cid},
+        )
+    try:
+        data = r.json()
+    except json.JSONDecodeError:
+        return [], ""
+    if not data.get("ok"):
+        err = str(data.get("error") or "")
+        if err == "missing_scope":
+            logger.warning(
+                "bookmarks.list: missing_scope — add bookmarks:read to the Slack app and reinstall"
+            )
+        elif err not in ("not_in_channel", "channel_not_found"):
+            logger.warning("bookmarks.list failed: %s", data)
+        return [], ""
+
+    google_urls: list[str] = []
+    other_lines: list[str] = []
+    seen_google: set[str] = set()
+    for b in data.get("bookmarks") or []:
+        if not isinstance(b, dict):
+            continue
+        link = (b.get("link") or "").strip()
+        if not link:
+            continue
+        title = (b.get("title") or "link").strip().replace("\n", " ")[:200]
+        safe_label = title.replace("<", "").replace(">", "").replace("|", "/")[:140] or "link"
+        low = link.lower()
+        if "google.com" in low:
+            key = link.split("?", 1)[0] if "drive.google.com" in low else link
+            if key not in seen_google:
+                seen_google.add(key)
+                google_urls.append(link)
+        else:
+            other_lines.append(f"• <{link}|{safe_label}>")
+
+    other_md = ""
+    if other_lines:
+        other_md = (
+            "### Channel bookmarks (Slack)\n"
+            "_Links saved as channel bookmarks (not Google Drive); cite when relevant._\n"
+            + "\n".join(other_lines[:40])
+        )
+        if len(other_lines) > 40:
+            other_md += f"\n_…and {len(other_lines) - 40} more bookmarks omitted._"
+    return google_urls, other_md
+
+
 SLACK_JSON_HEADERS = {
     "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
     "Content-Type": "application/json; charset=utf-8",

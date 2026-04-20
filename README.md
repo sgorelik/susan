@@ -44,7 +44,7 @@ If you prefer not to use the manifest file:
 1. **Create New App** → **From scratch**.
 2. **Slash Commands** → create `/susan` → Request URL `https://YOUR_PUBLIC_HOST/susan` (POST).
 3. **Interactivity & Shortcuts** → On → Request URL `https://YOUR_PUBLIC_HOST/susan/actions`.
-4. **OAuth & Permissions** → *Scopes* → *Bot Token Scopes* — add the same scopes as in `slack-manifest.json` (e.g. `commands`, `chat:write`, `chat:write.public`, `channels:history`, `channels:join`, `groups:history`, `im:history`, `im:write`, `mpim:history`, `mpim:write`, `users:read`, `users:read.email`).
+4. **OAuth & Permissions** → *Scopes* → *Bot Token Scopes* — add the same scopes as in `slack-manifest.json` (includes `bookmarks:read` so weekly status can use **channel bookmarks** for links and Google Drive seeds). Example set: `commands`, `chat:write`, `chat:write.public`, `channels:history`, `channels:join`, `groups:history`, `im:history`, `im:write`, `mpim:history`, `mpim:write`, `users:read`, `users:read.email`, `bookmarks:read`.
 5. **Install to Workspace** and copy Signing Secret + Bot Token as above.
 
 ### Updating Slack when `slack-manifest.json` changes
@@ -94,7 +94,7 @@ Run tests / checks (if you add them): `python -m py_compile app/*.py` is a minim
 - `/susan create a doc …`, `send email …`, `create invite …`
 - `/susan create issue …`, `create pr …` (GitHub OAuth + allowlists)
 - `/susan summarize merged prs …` / keywords like `pr summary` — merged PRs over a date range, preview then approve to post to channel
-- `/susan weekly status …` — Slack digest; in configured “tech” channel names, includes GitHub metrics and linked Drive activity; optional `--no-approval` (restrict with `SUSAN_WEEKLY_AUTO_POST_USER_IDS`)
+- `/susan weekly status …` — Structured update (*workstreams* with *1. Last week* / *2. Next steps* and Slack-style `<url|label>` links) from **Slack messages**, **channel bookmarks** (needs `bookmarks:read`; Google bookmark URLs feed Drive scan), **Google Drive** (files under linked folders / linked files in the date window, plus bookmarked Docs), and **all `GITHUB_REPOS`** in tech channels (else Slack+Drive+bookmarks only). Optional `--no-approval` (restrict with `SUSAN_WEEKLY_AUTO_POST_USER_IDS`). Raise `WEEKLY_STATUS_MAX_TOKENS` if outputs truncate.
 - `/susan help` — full in-Slack help
 
 ## Environment variables

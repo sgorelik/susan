@@ -446,9 +446,10 @@ def susan_slash_help_response() -> JSONResponse:
         "For *PRs/issues*, if several repos are allowed she still asks you to pick one.\n\n"
         "*Dependabot / vulnerabilities* (tech weekly status only): set `GITHUB_OAUTH_SCOPE` to include **`security_events`** "
         "(for example `repo security_events`) and reconnect GitHub; otherwise Susan will note that alerts are unavailable.\n\n"
-        "*Google Drive* (weekly status): if channel messages link to Drive folders or Docs/Sheets/Slides, Susan lists files "
-        "in those folders (recursive) and linked files whose `modifiedTime` falls in the same date window — using the "
-        "Google account of the user who runs `/susan`. Enable the **Google Drive API** in GCP and reconnect Google after "
+        "*Google Drive & bookmarks* (weekly status): Google Docs/Drive URLs from **channel messages and channel bookmarks** "
+        "(needs `bookmarks:read`) seed a Drive scan; Susan lists files in linked folders (recursive) and linked files whose "
+        "`modifiedTime` falls in the date window — using the **Google account** of the user who runs `/susan`. Enable the "
+        "**Google Drive API** in GCP and reconnect Google after "
         "deploy (new `drive.metadata.readonly` scope). Caps: `WEEKLY_DRIVE_MAX_FOLDERS`, `WEEKLY_DRIVE_MAX_DEPTH`, "
         "`WEEKLY_DRIVE_MAX_FILES_REPORTED`, `WEEKLY_DRIVE_MAX_API_CALLS`."
     )
