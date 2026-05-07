@@ -1,4 +1,4 @@
-"""Persistent store for per-Slack-user OAuth tokens (Google, GitHub).
+"""Persistent store for per-Slack-user OAuth tokens (Google, GitHub, Granola).
 
 Uses PostgreSQL when DATABASE_URL is set (e.g. Railway Postgres). Otherwise uses a
 local SQLite file (async via aiosqlite) so refresh tokens survive process restarts.
@@ -119,6 +119,22 @@ class GithubToken(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class GranolaToken(Base):
+    """Per-Slack-user Granola OAuth access token.
+
+    Mirrors ``GithubToken`` exactly: no refresh token handling for now (Granola refresh
+    token support is an open question — see ``app/oauth.py``). Each user must
+    authenticate their own Granola account; there is no shared/fallback token.
+    """
+
+    __tablename__ = "granola_tokens"
+
+    slack_user_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    access_token: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class RepoPickPending(Base):
     """Short-lived state for GitHub repo picker (Slack button value size limits)."""
 
@@ -186,7 +202,7 @@ async def consume_repo_pick_pending(pick_id: str, slack_user_id: str) -> dict | 
 
 
 class OauthResumePending(Base):
-    """Remembers a /susan command so we can continue it after Google/GitHub OAuth."""
+    """Remembers a /susan command so we can continue it after Google/GitHub/Granola OAuth."""
 
     __tablename__ = "oauth_resume_pending"
 
@@ -309,6 +325,12 @@ async def consume_oauth_resume_pending(
 
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
+GRANOLA_TOKEN_URL_DEFAULT = "https://api.granola.ai/oauth/token"
+
+
+def granola_token_url() -> str:
+    """Granola token endpoint. Override with ``GRANOLA_TOKEN_URL`` if Granola moves it."""
+    return (os.environ.get("GRANOLA_TOKEN_URL") or GRANOLA_TOKEN_URL_DEFAULT).strip() or GRANOLA_TOKEN_URL_DEFAULT
 
 
 async def exchange_github_code_for_token(code: str, redirect_uri: str) -> dict:
@@ -372,6 +394,76 @@ async def get_github_token(slack_user_id: str) -> str:
             return row.access_token.strip()
     raise ValueError(
         "GitHub is not connected. Type `/susan connect github` in Slack to link your account."
+    )
+
+
+async def exchange_granola_code_for_token(code: str, redirect_uri: str) -> dict:
+    """Exchange a Granola OAuth ``code`` for an access token.
+
+    Mirrors the GitHub OAuth code exchange; no refresh token is requested or stored
+    (Granola refresh token support is an open question for now).
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            granola_token_url(),
+            headers={"Accept": "application/json"},
+            data={
+                "client_id": os.environ["GRANOLA_CLIENT_ID"],
+                "client_secret": os.environ["GRANOLA_CLIENT_SECRET"],
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+            },
+        )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("error"):
+        raise ValueError(data.get("error_description", data.get("error", "oauth_error")))
+    return data
+
+
+async def upsert_granola_token(slack_user_id: str, access_token: str) -> None:
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        row = await session.get(GranolaToken, slack_user_id)
+        if row:
+            row.access_token = access_token
+            row.updated_at = now
+        else:
+            session.add(
+                GranolaToken(
+                    slack_user_id=slack_user_id,
+                    access_token=access_token,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        await session.commit()
+
+
+async def user_has_granola_tokens(slack_user_id: str) -> bool:
+    """True only if this Slack user has connected their own Granola account.
+
+    There is *no* shared/fallback token: every user must run ``/susan connect granola``.
+    """
+    async with SessionLocal() as session:
+        row = await session.get(GranolaToken, slack_user_id)
+        return row is not None
+
+
+async def get_granola_token(slack_user_id: str) -> str:
+    """Return this Slack user's Granola access token, or raise if not connected.
+
+    No shared fallback — each user must authenticate individually. The error message
+    instructs the user to run ``/susan connect granola``; callers that want graceful
+    degradation should call :func:`user_has_granola_tokens` first and silently skip.
+    """
+    async with SessionLocal() as session:
+        row = await session.get(GranolaToken, slack_user_id)
+        if row:
+            return row.access_token.strip()
+    raise ValueError(
+        "Granola is not connected. Run `/susan connect granola` to connect your Granola account."
     )
 
 

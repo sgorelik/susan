@@ -13,8 +13,10 @@ from db import (
     create_oauth_resume_pending,
     exchange_code_for_tokens,
     exchange_github_code_for_token,
+    exchange_granola_code_for_token,
     init_db,
     upsert_github_token,
+    upsert_granola_token,
     upsert_tokens,
     user_has_github_tokens,
     user_has_google_tokens,
@@ -38,8 +40,11 @@ from app.interactions import handle_action
 from app.oauth import (
     _github_oauth_configured,
     _google_oauth_configured,
+    _granola_oauth_configured,
     github_authorize_url,
     google_authorize_url,
+    granola_authorize_url,
+    granola_redirect_uri,
     make_oauth_state,
     parse_oauth_state,
     public_base_url,
@@ -235,6 +240,85 @@ async def auth_github_callback(
         f"<html><body><p><strong>GitHub connected.</strong> {html_note}</p></body></html>"
     )
 
+
+@app.get("/auth/granola")
+async def auth_granola_start(state: str):
+    """Initiate the Granola OAuth flow for the signed Slack-user state."""
+    parsed = parse_oauth_state(state)
+    if not parsed:
+        raise HTTPException(status_code=400, detail="Invalid or expired state")
+    if not _granola_oauth_configured():
+        raise HTTPException(status_code=500, detail="Granola OAuth not configured")
+    return RedirectResponse(granola_authorize_url(state))
+
+
+@app.get("/auth/granola/callback")
+async def auth_granola_callback(
+    code: str, state: str, background_tasks: BackgroundTasks
+):
+    """Granola OAuth callback: exchanges ``code`` for an access token, stores it,
+    and resumes any pending ``/susan`` command via ``oauth_resume_pending``."""
+    parsed = parse_oauth_state(state)
+    if not parsed:
+        return HTMLResponse(
+            "<html><body><p>Invalid or expired session. Close this window and run <code>/susan connect granola</code> again in Slack.</p></body></html>",
+            status_code=400,
+        )
+    uid, slack_channel_id, resume_id = parsed
+    redirect_uri = granola_redirect_uri()
+    resumed = False
+    try:
+        data = await exchange_granola_code_for_token(code, redirect_uri)
+        access = data.get("access_token")
+        if not access:
+            return HTMLResponse(
+                "<html><body><p>Granola did not return an access token. Try <code>/susan connect granola</code> again.</p></body></html>",
+                status_code=400,
+            )
+        await upsert_granola_token(uid, access)
+        logger.info(
+            "Granola OAuth token stored for Slack user=%s channel_in_state=%s",
+            uid,
+            slack_channel_id or "(none)",
+        )
+        if resume_id:
+            row = await consume_oauth_resume_pending(resume_id, uid, "granola")
+            if row:
+                background_tasks.add_task(resume_slash_after_oauth, row)
+                resumed = True
+    except Exception as e:
+        logger.exception("Granola OAuth callback failed for user=%s", uid)
+        return HTMLResponse(
+            "<html><body><p>Could not complete Granola sign-in: "
+            f"{html.escape(str(e))}</p></body></html>",
+            status_code=400,
+        )
+
+    if slack_channel_id:
+        try:
+            if resumed:
+                msg = "✓ *Granola connected.* Continuing your previous `/susan` command in this channel…"
+            else:
+                msg = "✓ *Granola connected.* You can use `/susan` anytime."
+            await post_ephemeral(
+                slack_channel_id,
+                uid,
+                msg,
+            )
+            logger.info("Posted Granola connect confirmation to Slack channel=%s user=%s", slack_channel_id, uid)
+        except Exception as e:
+            logger.warning("Could not post Slack confirmation after Granola OAuth: %s", e)
+
+    html_note = (
+        "Susan is continuing your request in Slack."
+        if resumed
+        else "You can close this tab."
+    )
+    return HTMLResponse(
+        f"<html><body><p><strong>Granola connected.</strong> {html_note}</p></body></html>"
+    )
+
+
 def connect_google_slack_response(
     user: str,
     intro: str | None = None,
@@ -334,16 +418,67 @@ def connect_github_slack_response(
     )
 
 
-def connect_slack_response_combined(user: str, channel_id: str | None = None) -> JSONResponse:
-    """Ephemeral with Google and/or GitHub connect links."""
+def connect_granola_slack_response(
+    user: str,
+    intro: str | None = None,
+    channel_id: str | None = None,
+    resume_id: str | None = None,
+) -> JSONResponse:
+    """Ephemeral message with link to Granola OAuth. Optional resume_id continues the command after OAuth.
+
+    No shared/fallback Granola token exists — every user must authenticate their own
+    Granola account before Granola-dependent features become available.
+    """
     base = public_base_url()
-    g_ok = _google_oauth_configured()
-    h_ok = _github_oauth_configured()
-    if not g_ok and not h_ok:
+    if not base:
         return JSONResponse(
             {
                 "response_type": "ephemeral",
-                "text": "OAuth is not configured. Set Google (`GOOGLE_*`) and/or GitHub (`GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GITHUB_REDIRECT_URI`) env vars.",
+                "text": "Set PUBLIC_BASE_URL or GRANOLA_REDIRECT_URI (e.g. https://your-app.up.railway.app/auth/granola/callback) so the Connect link works.",
+            }
+        )
+    if not _granola_oauth_configured():
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": "Granola OAuth is not configured. Set GRANOLA_CLIENT_ID, GRANOLA_CLIENT_SECRET, and either GRANOLA_REDIRECT_URI or PUBLIC_BASE_URL.",
+            }
+        )
+    intro = intro or "Connect your Granola account so Susan can use *your* meeting notes to inform responses."
+    state = make_oauth_state(
+        user, channel_id=channel_id or None, resume_id=resume_id
+    )
+    auth_path = f"{base}/auth/granola?state={urllib.parse.quote(state, safe='')}"
+    link = f"<{auth_path}|Connect Granola Account>"
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"{intro}\n\n{link}",
+            },
+        },
+    ]
+    return JSONResponse(
+        {
+            "response_type": "ephemeral",
+            "text": "Granola connection (only visible to you).",
+            "blocks": blocks,
+        }
+    )
+
+
+def connect_slack_response_combined(user: str, channel_id: str | None = None) -> JSONResponse:
+    """Ephemeral with Google, GitHub, and/or Granola connect links."""
+    base = public_base_url()
+    g_ok = _google_oauth_configured()
+    h_ok = _github_oauth_configured()
+    n_ok = _granola_oauth_configured()
+    if not g_ok and not h_ok and not n_ok:
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": "OAuth is not configured. Set Google (`GOOGLE_*`), GitHub (`GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GITHUB_REDIRECT_URI`), and/or Granola (`GRANOLA_CLIENT_ID`, `GRANOLA_CLIENT_SECRET`) env vars.",
             }
         )
     if not base:
@@ -363,11 +498,15 @@ def connect_slack_response_combined(user: str, channel_id: str | None = None) ->
         state = make_oauth_state(user, channel_id=channel_id or None)
         hurl = f"{base}/auth/github?state={urllib.parse.quote(state, safe='')}"
         parts.append(f"• *GitHub* (create PRs): <{hurl}|Connect GitHub>")
+    if n_ok:
+        state = make_oauth_state(user, channel_id=channel_id or None)
+        nurl = f"{base}/auth/granola?state={urllib.parse.quote(state, safe='')}"
+        parts.append(f"• *Granola* (meeting notes): <{nurl}|Connect Granola>")
     blocks[0]["text"]["text"] = "\n".join(parts)
     return JSONResponse(
         {
             "response_type": "ephemeral",
-            "text": "Connect Google and/or GitHub (only visible to you).",
+            "text": "Connect Google, GitHub, and/or Granola (only visible to you).",
             "blocks": blocks,
         }
     )
@@ -409,9 +548,10 @@ def susan_slash_help_response() -> JSONResponse:
     )
     body_connect = (
         "*Connect accounts*\n"
-        "• `/susan connect` — Google + GitHub (whatever is configured on the server)\n"
+        "• `/susan connect` — Google, GitHub, and Granola (whatever is configured on the server)\n"
         "• `/susan connect google` — Docs, Gmail, Calendar, Drive metadata (weekly status: linked folders/files)\n"
-        "• `/susan connect github` — issues, PRs, PR summaries; *tech-channel* weekly status (see below)"
+        "• `/susan connect github` — issues, PRs, PR summaries; *tech-channel* weekly status (see below)\n"
+        "• `/susan connect granola` — meeting notes that inform Susan's responses"
     )
     body_what = "*What to ask*\n" + actions_body
     body_ex = (
@@ -514,12 +654,14 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
             return connect_github_slack_response(user, channel_id=channel or None)
         if rest in ("google",):
             return connect_google_slack_response(user, channel_id=channel or None)
+        if rest in ("granola",):
+            return connect_granola_slack_response(user, channel_id=channel or None)
         if rest == "":
             return connect_slack_response_combined(user, channel_id=channel or None)
         return JSONResponse(
             {
                 "response_type": "ephemeral",
-                "text": "Unknown `connect` subcommand. Use `connect`, `connect google`, or `connect github`.",
+                "text": "Unknown `connect` subcommand. Use `connect`, `connect google`, `connect github`, or `connect granola`.",
             }
         )
 
