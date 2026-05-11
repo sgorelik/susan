@@ -99,6 +99,23 @@ def public_base_url() -> str:
     return ""
 
 
+def public_origin_for_connect_links() -> str:
+    """HTTPS origin used to build ``/auth/...`` links in Slack (never trailing slash)."""
+    b = public_base_url()
+    if b:
+        return b
+    r = (os.environ.get("GRANOLA_REDIRECT_URI") or "").strip()
+    if not r:
+        return ""
+    try:
+        p = urllib.parse.urlparse(_ensure_url_with_scheme(r))
+        if p.scheme and p.netloc:
+            return f"{p.scheme}://{p.netloc}".rstrip("/")
+    except Exception:
+        pass
+    return ""
+
+
 def google_authorize_url(state: str) -> str:
     redirect_uri = os.environ["GOOGLE_REDIRECT_URI"]
     params = {
@@ -145,18 +162,16 @@ def github_authorize_url(state: str) -> str:
     return "https://github.com/login/oauth/authorize?" + urllib.parse.urlencode(params)
 
 
-def _granola_oauth_configured() -> bool:
-    """True only if all required Granola OAuth env vars are set.
+def granola_client_credentials_set() -> bool:
+    """True when both OAuth client id and secret are non-empty (Granola app credentials)."""
+    cid = (os.environ.get("GRANOLA_CLIENT_ID") or "").strip()
+    sec = (os.environ.get("GRANOLA_CLIENT_SECRET") or "").strip()
+    return bool(cid and sec)
 
-    ``GRANOLA_REDIRECT_URI`` may be derived from ``PUBLIC_BASE_URL``; both fallbacks
-    are accepted so we don't force admins to set redundant variables.
-    """
-    try:
-        _ = os.environ["GRANOLA_CLIENT_ID"]
-        _ = os.environ["GRANOLA_CLIENT_SECRET"]
-    except KeyError:
-        return False
-    return bool(granola_redirect_uri())
+
+def _granola_oauth_configured() -> bool:
+    """True when redirect URI can be resolved and OAuth client credentials are set."""
+    return granola_client_credentials_set() and bool(granola_redirect_uri())
 
 
 def granola_redirect_uri() -> str:
@@ -185,7 +200,7 @@ def granola_authorize_url(state: str) -> str:
     redirect_uri = granola_redirect_uri()
     base = (os.environ.get("GRANOLA_AUTHORIZE_URL") or GRANOLA_AUTHORIZE_URL_DEFAULT).strip() or GRANOLA_AUTHORIZE_URL_DEFAULT
     params = {
-        "client_id": os.environ["GRANOLA_CLIENT_ID"],
+        "client_id": (os.environ.get("GRANOLA_CLIENT_ID") or "").strip(),
         "redirect_uri": redirect_uri,
         "response_type": "code",
         "state": state,

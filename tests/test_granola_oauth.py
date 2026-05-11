@@ -92,6 +92,22 @@ def test_granola_oauth_configured_requires_id_secret_and_redirect(
     _set_env(monkeypatch, PUBLIC_BASE_URL="https://h")
     assert oauth._granola_oauth_configured() is True
 
+    _set_env(monkeypatch, GRANOLA_CLIENT_ID="  ", GRANOLA_CLIENT_SECRET="y")
+    assert oauth._granola_oauth_configured() is False
+
+
+def test_public_origin_for_connect_links_from_granola_redirect(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import oauth
+
+    _set_env(
+        monkeypatch,
+        PUBLIC_BASE_URL=None,
+        GRANOLA_REDIRECT_URI="https://odd.host:8443/foo/oauth/callback",
+    )
+    assert oauth.public_base_url() == ""
+    assert oauth.granola_redirect_uri() == "https://odd.host:8443/foo/oauth/callback"
+    assert oauth.public_origin_for_connect_links() == "https://odd.host:8443"
+
 
 def test_oauth_state_round_trip_with_resume_id(monkeypatch: pytest.MonkeyPatch) -> None:
     """Granola reuses the same signed-state mechanism as Google/GitHub for resume_id."""

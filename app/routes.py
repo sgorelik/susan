@@ -45,10 +45,12 @@ from app.oauth import (
     github_authorize_url,
     google_authorize_url,
     granola_authorize_url,
+    granola_client_credentials_set,
     granola_redirect_uri,
     make_oauth_state,
     parse_oauth_state,
     public_base_url,
+    public_origin_for_connect_links,
 )
 from app.pr_summary import process_pr_summary
 from app.slack_commands import process_command, resume_slash_after_oauth
@@ -431,19 +433,41 @@ def connect_granola_slack_response(
     No shared/fallback Granola token exists — every user must authenticate their own
     Granola account before Granola-dependent features become available.
     """
-    base = public_base_url()
+    granola_redir = granola_redirect_uri()
+    if not granola_redir:
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": (
+                    "Granola OAuth needs a **callback URL** registered with Granola and on this server. Set "
+                    "`PUBLIC_BASE_URL` to your deploy’s HTTPS origin (e.g. `https://your-service.up.railway.app`) "
+                    "so Susan uses `…/auth/granola/callback`, *or* set `GRANOLA_REDIRECT_URI` to the full callback "
+                    "URL (must match what you registered with Granola)."
+                ),
+            }
+        )
+    if not granola_client_credentials_set():
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": (
+                    "Set **`GRANOLA_CLIENT_ID`** and **`GRANOLA_CLIENT_SECRET`** in Railway (or `.env`). "
+                    "Susan uses a normal OAuth *authorization_code* flow. If Granola hasn’t given you a static "
+                    "client id/secret for your app, ask them at **hey@granola.so** — their MCP docs describe "
+                    "dynamic registration for some clients: "
+                    "https://docs.granola.ai/help-center/sharing/integrations/mcp"
+                ),
+            }
+        )
+    base = public_origin_for_connect_links()
     if not base:
         return JSONResponse(
             {
                 "response_type": "ephemeral",
-                "text": "Set PUBLIC_BASE_URL or GRANOLA_REDIRECT_URI (e.g. https://your-app.up.railway.app/auth/granola/callback) so the Connect link works.",
-            }
-        )
-    if not _granola_oauth_configured():
-        return JSONResponse(
-            {
-                "response_type": "ephemeral",
-                "text": "Granola OAuth is not configured. Set GRANOLA_CLIENT_ID, GRANOLA_CLIENT_SECRET, and either GRANOLA_REDIRECT_URI or PUBLIC_BASE_URL.",
+                "text": (
+                    "Could not determine your app’s public **origin** for the Connect link. Set `PUBLIC_BASE_URL` "
+                    "or a full `GRANOLA_REDIRECT_URI` URL."
+                ),
             }
         )
     intro = intro or "Connect your Granola account so Susan can use *your* meeting notes to inform responses."
