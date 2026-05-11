@@ -98,10 +98,10 @@ def test_auth_granola_callback_stores_token_and_consumes_resume(
     import db
     from app.oauth import make_oauth_state
 
-    asyncio.get_event_loop().run_until_complete(db.init_db())
+    asyncio.run(db.init_db())
 
     uid = "U-callback"
-    rid = asyncio.get_event_loop().run_until_complete(
+    rid = asyncio.run(
         db.create_oauth_resume_pending(uid, "C1", None, "/susan x", "doc", "granola")
     )
     state = make_oauth_state(uid, channel_id="C1", resume_id=rid)
@@ -143,14 +143,12 @@ def test_auth_granola_callback_stores_token_and_consumes_resume(
     assert "Granola connected" in r.text
 
     # Token persisted under the right Slack user id.
-    has = asyncio.get_event_loop().run_until_complete(db.user_has_granola_tokens(uid))
+    has = asyncio.run(db.user_has_granola_tokens(uid))
     assert has is True
-    tok = asyncio.get_event_loop().run_until_complete(db.get_granola_token(uid))
+    tok = asyncio.run(db.get_granola_token(uid))
     assert tok == "granola-acc"
     # Resume row was consumed (returns None on second call).
-    consumed = asyncio.get_event_loop().run_until_complete(
-        db.consume_oauth_resume_pending(rid, uid, "granola")
-    )
+    consumed = asyncio.run(db.consume_oauth_resume_pending(rid, uid, "granola"))
     assert consumed is None
 
 
