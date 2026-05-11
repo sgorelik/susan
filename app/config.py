@@ -44,6 +44,10 @@ ACTIONS = {
             "engineering status",
         ],
     ),
+    "granola_cmd": (
+        "Granola notes summary",
+        [],  # Routed only via `/susan granola` / `/susan gn`; empty keywords avoid accidental matches.
+    ),
     "pr": ("create a GitHub PR", ["pull request", "create pr", "open pr", "pr"]),
 }
 

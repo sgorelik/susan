@@ -72,6 +72,30 @@ def test_slash_connect_unknown_subcommand_lists_granola(client: TestClient) -> N
     assert "connect granola" in j["text"]
 
 
+def test_slash_granola_without_token_offers_connect(client: TestClient) -> None:
+    """`/susan granola …` with no stored token returns the Granola OAuth ephemeral."""
+    j = _slash_post(client, "granola group meeting notes last week")
+    assert j["response_type"] == "ephemeral"
+    blocks_text = json.dumps(j.get("blocks") or [])
+    assert "Connect Granola Account" in blocks_text
+    assert "/auth/granola?state=" in blocks_text
+
+
+def test_slash_gn_shortcut_ack_when_token_mocked(client: TestClient) -> None:
+    """With a token present, `/susan gn` acks immediately (Granola fetch runs in background)."""
+    import asyncio
+
+    import db
+
+    asyncio.run(db.init_db())
+    asyncio.run(db.upsert_granola_token("U1", "fake-access-token"))
+
+    with mock.patch("app.routes.process_granola_summarize", new=mock.AsyncMock()):
+        j = _slash_post(client, "gn last week")
+    assert j["response_type"] == "ephemeral"
+    assert "Granola" in j["text"]
+
+
 def test_auth_granola_start_rejects_invalid_state(client: TestClient) -> None:
     r = client.get("/auth/granola", params={"state": "garbage"}, follow_redirects=False)
     assert r.status_code == 400

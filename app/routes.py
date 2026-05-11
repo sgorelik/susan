@@ -20,6 +20,7 @@ from db import (
     upsert_tokens,
     user_has_github_tokens,
     user_has_google_tokens,
+    user_has_granola_tokens,
 )
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -66,6 +67,7 @@ from app.weekly_context import (
     weekly_status_auto_post_user_allowed,
     weekly_status_include_github,
 )
+from app.granola_summarize import parse_granola_slash_command, process_granola_summarize
 from app.weekly_status import process_weekly_status
 
 @asynccontextmanager
@@ -556,6 +558,9 @@ def susan_slash_help_response() -> JSONResponse:
     body_what = "*What to ask*\n" + actions_body
     body_ex = (
         "*Examples*\n"
+        "`/susan granola` or `/susan gn` — summarize *your* Granola meetings (default lookback); "
+        "add free text for the window or focus, e.g. `/susan gn last calendar week` or "
+        "`/susan granola group sync notes last 14 days`\n"
         "`/susan create a doc summarizing this thread for the launch notes`\n"
         "`/susan send email to the team thanking them for the release`\n"
         "`/susan create invite for a 30m design review next Tuesday`\n"
@@ -668,6 +673,52 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
     if is_susan_help_command(text_lower):
         return susan_slash_help_response()
 
+    granola_remainder = parse_granola_slash_command(text)
+    if granola_remainder is not None:
+        if not await user_has_granola_tokens(user):
+            resume_id = await create_oauth_resume_pending(
+                user, channel, thread_ts, text, "granola_cmd", "granola"
+            )
+            return connect_granola_slack_response(
+                user,
+                intro="*Granola isn’t connected yet.* Use the link below to sign in — Susan will run your Granola summary when you’re done (or use `/susan connect granola` anytime).",
+                channel_id=channel or None,
+                resume_id=resume_id,
+            )
+
+        async def run_granola():
+            try:
+                await process_granola_summarize(
+                    granola_remainder,
+                    channel,
+                    user,
+                    thread_ts,
+                    response_url,
+                )
+            except Exception as e:
+                logger.exception("Granola summarize task failed")
+                try:
+                    await notify_user_ephemeral(
+                        channel,
+                        user,
+                        f"Susan error (Granola): {str(e)}",
+                        None,
+                        response_url,
+                    )
+                except Exception as e2:
+                    logger.error("Could not notify user after Granola error: %s", e2)
+
+        background_tasks.add_task(run_granola)
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": (
+                    "Got it — Susan is pulling *your Granola notes* for the requested window and will post "
+                    "a private summary here when ready."
+                ),
+            }
+        )
+
     action = detect_action(text)
     if not action:
         return JSONResponse(
@@ -676,7 +727,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                 "text": (
                     "Susan doesn’t understand that command. Try `/susan help` for examples, "
                     "or keywords like `connect`, `doc`, `email`, `invite`, `issue`, `pr`, "
-                    "`summarize prs`, or `weekly status`."
+                    "`summarize prs`, `weekly status`, or Granola-only: `granola` / `gn`."
                 ),
             }
         )

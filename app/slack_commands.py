@@ -9,7 +9,7 @@ import uuid
 from db import create_user_draft
 
 from app.claude_client import call_claude
-from app.config import ACTIONS, logger, REPO_PREFIX, SYSTEM_PROMPTS
+from app.config import ACTIONS, GITHUB_ACTIONS, logger, REPO_PREFIX, SYSTEM_PROMPTS
 from app.github_pickers import (
     post_github_repo_multi_summary_picker_ephemeral,
     post_github_repo_picker_ephemeral,
@@ -22,6 +22,7 @@ from app.github_repos import (
     resolve_github_repos_for_pr_summary,
 )
 from app.pr_summary import process_pr_summary
+from app.granola_summarize import parse_granola_slash_command, process_granola_summarize
 from app.slack_api import (
     extract_slack_archives_link,
     fetch_slack_history,
@@ -434,6 +435,31 @@ async def resume_slash_after_oauth(row: dict) -> None:
     thread_ts = row["thread_ts"]
     action = row["action"]
     response_url = None
+    if action == "granola_cmd":
+        remainder = parse_granola_slash_command(text) or ""
+        try:
+            await post_ephemeral(
+                channel,
+                user,
+                "Resuming your *Granola notes summary* after sign-in…",
+            )
+        except Exception as e:
+            logger.warning("resume_slash_after_oauth intro ephemeral: %s", e)
+        try:
+            await process_granola_summarize(remainder, channel, user, thread_ts, response_url)
+        except Exception as e:
+            logger.exception("resume_slash_after_oauth granola failed")
+            try:
+                await notify_user_ephemeral(
+                    channel,
+                    user,
+                    f"Could not resume your Granola command after sign-in: {e}",
+                    None,
+                    response_url,
+                )
+            except Exception as e2:
+                logger.error("resume_slash_after_oauth notify: %s", e2)
+        return
     try:
         await post_ephemeral(
             channel,
