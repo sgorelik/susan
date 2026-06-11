@@ -14,6 +14,7 @@ from app.github_actions import create_github_issue, create_github_pr
 from app.github_pickers import _slack_multi_summary_selected_repos
 from app.github_repos import _issue_allowlist, _pr_allowlist
 from app.google_workspace import create_calendar_invite, create_google_doc, send_gmail
+from app.action_items import publish_action_items_digest
 from app.pr_summary import process_pr_summary
 from app.slack_commands import (
     SLACK_CB_EMAIL_MODAL,
@@ -571,6 +572,46 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                 except (json.JSONDecodeError, TypeError, RuntimeError) as e:
                     logger.exception("weekly_status post failed")
                     result = f"Susan error posting weekly status: {e}"
+            elif action_type == "action_items":
+                if not _looks_like_draft_id(value):
+                    await post_ephemeral(
+                        channel,
+                        user,
+                        "Invalid action items draft. Run `/susan actions` again.",
+                    )
+                    return
+                row = await consume_user_draft(value, user)
+                if not row or row.get("kind") != "action_items":
+                    await post_ephemeral(
+                        channel,
+                        user,
+                        "That action items draft expired. Run `/susan actions` again.",
+                    )
+                    return
+                try:
+                    meta = json.loads(row["content"])
+                    post_ch = (meta.get("channel_id") or channel or "").strip()
+                    th = meta.get("thread_ts")
+                    if not isinstance(th, str) or not th.strip():
+                        th = None
+                    items = meta.get("items") or []
+                    if not post_ch:
+                        result = "Could not post — missing channel."
+                    else:
+                        notify_ch = notify_ch or post_ch
+                        await publish_action_items_digest(
+                            channel_id=post_ch,
+                            thread_ts=th,
+                            user=user,
+                            range_label=meta.get("range_label") or "action items",
+                            since_d=meta.get("since_d") or "",
+                            until_d=meta.get("until_d") or "",
+                            items=items,
+                        )
+                        result = f"Posted action items roundup ({len(items)} outstanding) to the channel."
+                except (json.JSONDecodeError, TypeError, RuntimeError) as e:
+                    logger.exception("action_items post failed")
+                    result = f"Susan error posting action items: {e}"
             elif action_type == "pr":
                 result = await create_github_pr(value, user)
             else:

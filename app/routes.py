@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
 import os
 import re
@@ -70,6 +71,8 @@ from app.weekly_context import (
     weekly_status_include_github,
 )
 from app.granola_summarize import parse_granola_slash_command, process_granola_summarize
+from app.action_items import parse_action_items_command, process_action_items
+from app.slack_events import handle_slack_event_callback, parse_events_body
 from app.weekly_status import process_weekly_status
 
 @asynccontextmanager
@@ -585,6 +588,9 @@ def susan_slash_help_response() -> JSONResponse:
         "`/susan granola` or `/susan gn` — summarize *your* Granola meetings (default lookback); "
         "add free text for the window or focus, e.g. `/susan gn last calendar week` or "
         "`/susan granola group sync notes last 14 days`\n"
+        "`/susan actions` or `/susan action items` — outstanding tasks with *@mentions* from Slack, "
+        "Drive, Granola, and GitHub (when connected); team replies `done` / `in progress` / `won't do` in the thread\n"
+        "`/susan actions last 14 days --no-approval` — for scheduled Slack messages (posts directly to channel)\n"
         "`/susan create a doc summarizing this thread for the launch notes`\n"
         "`/susan send email to the team thanking them for the release`\n"
         "`/susan create invite for a 30m design review next Tuesday`\n"
@@ -743,6 +749,61 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
             }
         )
 
+    actions_remainder = parse_action_items_command(text)
+    if actions_remainder is not None:
+        _, actions_auto_post = strip_weekly_status_auto_post_flags(text)
+        if actions_auto_post and not weekly_status_auto_post_user_allowed(user):
+            return JSONResponse(
+                {
+                    "response_type": "ephemeral",
+                    "text": (
+                        "Auto-publish (`--no-approval` / `-no-approval`) is restricted for your user. "
+                        "Remove the flag for a normal preview, or ask an admin to add your Slack user id to "
+                        "`SUSAN_WEEKLY_AUTO_POST_USER_IDS` on the server."
+                    ),
+                }
+            )
+
+        link_ch_a, link_ts_a = extract_slack_archives_link(text)
+        hist_channel_a = link_ch_a or channel
+
+        async def run_action_items():
+            try:
+                await process_action_items(
+                    text,
+                    hist_channel_a,
+                    channel,
+                    user,
+                    thread_ts or link_ts_a,
+                    response_url,
+                    auto_publish=actions_auto_post,
+                )
+            except Exception as e:
+                logger.exception("Action items task failed")
+                try:
+                    await notify_user_ephemeral(
+                        channel,
+                        user,
+                        f"Susan error (action items): {str(e)}",
+                        None,
+                        response_url,
+                    )
+                except Exception as e2:
+                    logger.error("Could not notify user after action items error: %s", e2)
+
+        background_tasks.add_task(run_action_items)
+        if actions_auto_post:
+            ack = (
+                "Got it — Susan is scanning Slack (and connected Drive, Granola, GitHub) for *action items* "
+                "and will *post a channel roundup with @mentions* when ready (`--no-approval`)."
+            )
+        else:
+            ack = (
+                "Got it — Susan is gathering *action items* from Slack and connected sources; "
+                "you'll get a preview with @mentions to approve."
+            )
+        return JSONResponse({"response_type": "ephemeral", "text": ack})
+
     action = detect_action(text)
     if not action:
         return JSONResponse(
@@ -751,7 +812,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                 "text": (
                     "Susan doesn’t understand that command. Try `/susan help` for examples, "
                     "or keywords like `connect`, `doc`, `email`, `invite`, `issue`, `pr`, "
-                    "`summarize prs`, `weekly status`, or Granola-only: `granola` / `gn`."
+                    "`summarize prs`, `weekly status`, `actions` / `action items`, or Granola-only: `granola` / `gn`."
                 ),
             }
         )
@@ -984,6 +1045,25 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "susan"}
+
+
+@app.post("/susan/events")
+async def slack_events(request: Request, background_tasks: BackgroundTasks):
+    """Slack Events API (action-item status replies in digest threads)."""
+    body = await request.body()
+    ts = request.headers.get("X-Slack-Request-Timestamp", "")
+    sig = request.headers.get("X-Slack-Signature", "")
+    if not verify_slack(body, ts, sig):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+    try:
+        payload = parse_events_body(body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    if payload.get("type") == "url_verification":
+        return JSONResponse({"challenge": payload.get("challenge", "")})
+    if payload.get("type") == "event_callback":
+        background_tasks.add_task(handle_slack_event_callback, payload)
+    return JSONResponse({"ok": True})
 
 
 @app.post("/susan/actions")

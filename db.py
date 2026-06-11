@@ -255,6 +255,249 @@ class UserDraftPending(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class ActionItemDigest(Base):
+    """Posted action-item roundup in a channel; thread replies update tracked items."""
+
+    __tablename__ = "action_item_digests"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    channel_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    message_ts: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    thread_root_ts: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    created_by_slack_user_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    range_label: Mapped[str] = mapped_column(String(240), nullable=False)
+    since_d: Mapped[str] = mapped_column(String(10), nullable=False)
+    until_d: Mapped[str] = mapped_column(String(10), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ActionItemRecord(Base):
+    """Tracked action item for a channel; status survives across digests."""
+
+    __tablename__ = "action_items"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    channel_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    assignee_slack_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    status_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    updated_by_slack_user_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_digest_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+ACTION_ITEM_ACTIVE_STATUSES = frozenset({"open", "in_progress"})
+ACTION_ITEM_TERMINAL_STATUSES = frozenset({"done", "wont_do"})
+
+
+def _action_item_row_dict(row: ActionItemRecord) -> dict:
+    return {
+        "id": row.id,
+        "channel_id": row.channel_id,
+        "assignee_slack_id": row.assignee_slack_id,
+        "text": row.text,
+        "status": row.status,
+        "status_note": row.status_note,
+        "source": row.source,
+        "updated_by_slack_user_id": row.updated_by_slack_user_id,
+        "last_digest_id": row.last_digest_id,
+        "created_at": row.created_at.isoformat(),
+        "updated_at": row.updated_at.isoformat(),
+    }
+
+
+async def list_active_action_items(channel_id: str) -> list[dict]:
+    """Open and in-progress items for a channel, oldest first."""
+    async with SessionLocal() as session:
+        from sqlalchemy import select
+
+        q = (
+            select(ActionItemRecord)
+            .where(
+                ActionItemRecord.channel_id == channel_id,
+                ActionItemRecord.status.in_(tuple(ACTION_ITEM_ACTIVE_STATUSES)),
+            )
+            .order_by(ActionItemRecord.created_at.asc())
+        )
+        rows = (await session.execute(q)).scalars().all()
+        return [_action_item_row_dict(r) for r in rows]
+
+
+async def get_action_item(item_id: str) -> dict | None:
+    async with SessionLocal() as session:
+        row = await session.get(ActionItemRecord, item_id)
+        return _action_item_row_dict(row) if row else None
+
+
+async def get_digest_for_thread(channel_id: str, thread_ts: str) -> dict | None:
+    """Find latest digest whose thread root matches (replies use thread_ts = root)."""
+    async with SessionLocal() as session:
+        from sqlalchemy import select
+
+        q = (
+            select(ActionItemDigest)
+            .where(
+                ActionItemDigest.channel_id == channel_id,
+                ActionItemDigest.thread_root_ts == thread_ts,
+            )
+            .order_by(ActionItemDigest.created_at.desc())
+            .limit(1)
+        )
+        row = (await session.execute(q)).scalar_one_or_none()
+        if not row:
+            return None
+        return {
+            "id": row.id,
+            "channel_id": row.channel_id,
+            "message_ts": row.message_ts,
+            "thread_root_ts": row.thread_root_ts,
+            "created_by_slack_user_id": row.created_by_slack_user_id,
+            "range_label": row.range_label,
+            "since_d": row.since_d,
+            "until_d": row.until_d,
+            "created_at": row.created_at.isoformat(),
+        }
+
+
+async def create_action_item_digest(
+    channel_id: str,
+    message_ts: str,
+    thread_root_ts: str,
+    created_by: str,
+    range_label: str,
+    since_d: str,
+    until_d: str,
+) -> str:
+    did = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        session.add(
+            ActionItemDigest(
+                id=did,
+                channel_id=channel_id,
+                message_ts=message_ts,
+                thread_root_ts=thread_root_ts,
+                created_by_slack_user_id=created_by,
+                range_label=range_label,
+                since_d=since_d,
+                until_d=until_d,
+                created_at=now,
+            )
+        )
+        await session.commit()
+    return did
+
+
+async def upsert_action_items(
+    channel_id: str,
+    items: list[dict],
+    *,
+    digest_id: str | None = None,
+) -> list[dict]:
+    """Insert new items or update existing by id. Returns saved rows (active only)."""
+    now = datetime.now(timezone.utc)
+    saved: list[dict] = []
+    async with SessionLocal() as session:
+        for it in items:
+            iid = (it.get("id") or "").strip()
+            text = (it.get("text") or "").strip()
+            if not text:
+                continue
+            status = (it.get("status") or "open").strip().lower()
+            if status not in ACTION_ITEM_ACTIVE_STATUSES | ACTION_ITEM_TERMINAL_STATUSES:
+                status = "open"
+            assignee = (it.get("assignee_slack_id") or "").strip() or None
+            source = (it.get("source") or "slack").strip()[:16] or "slack"
+            note = (it.get("status_note") or "").strip() or None
+
+            row: ActionItemRecord | None = None
+            if iid:
+                row = await session.get(ActionItemRecord, iid)
+                if row and row.channel_id != channel_id:
+                    row = None
+            if row:
+                row.text = text
+                row.assignee_slack_id = assignee
+                if status in ACTION_ITEM_TERMINAL_STATUSES:
+                    row.status = status
+                elif row.status in ACTION_ITEM_TERMINAL_STATUSES:
+                    pass
+                else:
+                    row.status = status
+                if note:
+                    row.status_note = note
+                row.source = source
+                row.last_digest_id = digest_id
+                row.updated_at = now
+            else:
+                row = ActionItemRecord(
+                    id=str(uuid.uuid4()),
+                    channel_id=channel_id,
+                    assignee_slack_id=assignee,
+                    text=text,
+                    status=status,
+                    status_note=note,
+                    source=source,
+                    updated_by_slack_user_id=None,
+                    last_digest_id=digest_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(row)
+            saved.append(_action_item_row_dict(row))
+        await session.commit()
+    return saved
+
+
+async def update_action_item_status(
+    item_id: str,
+    channel_id: str,
+    status: str,
+    *,
+    note: str | None = None,
+    updated_by: str | None = None,
+) -> dict | None:
+    status = status.strip().lower()
+    if status not in ACTION_ITEM_ACTIVE_STATUSES | ACTION_ITEM_TERMINAL_STATUSES:
+        return None
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        row = await session.get(ActionItemRecord, item_id)
+        if not row or row.channel_id != channel_id:
+            return None
+        row.status = status
+        if note:
+            row.status_note = note.strip()[:2000]
+        row.updated_by_slack_user_id = updated_by
+        row.updated_at = now
+        await session.commit()
+        return _action_item_row_dict(row)
+
+
+async def list_action_items_for_digest_display(channel_id: str) -> list[dict]:
+    """Active items plus recently closed (last 7 days) for context in replies."""
+    async with SessionLocal() as session:
+        from sqlalchemy import select
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        q = (
+            select(ActionItemRecord)
+            .where(ActionItemRecord.channel_id == channel_id)
+            .order_by(ActionItemRecord.created_at.asc())
+        )
+        rows = (await session.execute(q)).scalars().all()
+        out: list[dict] = []
+        for r in rows:
+            if r.status in ACTION_ITEM_ACTIVE_STATUSES:
+                out.append(_action_item_row_dict(r))
+            elif r.status in ACTION_ITEM_TERMINAL_STATUSES and _as_utc_aware(r.updated_at) >= cutoff:
+                out.append(_action_item_row_dict(r))
+        return out
+
+
 async def create_user_draft(slack_user_id: str, kind: str, content: str) -> str:
     did = str(uuid.uuid4())
     now = datetime.now(timezone.utc)

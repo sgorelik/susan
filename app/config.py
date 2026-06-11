@@ -48,13 +48,17 @@ ACTIONS = {
         "Granola notes summary",
         [],  # Routed only via `/susan granola` / `/susan gn`; empty keywords avoid accidental matches.
     ),
+    "action_items_cmd": (
+        "action items digest",
+        [],  # Routed via `/susan actions` / `/susan action items` / `/susan todos`.
+    ),
     "pr": ("create a GitHub PR", ["pull request", "create pr", "open pr", "pr"]),
 }
 
 GOOGLE_ACTIONS = frozenset({"doc", "email", "invite"})
 GITHUB_ACTIONS = frozenset({"pr", "issue", "pr_summary"})
 APPROVE_ACTION_TYPES = frozenset(
-    {"doc", "email", "invite", "pr", "issue", "pr_summary", "weekly_status"}
+    {"doc", "email", "invite", "pr", "issue", "pr_summary", "weekly_status", "action_items"}
 )
 
 EMAIL_IN_TEXT_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")

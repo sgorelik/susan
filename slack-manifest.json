@@ -20,7 +20,7 @@
         "command": "/susan",
         "url": "https://your-host.example/susan",
         "description": "Ask Susan to act on this channel or thread",
-        "usage_hint": "help | connect | weekly status [--no-approval] | summarize prs … | create pr … | …",
+        "usage_hint": "help | connect | actions | weekly status [--no-approval] | granola | summarize prs … | …",
         "should_escape": false
       }
     ]
@@ -46,6 +46,15 @@
     "pkce_enabled": false
   },
   "settings": {
+    "event_subscriptions": {
+      "request_url": "https://your-host.example/susan/events",
+      "bot_events": [
+        "message.channels",
+        "message.groups",
+        "message.im",
+        "message.mpim"
+      ]
+    },
     "interactivity": {
       "is_enabled": true,
       "request_url": "https://your-host.example/susan/actions"
