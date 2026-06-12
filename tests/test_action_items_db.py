@@ -56,3 +56,18 @@ async def test_digest_for_thread_lookup() -> None:
     found = await db.get_digest_for_thread(channel, "1111.2222")
     assert found is not None
     assert found["id"] == digest_id
+
+
+@pytest.mark.asyncio
+async def test_action_items_registry_round_trip() -> None:
+    await db.init_db()
+    await db.set_action_items_registry("sheet-xyz", "U-owner")
+    reg = await db.get_action_items_registry()
+    assert reg is not None
+    assert reg["spreadsheet_id"] == "sheet-xyz"
+    assert reg["created_by_slack_user_id"] == "U-owner"
+    await db.upsert_channel_sheet_tab("C1", "team-tech", 12345, "sheet-xyz")
+    tab = await db.get_channel_sheet_tab("C1")
+    assert tab is not None
+    assert tab["tab_title"] == "team-tech"
+    assert tab["sheet_gid"] == 12345

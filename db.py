@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
-from sqlalchemy import String, Text, DateTime
+from sqlalchemy import String, Text, DateTime, Integer
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -289,6 +289,30 @@ class ActionItemRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class ActionItemsRegistry(Base):
+    """Single workspace spreadsheet for all action-item channel tabs."""
+
+    __tablename__ = "action_items_registry"
+
+    id: Mapped[str] = mapped_column(String(16), primary_key=True)
+    spreadsheet_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_by_slack_user_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ActionItemChannelTab(Base):
+    """Maps a Slack channel to a tab in the action-items spreadsheet."""
+
+    __tablename__ = "action_item_channel_tabs"
+
+    channel_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    spreadsheet_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    tab_title: Mapped[str] = mapped_column(String(100), nullable=False)
+    sheet_gid: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+ACTION_ITEMS_REGISTRY_KEY = "default"
 ACTION_ITEM_ACTIVE_STATUSES = frozenset({"open", "in_progress"})
 ACTION_ITEM_TERMINAL_STATUSES = frozenset({"done", "wont_do"})
 
@@ -362,6 +386,91 @@ async def get_digest_for_thread(channel_id: str, thread_ts: str) -> dict | None:
         }
 
 
+async def list_action_items_for_sheet(channel_id: str) -> list[dict]:
+    """All action items for a channel (full audit trail for Sheets export)."""
+    async with SessionLocal() as session:
+        from sqlalchemy import select
+
+        q = (
+            select(ActionItemRecord)
+            .where(ActionItemRecord.channel_id == channel_id)
+            .order_by(ActionItemRecord.created_at.asc())
+        )
+        rows = (await session.execute(q)).scalars().all()
+        return [_action_item_row_dict(r) for r in rows]
+
+
+async def get_action_items_registry() -> dict | None:
+    async with SessionLocal() as session:
+        row = await session.get(ActionItemsRegistry, ACTION_ITEMS_REGISTRY_KEY)
+        if not row:
+            return None
+        return {
+            "spreadsheet_id": row.spreadsheet_id,
+            "created_by_slack_user_id": row.created_by_slack_user_id,
+            "created_at": row.created_at.isoformat(),
+        }
+
+
+async def set_action_items_registry(spreadsheet_id: str, created_by_slack_user_id: str) -> None:
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        row = await session.get(ActionItemsRegistry, ACTION_ITEMS_REGISTRY_KEY)
+        if row:
+            row.spreadsheet_id = spreadsheet_id
+            row.created_by_slack_user_id = created_by_slack_user_id
+        else:
+            session.add(
+                ActionItemsRegistry(
+                    id=ACTION_ITEMS_REGISTRY_KEY,
+                    spreadsheet_id=spreadsheet_id,
+                    created_by_slack_user_id=created_by_slack_user_id,
+                    created_at=now,
+                )
+            )
+        await session.commit()
+
+
+async def get_channel_sheet_tab(channel_id: str) -> dict | None:
+    async with SessionLocal() as session:
+        row = await session.get(ActionItemChannelTab, channel_id)
+        if not row:
+            return None
+        return {
+            "channel_id": row.channel_id,
+            "spreadsheet_id": row.spreadsheet_id,
+            "tab_title": row.tab_title,
+            "sheet_gid": row.sheet_gid,
+        }
+
+
+async def upsert_channel_sheet_tab(
+    channel_id: str,
+    tab_title: str,
+    sheet_gid: int,
+    spreadsheet_id: str,
+) -> None:
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        row = await session.get(ActionItemChannelTab, channel_id)
+        if row:
+            row.tab_title = tab_title
+            row.sheet_gid = sheet_gid
+            row.spreadsheet_id = spreadsheet_id
+            row.updated_at = now
+        else:
+            session.add(
+                ActionItemChannelTab(
+                    channel_id=channel_id,
+                    spreadsheet_id=spreadsheet_id,
+                    tab_title=tab_title,
+                    sheet_gid=sheet_gid,
+                    updated_at=now,
+                )
+            )
+        await session.commit()
+
+
 async def create_action_item_digest(
     channel_id: str,
     message_ts: str,
@@ -421,7 +530,9 @@ async def upsert_action_items(
             if row:
                 row.text = text
                 row.assignee_slack_id = assignee
-                if status in ACTION_ITEM_TERMINAL_STATUSES:
+                if it.get("sync_from_sheet"):
+                    row.status = status
+                elif status in ACTION_ITEM_TERMINAL_STATUSES:
                     row.status = status
                 elif row.status in ACTION_ITEM_TERMINAL_STATUSES:
                     pass

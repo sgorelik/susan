@@ -25,6 +25,7 @@ from db import (
 from app.claude_client import call_claude
 from app.config import logger
 from app.github_http import fetch_merged_prs_for_repo_range, fetch_opened_prs_for_repo_range
+from app.action_items_sheet import sync_action_items_sheet, sync_sheet_after_status_updates
 from app.granola_summarize import collect_granola_notes_for_window
 from app.slack_api import (
     fetch_slack_channel_history_since,
@@ -230,6 +231,7 @@ def format_action_items_message(
     range_label: str,
     *,
     include_instructions: bool = True,
+    sheet_url: str | None = None,
 ) -> str:
     """Slack mrkdwn digest with numbered items and <@U…> mentions."""
     active = [it for it in items if it.get("status") in ACTION_ITEM_ACTIVE_STATUSES]
@@ -247,6 +249,8 @@ def format_action_items_message(
         body = "\n".join(lines)
 
     header = f"*Outstanding action items* — {range_label}\n\n{body}"
+    if sheet_url:
+        header += f"\n\n📎 *Ledger:* <{sheet_url}|Open Google Sheet> _(edit tasks/status here — Susan syncs on the next run)_"
     if include_instructions:
         header += (
             "\n\n_Reply in this thread with status updates: `done`, `in progress`, or `won't do` "
@@ -312,6 +316,7 @@ async def publish_action_items_digest(
     since_d: str,
     until_d: str,
     items: list[dict],
+    sheet_url: str | None = None,
 ) -> str:
     """Post digest to channel, persist items, return digest message ts."""
     active_for_display = [
@@ -319,7 +324,7 @@ async def publish_action_items_digest(
         for it in items
         if it.get("status") in ACTION_ITEM_ACTIVE_STATUSES
     ]
-    body = format_action_items_message(active_for_display, range_label)
+    body = format_action_items_message(active_for_display, range_label, sheet_url=sheet_url)
     title = f"Action items — {range_label}"
     post_thread = thread_ts
     if post_thread:
@@ -356,6 +361,20 @@ async def process_action_items(
     since_d, until_d, range_label = parse_action_items_time_window(remainder)
     oldest_ts = utc_date_start_slack_ts(since_d)
 
+    sheet_url: str | None = None
+    sheet_err: str | None = None
+    if await user_has_google_tokens(user):
+        try:
+            sheet_url = await sync_action_items_sheet(user, hist_channel)
+        except Exception as e:
+            sheet_err = str(e)
+            logger.warning("Action items sheet setup failed: %s", e)
+    else:
+        sheet_err = (
+            "Google is not connected — action items will not be saved to a Sheet. "
+            "Run `/susan connect google` to create the team ledger on first use."
+        )
+
     try:
         slack_digest = await fetch_slack_channel_history_since(hist_channel, oldest_ts, user)
     except Exception as e:
@@ -381,6 +400,18 @@ async def process_action_items(
     merged = await upsert_action_items(hist_channel, extracted)
     display_items = [it for it in merged if it.get("status") in ACTION_ITEM_ACTIVE_STATUSES]
 
+    if await user_has_google_tokens(user):
+        try:
+            sheet_url = await sync_action_items_sheet(user, hist_channel) or sheet_url
+        except Exception as e:
+            logger.warning("Action items sheet export failed: %s", e)
+
+    sheet_note = ""
+    if sheet_url:
+        sheet_note = f"\n\n📎 Ledger: {sheet_url}"
+    elif sheet_err:
+        sheet_note = f"\n\n_{sheet_err}_"
+
     if auto_publish:
         try:
             await publish_action_items_digest(
@@ -391,6 +422,7 @@ async def process_action_items(
                 since_d=since_d,
                 until_d=until_d,
                 items=display_items,
+                sheet_url=sheet_url,
             )
         except Exception as e:
             logger.exception("Action items auto-publish failed")
@@ -401,13 +433,13 @@ async def process_action_items(
         await notify_user_ephemeral(
             channel,
             user,
-            f"✓ Posted *{len(display_items)}* outstanding action item(s) to the channel (_no approval step_).",
+            f"✓ Posted *{len(display_items)}* outstanding action item(s) to the channel (_no approval step_).{sheet_note}",
             None,
             response_url,
         )
         return
 
-    body = format_action_items_message(display_items, range_label)
+    body = format_action_items_message(display_items, range_label, sheet_url=sheet_url)
     title = f"Action items — {range_label}"
     meta = {
         "title": title,
@@ -419,6 +451,7 @@ async def process_action_items(
         "since_d": since_d,
         "until_d": until_d,
         "items": display_items,
+        "sheet_url": sheet_url,
     }
     draft_id = await create_user_draft(user, "action_items", json.dumps(meta, ensure_ascii=False))
     preview = body[:2800] + ("..." if len(body) > 2800 else "")
@@ -430,6 +463,7 @@ async def process_action_items(
                 "text": (
                     f"*Susan preview — action items*\n_(Only visible to you)_\n"
                     "_Approve to post to the channel with @mentions; team replies in the thread update status._"
+                    f"{sheet_note}"
                 ),
             },
         },
@@ -515,6 +549,15 @@ async def apply_status_reply_with_claude(
         )
         if row:
             updated.append(row)
+    if updated:
+        try:
+            from db import get_action_items_registry
+
+            reg = await get_action_items_registry()
+            sync_user = (reg or {}).get("created_by_slack_user_id") or user_id
+            await sync_sheet_after_status_updates(sync_user, channel_id)
+        except Exception as e:
+            logger.warning("Sheet sync after status reply failed: %s", e)
     return updated
 
 

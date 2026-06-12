@@ -15,6 +15,7 @@ from app.github_pickers import _slack_multi_summary_selected_repos
 from app.github_repos import _issue_allowlist, _pr_allowlist
 from app.google_workspace import create_calendar_invite, create_google_doc, send_gmail
 from app.action_items import publish_action_items_digest
+from app.action_items_sheet import sync_action_items_sheet
 from app.pr_summary import process_pr_summary
 from app.slack_commands import (
     SLACK_CB_EMAIL_MODAL,
@@ -599,6 +600,11 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                         result = "Could not post — missing channel."
                     else:
                         notify_ch = notify_ch or post_ch
+                        sheet_url = meta.get("sheet_url")
+                        try:
+                            sheet_url = await sync_action_items_sheet(user, post_ch) or sheet_url
+                        except Exception as e:
+                            logger.warning("Sheet sync on approve failed: %s", e)
                         await publish_action_items_digest(
                             channel_id=post_ch,
                             thread_ts=th,
@@ -607,6 +613,7 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                             since_d=meta.get("since_d") or "",
                             until_d=meta.get("until_d") or "",
                             items=items,
+                            sheet_url=sheet_url,
                         )
                         result = f"Posted action items roundup ({len(items)} outstanding) to the channel."
                 except (json.JSONDecodeError, TypeError, RuntimeError) as e:

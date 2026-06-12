@@ -589,7 +589,7 @@ def susan_slash_help_response() -> JSONResponse:
         "add free text for the window or focus, e.g. `/susan gn last calendar week` or "
         "`/susan granola group sync notes last 14 days`\n"
         "`/susan actions` or `/susan action items` — outstanding tasks with *@mentions* from Slack, "
-        "Drive, Granola, and GitHub (when connected); team replies `done` / `in progress` / `won't do` in the thread\n"
+        "Drive, Granola, and GitHub; kept in a *Google Sheet* (one tab per channel) for provenance\n"
         "`/susan actions last 14 days --no-approval` — for scheduled Slack messages (posts directly to channel)\n"
         "`/susan create a doc summarizing this thread for the launch notes`\n"
         "`/susan send email to the team thanking them for the release`\n"
