@@ -1,7 +1,7 @@
 ---
 rezonant_doc_id: "fccf4afa-9d2b-42ca-983d-5c04d6a07e14"
 rezonant_session_id: "88a2b5ce-0374-4006-9d6c-5940a7ff53c2"
-updated_at: "2026-06-16T15:04:34+00:00"
+updated_at: "2026-06-16T15:04:46+00:00"
 ---
 
 # Susan – Meeting Notes: Technical Specification
@@ -10,7 +10,7 @@ updated_at: "2026-06-16T15:04:34+00:00"
 
 Add a `meeting notes` command to Susan (Slack bot) that, when triggered by an @mention, looks up the invoking user's most recent calendar meeting, fetches associated Granola notes and Google Drive documents, and posts a formatted summary with links back into the triggering Slack channel.
 
-
+![image](doc://8daea814-60b1-4f5e-83cc-41915162c9cf "image")
 
 ## Context and Background
 
