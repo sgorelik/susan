@@ -1,7 +1,7 @@
 ---
 rezonant_doc_id: "fccf4afa-9d2b-42ca-983d-5c04d6a07e14"
 rezonant_session_id: "88a2b5ce-0374-4006-9d6c-5940a7ff53c2"
-updated_at: "2026-06-16T13:05:06+00:00"
+updated_at: "2026-06-16T13:08:47+00:00"
 ---
 
 # Susan – Meeting Notes: Technical Specification
@@ -19,8 +19,6 @@ Key assumptions:
 - Susan already authenticates with Google Calendar, Google Drive, and Granola on behalf of users — no new OAuth flows are required.
 - Drive documents are surfaced from two places: links/attachments in the Google Calendar event, and documents that Granola associates with the meeting record.
 - The "last meeting" is the most recently completed calendar event with at least one other attendee and a Granola notes record.
-
-hhh
 
 
 
