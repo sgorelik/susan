@@ -94,6 +94,7 @@ Run tests / checks (if you add them): `python -m py_compile app/*.py` is a minim
 - `/susan create a doc …`, `send email …`, `create invite …`
 - `/susan create issue …`, `create pr …` (GitHub OAuth + allowlists)
 - `/susan summarize merged prs …` / keywords like `pr summary` — merged PRs over a date range, preview then approve to post to channel
+- `/susan meeting notes` — find your most recent qualifying Google Calendar meeting (past, ≥2 attendees, you RSVP'd accepted/tentative), fetch its **Granola** notes (matched by calendar event id, else title + time ±15 min), and post a channel summary with deduplicated **Google Drive** doc links. Also triggers on `share notes`, `post notes`, `notes from`. Needs Google + Granola connected.
 - `/susan weekly status …` — Structured update (*workstreams* with *1. Last week* / *2. Next steps* and Slack-style `<url|label>` links) from **Slack messages**, **channel bookmarks** (needs `bookmarks:read`; Google bookmark URLs feed Drive scan), **Google Drive** (files under linked folders / linked files in the date window, plus bookmarked Docs), and **all `GITHUB_REPOS`** in tech channels (else Slack+Drive+bookmarks only). Optional `--no-approval` (restrict with `SUSAN_WEEKLY_AUTO_POST_USER_IDS`). Raise `WEEKLY_STATUS_MAX_TOKENS` if outputs truncate.
 - `/susan help` — full in-Slack help
 

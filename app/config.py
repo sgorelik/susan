@@ -52,6 +52,10 @@ ACTIONS = {
         "action items digest",
         [],  # Routed via `/susan actions` / `/susan action items` / `/susan todos`.
     ),
+    "meeting_notes_cmd": (
+        "meeting notes from your last meeting",
+        [],  # Routed via trigger phrases: "meeting notes", "share notes", "post notes", "notes from".
+    ),
     "pr": ("create a GitHub PR", ["pull request", "create pr", "open pr", "pr"]),
 }
 

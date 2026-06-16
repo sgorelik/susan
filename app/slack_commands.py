@@ -435,6 +435,32 @@ async def resume_slash_after_oauth(row: dict) -> None:
     thread_ts = row["thread_ts"]
     action = row["action"]
     response_url = None
+    if action == "meeting_notes_cmd":
+        from app.meeting_notes import process_meeting_notes
+
+        try:
+            await post_ephemeral(
+                channel,
+                user,
+                "Resuming — looking up your last meeting after sign-in…",
+            )
+        except Exception as e:
+            logger.warning("resume_slash_after_oauth intro ephemeral: %s", e)
+        try:
+            await process_meeting_notes(text, channel, user, thread_ts, response_url)
+        except Exception as e:
+            logger.exception("resume_slash_after_oauth meeting notes failed")
+            try:
+                await notify_user_ephemeral(
+                    channel,
+                    user,
+                    f"Could not resume your meeting notes after sign-in: {e}",
+                    None,
+                    response_url,
+                )
+            except Exception as e2:
+                logger.error("resume_slash_after_oauth notify: %s", e2)
+        return
     if action == "granola_cmd":
         remainder = parse_granola_slash_command(text) or ""
         try:

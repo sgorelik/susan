@@ -72,6 +72,7 @@ from app.weekly_context import (
 )
 from app.granola_summarize import parse_granola_slash_command, process_granola_summarize
 from app.action_items import parse_action_items_command, process_action_items
+from app.meeting_notes import parse_meeting_notes_command, process_meeting_notes
 from app.slack_events import handle_slack_event_callback, parse_events_body
 from app.weekly_status import process_weekly_status
 
@@ -590,6 +591,9 @@ def susan_slash_help_response() -> JSONResponse:
         "`/susan granola group sync notes last 14 days`\n"
         "`/susan actions` or `/susan action items` — outstanding tasks with *@mentions* from Slack, "
         "Drive, Granola, and GitHub; kept in a *Google Sheet* (one tab per channel) for provenance\n"
+        "`/susan meeting notes` (or `share notes` / `post notes` / `notes from …`) — finds your *last "
+        "meeting* on Google Calendar, fetches its *Granola notes*, and posts a summary with deduplicated "
+        "*Drive doc* links to this channel\n"
         "`/susan actions last 14 days --no-approval` — for scheduled Slack messages (posts directly to channel)\n"
         "`/susan create a doc summarizing this thread for the launch notes`\n"
         "`/susan send email to the team thanking them for the release`\n"
@@ -803,6 +807,54 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                 "you'll get a preview with @mentions to approve."
             )
         return JSONResponse({"response_type": "ephemeral", "text": ack})
+
+    if parse_meeting_notes_command(text) is not None:
+        if not await user_has_google_tokens(user):
+            resume_id = await create_oauth_resume_pending(
+                user, channel, thread_ts, text, "meeting_notes_cmd", "google"
+            )
+            return connect_google_slack_response(
+                user,
+                intro=(
+                    "*Google isn’t connected yet.* Susan needs your Google Calendar and Drive to find your "
+                    "last meeting and its docs. Use the link below — Susan will continue when you’re done "
+                    "(or use `/susan connect google` anytime)."
+                ),
+                channel_id=channel or None,
+                resume_id=resume_id,
+            )
+        if not await user_has_granola_tokens(user):
+            resume_id = await create_oauth_resume_pending(
+                user, channel, thread_ts, text, "meeting_notes_cmd", "granola"
+            )
+            return connect_granola_slack_response(
+                user,
+                intro=(
+                    "*Granola isn’t connected yet.* Susan needs Granola to fetch your meeting notes. "
+                    "Use the link below — Susan will continue when you’re done (or use `/susan connect granola` anytime)."
+                ),
+                channel_id=channel or None,
+                resume_id=resume_id,
+            )
+
+        async def run_meeting_notes():
+            try:
+                await process_meeting_notes(text, channel, user, thread_ts, response_url)
+            except Exception as e:
+                logger.exception("Meeting notes task failed")
+                try:
+                    await notify_user_ephemeral(
+                        channel,
+                        user,
+                        f"Susan error (meeting notes): {str(e)}",
+                        None,
+                        response_url,
+                    )
+                except Exception as e2:
+                    logger.error("Could not notify user after meeting notes error: %s", e2)
+
+        background_tasks.add_task(run_meeting_notes)
+        return JSONResponse({"response_type": "ephemeral", "text": "Looking up your last meeting…"})
 
     action = detect_action(text)
     if not action:
