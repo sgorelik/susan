@@ -1,7 +1,7 @@
 ---
 rezonant_doc_id: "fccf4afa-9d2b-42ca-983d-5c04d6a07e14"
 rezonant_session_id: "88a2b5ce-0374-4006-9d6c-5940a7ff53c2"
-updated_at: "2026-06-16T13:08:47+00:00"
+updated_at: "2026-06-16T13:55:54+00:00"
 ---
 
 # Susan – Meeting Notes: Technical Specification
