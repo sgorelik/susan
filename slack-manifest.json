@@ -29,6 +29,7 @@
     "scopes": {
       "bot": [
         "commands",
+        "app_mentions:read",
         "chat:write",
         "chat:write.public",
         "channels:history",
@@ -49,6 +50,7 @@
     "event_subscriptions": {
       "request_url": "https://your-host.example/susan/events",
       "bot_events": [
+        "app_mention",
         "message.channels",
         "message.groups",
         "message.im",
