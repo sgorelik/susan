@@ -1,0 +1,12 @@
+name: goodbye
+order: 110
+help_summary: say goodbye
+triggers:
+  - goodbye
+  - bye susan
+  - see you later
+  - farewell
+response:
+  text: "Goodbye! Come back anytime."
+session:
+  end: true

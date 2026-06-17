@@ -10,6 +10,7 @@ FastAPI service that powers the **`/susan`** slash command in Slack: summarize t
 |------|--------|
 | `main.py` | Loads `.env`, exposes `app` for Uvicorn |
 | `app/` | Application code (routes, Slack, OAuth, GitHub, Google, weekly flows) |
+| `app/skills/` | YAML-defined skill engine (greetings, time/date, jokes, timer, weather, …) — see [docs/skills.md](docs/skills.md) |
 | `db.py` | Async SQLAlchemy store for OAuth tokens and short-lived picker / resume rows |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Environment variable names (copy to `.env`; never commit secrets) |
@@ -96,6 +97,16 @@ Run tests / checks (if you add them): `python -m py_compile app/*.py` is a minim
 - `/susan summarize merged prs …` / keywords like `pr summary` — merged PRs over a date range, preview then approve to post to channel
 - `/susan weekly status …` — Structured update (*workstreams* with *1. Last week* / *2. Next steps* and Slack-style `<url|label>` links) from **Slack messages**, **channel bookmarks** (needs `bookmarks:read`; Google bookmark URLs feed Drive scan), **Google Drive** (files under linked folders / linked files in the date window, plus bookmarked Docs), and **all `GITHUB_REPOS`** in tech channels (else Slack+Drive+bookmarks only). Optional `--no-approval` (restrict with `SUSAN_WEEKLY_AUTO_POST_USER_IDS`). Raise `WEEKLY_STATUS_MAX_TOKENS` if outputs truncate.
 - `/susan help` — full in-Slack help
+
+## Skills
+
+A lightweight, YAML-defined **skill engine** (`app/skills/`) handles short
+conversational utterances — greetings, "what time is it", "tell me a joke",
+"set a timer for 5 minutes", "what's the weather", "repeat that", "goodbye", and
+more. Skills are declared in `app/skills/definitions/*.yaml` and dynamic
+behaviour lives in small named handlers, so adding a skill needs no engine
+changes. See **[docs/skills.md](docs/skills.md)** for the definition format, the
+full skill registry, weather API configuration, and the session-memory model.
 
 ## Environment variables
 

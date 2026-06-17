@@ -1,0 +1,11 @@
+# Dynamic so the listing always stays in sync with the registered skills.
+name: help
+order: 30
+help_summary: tell you what I can do
+triggers:
+  - help
+  - what can you do
+  - commands
+response:
+  dynamic: true
+  handler: help.summary

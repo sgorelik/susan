@@ -1,0 +1,10 @@
+name: fun-fact
+order: 70
+help_summary: share a fun fact
+triggers:
+  - tell me a fact
+  - fun fact
+  - surprise me
+response:
+  dynamic: true
+  handler: content.random_fact

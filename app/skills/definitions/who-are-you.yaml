@@ -1,0 +1,9 @@
+name: who-are-you
+order: 20
+help_summary: introduce myself
+triggers:
+  - who are you
+  - what's your name
+  - introduce yourself
+response:
+  text: "I'm Susan, your personal assistant. Ask me anything!"

@@ -1,0 +1,10 @@
+name: tell-date
+order: 50
+help_summary: tell you the date
+triggers:
+  - what's the date
+  - what day is it
+  - today's date
+response:
+  dynamic: true
+  handler: time.current_date

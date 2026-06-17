@@ -1,0 +1,9 @@
+# Canonical "Hello World" skill — the reference pattern for all other skills.
+name: hello-world
+order: 10
+help_summary: greet you
+triggers:
+  - hello
+  - hi susan
+response:
+  text: "Hello, World! I'm Susan, and I'm ready to help."

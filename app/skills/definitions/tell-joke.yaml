@@ -1,0 +1,10 @@
+name: tell-joke
+order: 60
+help_summary: tell you a joke
+triggers:
+  - tell me a joke
+  - joke
+  - make me laugh
+response:
+  dynamic: true
+  handler: content.random_joke

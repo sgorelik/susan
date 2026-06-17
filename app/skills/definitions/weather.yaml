@@ -1,0 +1,13 @@
+name: weather
+order: 90
+help_summary: check the weather
+triggers:
+  - what's the weather
+  - weather today
+  - is it raining
+requires:
+  - api: weather_service
+  - permission: location
+response:
+  dynamic: true
+  handler: weather.current

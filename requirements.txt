@@ -7,3 +7,4 @@ sqlalchemy[asyncio]==2.0.36
 asyncpg==0.30.0
 aiosqlite==0.20.0
 greenlet==3.1.1
+PyYAML==6.0.2

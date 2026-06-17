@@ -1,0 +1,10 @@
+name: tell-time
+order: 40
+help_summary: tell you the time
+triggers:
+  - what time is it
+  - current time
+  - time
+response:
+  dynamic: true
+  handler: time.current_local

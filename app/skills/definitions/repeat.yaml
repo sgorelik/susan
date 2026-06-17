@@ -1,0 +1,11 @@
+# Stateful: replays the last response stored in the session.
+name: repeat
+order: 100
+help_summary: repeat my last response
+triggers:
+  - say that again
+  - repeat that
+  - repeat
+response:
+  dynamic: true
+  handler: session.replay_last
