@@ -72,6 +72,7 @@ from app.weekly_context import (
 )
 from app.granola_summarize import parse_granola_slash_command, process_granola_summarize
 from app.action_items import parse_action_items_command, process_action_items
+from app.hello_world import handle_hello_world
 from app.slack_events import handle_slack_event_callback, parse_events_body
 from app.weekly_status import process_weekly_status
 
@@ -585,6 +586,7 @@ def susan_slash_help_response() -> JSONResponse:
     body_what = "*What to ask*\n" + actions_body
     body_ex = (
         "*Examples*\n"
+        "`/susan hello` or `/susan hi susan` — Susan greets you back so you know she's ready\n"
         "`/susan granola` or `/susan gn` — summarize *your* Granola meetings (default lookback); "
         "add free text for the window or focus, e.g. `/susan gn last calendar week` or "
         "`/susan granola group sync notes last 14 days`\n"
@@ -702,6 +704,10 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
 
     if is_susan_help_command(text_lower):
         return susan_slash_help_response()
+
+    hello_reply = handle_hello_world(text)
+    if hello_reply is not None:
+        return JSONResponse({"response_type": "ephemeral", "text": hello_reply})
 
     granola_remainder = parse_granola_slash_command(text)
     if granola_remainder is not None:
