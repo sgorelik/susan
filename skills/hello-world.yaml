@@ -1,0 +1,8 @@
+skill:
+  name: hello-world
+  description: Greets the user with a Hello World message.
+  triggers:
+    - "hello"
+    - "hi susan"
+  response:
+    text: "Hello, World! I'm Susan, and I'm ready to help."

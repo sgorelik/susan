@@ -89,6 +89,7 @@ Run tests / checks (if you add them): `python -m py_compile app/*.py` is a minim
 
 ## Commands (high level)
 
+- `/susan hello` (or `/susan hi susan`) — Susan greets you so you know she's ready to help (the `hello-world` skill; see `skills/`)
 - `/susan connect` — Google and/or GitHub (whatever is configured)
 - `/susan connect google` / `/susan connect github`
 - `/susan create a doc …`, `send email …`, `create invite …`
