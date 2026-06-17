@@ -14,6 +14,7 @@ FastAPI service that powers the **`/susan`** slash command in Slack: summarize t
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Environment variable names (copy to `.env`; never commit secrets) |
 | `slack-manifest.json` | Slack [app manifest](https://api.slack.com/reference/manifests) — scopes, slash command, interactivity |
+| `skills/` | YAML skill definitions (static-response skills such as `hello-world`) |
 
 ## Slack app setup
 
@@ -89,6 +90,7 @@ Run tests / checks (if you add them): `python -m py_compile app/*.py` is a minim
 
 ## Commands (high level)
 
+- `/susan hello` / `/susan hi susan` — Susan replies with a quick greeting so you know she's ready (the `hello-world` skill; see `skills/`)
 - `/susan connect` — Google and/or GitHub (whatever is configured)
 - `/susan connect google` / `/susan connect github`
 - `/susan create a doc …`, `send email …`, `create invite …`

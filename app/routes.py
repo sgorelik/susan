@@ -54,6 +54,7 @@ from app.oauth import (
     public_origin_for_connect_links,
 )
 from app.pr_summary import process_pr_summary
+from app.skills import match_skill
 from app.slack_commands import process_command, resume_slash_after_oauth
 from app.slack_api import (
     _slack_form_fields,
@@ -702,6 +703,12 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
 
     if is_susan_help_command(text_lower):
         return susan_slash_help_response()
+
+    skill = match_skill(text)
+    if skill is not None:
+        return JSONResponse(
+            {"response_type": "ephemeral", "text": skill.response_text}
+        )
 
     granola_remainder = parse_granola_slash_command(text)
     if granola_remainder is not None:
