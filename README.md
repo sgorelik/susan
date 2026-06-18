@@ -11,6 +11,7 @@ FastAPI service that powers the **`/susan`** slash command in Slack: summarize t
 | `main.py` | Loads `.env`, exposes `app` for Uvicorn |
 | `app/` | Application code (routes, Slack, OAuth, GitHub, Google, weekly flows) |
 | `db.py` | Async SQLAlchemy store for OAuth tokens and short-lived picker / resume rows |
+| `skills/` | YAML skill definitions (e.g. `hello-world.yaml`); loaded by `app/skills.py` |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Environment variable names (copy to `.env`; never commit secrets) |
 | `slack-manifest.json` | Slack [app manifest](https://api.slack.com/reference/manifests) — scopes, slash command, interactivity |
@@ -89,6 +90,7 @@ Run tests / checks (if you add them): `python -m py_compile app/*.py` is a minim
 
 ## Commands (high level)
 
+- `/susan hello` (or `/susan hi susan`) — Susan greets you back so you know she's ready (the `hello-world` skill; see [Skills](#skills))
 - `/susan connect` — Google and/or GitHub (whatever is configured)
 - `/susan connect google` / `/susan connect github`
 - `/susan create a doc …`, `send email …`, `create invite …`
@@ -96,6 +98,36 @@ Run tests / checks (if you add them): `python -m py_compile app/*.py` is a minim
 - `/susan summarize merged prs …` / keywords like `pr summary` — merged PRs over a date range, preview then approve to post to channel
 - `/susan weekly status …` — Structured update (*workstreams* with *1. Last week* / *2. Next steps* and Slack-style `<url|label>` links) from **Slack messages**, **channel bookmarks** (needs `bookmarks:read`; Google bookmark URLs feed Drive scan), **Google Drive** (files under linked folders / linked files in the date window, plus bookmarked Docs), and **all `GITHUB_REPOS`** in tech channels (else Slack+Drive+bookmarks only). Optional `--no-approval` (restrict with `SUSAN_WEEKLY_AUTO_POST_USER_IDS`). Raise `WEEKLY_STATUS_MAX_TOKENS` if outputs truncate.
 - `/susan help` — full in-Slack help
+
+## Skills
+
+Small, self-contained capabilities are defined as **skills** — declarative YAML files in [`skills/`](skills/) loaded by [`app/skills.py`](app/skills.py). The `/susan` slash handler matches the command text against each skill's triggers (case-insensitive) and replies with the skill's response.
+
+`hello-world` is the **reference implementation**: stateless, no parameters/slots, no external API calls. Saying `/susan hello` or `/susan hi susan` returns a fixed greeting.
+
+```yaml
+# skills/hello-world.yaml
+skill:
+  name: hello-world
+  description: Greets the user with a Hello World message.
+  triggers:
+    - "hello"
+    - "hi susan"
+  response:
+    text: "Hello, World! I'm Susan, and I'm ready to help."
+```
+
+Schema fields:
+
+| Field | Purpose |
+|-------|---------|
+| `name` | Unique skill identifier (e.g. `hello-world`) |
+| `description` | One-line summary of the skill |
+| `triggers` | List of phrases that activate the skill (matched case-insensitively) |
+| `response.text` | Static reply text (used by `hello-world`) |
+| `response.dynamic` / `response.handler` | For skills that compute their reply instead of using static `text` |
+
+To add a skill, drop a new YAML file in `skills/` following this template; it is picked up automatically at startup.
 
 ## Environment variables
 

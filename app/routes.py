@@ -54,6 +54,7 @@ from app.oauth import (
     public_origin_for_connect_links,
 )
 from app.pr_summary import process_pr_summary
+from app.skills import CATALOG, skill_response
 from app.slack_commands import process_command, resume_slash_after_oauth
 from app.slack_api import (
     _slack_form_fields,
@@ -583,6 +584,12 @@ def susan_slash_help_response() -> JSONResponse:
         "• `/susan connect granola` — meeting notes that inform Susan's responses"
     )
     body_what = "*What to ask*\n" + actions_body
+    skill_lines = [
+        f"• *{skill.name}* — say {', '.join(f'`{t}`' for t in skill.triggers)}"
+        for skill in CATALOG.all()
+        if skill.triggers
+    ]
+    body_skills = "*Skills*\n" + "\n".join(skill_lines) if skill_lines else ""
     body_ex = (
         "*Examples*\n"
         "`/susan granola` or `/susan gn` — summarize *your* Granola meetings (default lookback); "
@@ -638,6 +645,11 @@ def susan_slash_help_response() -> JSONResponse:
         {"type": "section", "text": {"type": "mrkdwn", "text": body_connect}},
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text": body_what}},
+        *(
+            [{"type": "section", "text": {"type": "mrkdwn", "text": body_skills}}]
+            if body_skills
+            else []
+        ),
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text": body_ex}},
         {"type": "section", "text": {"type": "mrkdwn", "text": body_pr}},
@@ -702,6 +714,12 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
 
     if is_susan_help_command(text_lower):
         return susan_slash_help_response()
+
+    # YAML-defined skills (e.g. hello-world). Stateless, no external calls — return
+    # the skill's static response directly when its trigger matches.
+    skill_text = skill_response(text)
+    if skill_text is not None:
+        return JSONResponse({"response_type": "ephemeral", "text": skill_text})
 
     granola_remainder = parse_granola_slash_command(text)
     if granola_remainder is not None:
