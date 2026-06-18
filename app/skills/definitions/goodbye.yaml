@@ -1,0 +1,11 @@
+name: goodbye
+description: End the session with a friendly farewell.
+triggers:
+  - "goodbye"
+  - "bye susan"
+  - "see you later"
+  - "farewell"
+response:
+  text: "Goodbye! Come back anytime."
+session:
+  end: true

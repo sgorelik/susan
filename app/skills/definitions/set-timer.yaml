@@ -1,0 +1,14 @@
+name: set-timer
+description: Set a countdown timer for a spoken duration and alert when it expires.
+triggers:
+  - "set a timer for {duration}"
+  - "timer for {duration}"
+slots:
+  - name: duration
+    type: duration
+    required: true
+    prompt: "How long should I set the timer for?"
+response:
+  dynamic: true
+  handler: timer.set
+  text: "Timer set for {duration}. I'll let you know when it's done."

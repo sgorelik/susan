@@ -1,0 +1,12 @@
+name: weather
+description: Report the current weather for the user's location.
+triggers:
+  - "what's the weather"
+  - "weather today"
+  - "is it raining"
+response:
+  dynamic: true
+  handler: weather.current
+  text: "Currently in {location}: {conditions}, {temperature}."
+api: weather_service
+permission: location
