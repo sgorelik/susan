@@ -609,12 +609,19 @@ async def post_message(
     text: str,
     thread_ts: str | None = None,
     blocks: list[dict] | None = None,
+    *,
+    unfurl_links: bool | None = None,
+    unfurl_media: bool | None = None,
 ) -> dict:
     payload: dict = {"channel": channel, "text": text}
     if thread_ts:
         payload["thread_ts"] = thread_ts
     if blocks:
         payload["blocks"] = blocks
+    if unfurl_links is not None:
+        payload["unfurl_links"] = unfurl_links
+    if unfurl_media is not None:
+        payload["unfurl_media"] = unfurl_media
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             "https://slack.com/api/chat.postMessage",
@@ -731,6 +738,63 @@ async def post_pr_summary_to_channel(
         if reply_thread_ts is None and ts and not is_last:
             reply_thread_ts = ts
 
+
+async def slack_api_canvases_create(
+    *,
+    title: str,
+    markdown: str,
+    channel_id: str | None = None,
+) -> str:
+    """Create a Canvas with markdown content; returns canvas_id (same as file id)."""
+    payload: dict = {
+        "title": title,
+        "document_content": {"type": "markdown", "markdown": markdown},
+    }
+    if channel_id:
+        payload["channel_id"] = channel_id
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            "https://slack.com/api/canvases.create",
+            headers=SLACK_JSON_HEADERS,
+            json=payload,
+        )
+    try:
+        data = r.json()
+    except json.JSONDecodeError:
+        data = {}
+    if not data.get("ok"):
+        err = data.get("error", "canvases.create failed")
+        detail = data.get("detail")
+        msg = f"{err}: {detail}" if detail else str(err)
+        logger.error("canvases.create failed: %s", data)
+        raise RuntimeError(msg)
+    canvas_id = (data.get("canvas_id") or "").strip()
+    if not canvas_id:
+        raise RuntimeError("canvases.create returned no canvas_id")
+    return canvas_id
+
+
+async def slack_api_files_permalink(file_id: str) -> str:
+    """Return the Slack permalink for a file or canvas id."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            "https://slack.com/api/files.info",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            params={"file": file_id},
+        )
+    try:
+        data = r.json()
+    except json.JSONDecodeError:
+        data = {}
+    if not data.get("ok"):
+        err = data.get("error", "files.info failed")
+        logger.error("files.info failed for %s: %s", file_id, data)
+        raise RuntimeError(str(err))
+    file_obj = data.get("file") or {}
+    permalink = (file_obj.get("permalink") or file_obj.get("url_private") or "").strip()
+    if not permalink:
+        raise RuntimeError("files.info returned no permalink")
+    return permalink
 
 
 SLACK_USER_MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]+)?>")

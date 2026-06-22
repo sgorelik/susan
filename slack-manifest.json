@@ -40,6 +40,8 @@
         "mpim:write",
         "users:read",
         "users:read.email",
+        "canvases:write",
+        "files:read",
         "bookmarks:read"
       ]
     },

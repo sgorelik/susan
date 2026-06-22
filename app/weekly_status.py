@@ -20,9 +20,9 @@ from app.github_http import (
 from app.slack_api import (
     fetch_slack_channel_history_since,
     notify_user_ephemeral,
-    post_pr_summary_to_channel,
     slack_channel_bookmarks_for_weekly,
 )
+from app.weekly_canvas import publish_weekly_status
 from app.weekly_context import parse_weekly_status_time_range, utc_date_start_slack_ts
 from app.weekly_drive import weekly_status_drive_activity_block
 
@@ -268,7 +268,7 @@ async def process_weekly_status(
     title = _weekly_status_title_line(repos, range_label, include_github=include_github)
     if auto_publish:
         try:
-            await post_pr_summary_to_channel(channel, thread_ts, title, summary)
+            await publish_weekly_status(channel, thread_ts, title, summary)
         except Exception as e:
             logger.exception("Weekly status auto-publish failed")
             await notify_user_ephemeral(
@@ -282,7 +282,7 @@ async def process_weekly_status(
         await notify_user_ephemeral(
             channel,
             user,
-            "✓ Weekly status was posted to the channel (_no approval step_).",
+            "✓ Weekly status was posted to the channel (_Canvas link; no approval step_).",
             None,
             response_url,
         )
@@ -301,7 +301,7 @@ async def process_weekly_status(
     )
     display_truncated = summary[:2800] + ("..." if len(summary) > 2800 else "")
     hint = (
-        "_Use *Approve & post to channel* to publish this for everyone in this conversation, "
+        "_Use *Approve & post to channel* to publish a Canvas link for everyone in this conversation, "
         "or *Cancel*._"
     )
     blocks = [
@@ -319,7 +319,7 @@ async def process_weekly_status(
             "elements": [
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "✓ Approve & post to channel"},
+                    "text": {"type": "plain_text", "text": "✓ Approve & post Canvas link"},
                     "style": "primary",
                     "action_id": "approve_weekly_status",
                     "value": draft_id,

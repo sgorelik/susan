@@ -39,6 +39,7 @@ from app.slack_api import (
     slack_views_open,
     verify_slack,
 )
+from app.weekly_canvas import publish_weekly_status
 
 def slack_interaction_user_id(payload: dict) -> str:
     """Slack user id from interaction payload (handles typical and enterprise-shaped user objects)."""
@@ -568,8 +569,8 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                         result = "Could not post — missing channel."
                     else:
                         notify_ch = notify_ch or post_ch
-                        await post_pr_summary_to_channel(post_ch, th, title, body)
-                        result = "Posted the weekly status to the channel."
+                        await publish_weekly_status(post_ch, th, title, body)
+                        result = "Posted the weekly status Canvas link to the channel."
                 except (json.JSONDecodeError, TypeError, RuntimeError) as e:
                     logger.exception("weekly_status post failed")
                     result = f"Susan error posting weekly status: {e}"
