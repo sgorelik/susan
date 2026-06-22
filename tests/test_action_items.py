@@ -35,12 +35,35 @@ def test_format_action_items_message_mentions() -> None:
             "status": "in_progress",
             "status_note": "started draft",
         },
+        {
+            "id": "ghi",
+            "text": "Ship feature",
+            "assignee_slack_id": "U123ABC",
+            "status": "open",
+            "status_note": None,
+        },
     ]
     msg = format_action_items_message(items, "last 7 days", include_instructions=False)
-    assert "<@U123ABC>" in msg
-    assert "_unassigned_" in msg
+    assert "<@U123ABC> you have *2* outstanding:" in msg
+    assert "*1.* Fix login button" in msg
+    assert "*3.* Ship feature" in msg
+    assert "*Unassigned*" in msg
+    assert "*2.* Write design doc" in msg
     assert "in progress" in msg
-    assert "Fix login button" in msg
+
+
+def test_group_items_by_assignee() -> None:
+    from app.action_items import _group_items_by_assignee
+
+    items = [
+        {"id": "a", "assignee_slack_id": "U2"},
+        {"id": "b", "assignee_slack_id": "U1"},
+        {"id": "c", "assignee_slack_id": None},
+    ]
+    groups = _group_items_by_assignee(items)
+    assert groups[0][0] == "U1"
+    assert groups[1][0] == "U2"
+    assert groups[2][0] is None
 
 
 def test_parse_action_items_time_window_default(monkeypatch: pytest.MonkeyPatch) -> None:

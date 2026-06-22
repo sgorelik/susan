@@ -242,6 +242,89 @@ def _parse_extraction_json(raw: str) -> list[dict]:
     return out
 
 
+def _build_item_numbers(items: list[dict]) -> dict[str, int]:
+    """Stable global numbers for thread status replies (#1, #2, …)."""
+    numbers: dict[str, int] = {}
+    for i, it in enumerate(items, 1):
+        iid = (it.get("id") or "").strip()
+        if iid:
+            numbers[iid] = i
+    return numbers
+
+
+def _group_items_by_assignee(items: list[dict]) -> list[tuple[str | None, list[dict]]]:
+    """Return (assignee_slack_id, items) groups; unassigned last; stable within assignee."""
+    buckets: dict[str | None, list[dict]] = {}
+    for it in items:
+        aid = (it.get("assignee_slack_id") or "").strip() or None
+        buckets.setdefault(aid, []).append(it)
+
+    def sort_key(aid: str | None) -> tuple[int, str]:
+        if aid is None:
+            return (1, "")
+        return (0, aid.lower())
+
+    out: list[tuple[str | None, list[dict]]] = []
+    for aid in sorted(buckets.keys(), key=sort_key):
+        out.append((aid, buckets[aid]))
+    return out
+
+
+def _format_item_line(it: dict, number: int) -> str:
+    st = _STATUS_LABELS.get(it.get("status") or "open", "open")
+    note = (it.get("status_note") or "").strip()
+    note_part = f" — _{note}_" if note else ""
+    return f"*{number}.* {it['text']} _({st}{note_part})_"
+
+
+def format_action_items_header(
+    range_label: str,
+    *,
+    include_instructions: bool = True,
+    sheet_url: str | None = None,
+    item_count: int = 0,
+) -> str:
+    """Short digest header (sheet link + thread instructions)."""
+    if item_count:
+        summary = f"*{item_count}* outstanding action item(s) — {range_label}"
+    else:
+        summary = f"*Outstanding action items* — {range_label}\n\n_No outstanding action items._"
+    header = summary
+    if sheet_url:
+        header += (
+            f"\n\n📎 *Ledger:* <{sheet_url}|Open Google Sheet> "
+            "_(edit tasks/status here — Susan syncs on the next run)_"
+        )
+    if include_instructions and item_count:
+        header += (
+            "\n\n_Reply in this thread with status updates: `done`, `in progress`, or `won't do` "
+            "(reference `#1` or describe the item). Susan remembers updates for the next roundup._"
+        )
+    return header
+
+
+def format_assignee_action_items_message(
+    assignee_slack_id: str | None,
+    items: list[dict],
+    item_numbers: dict[str, int],
+) -> str:
+    """One Slack message tagging a single assignee with their numbered items."""
+    if not items:
+        return ""
+    count = len(items)
+    if assignee_slack_id:
+        lines = [f"<@{assignee_slack_id}> you have *{count}* outstanding:"]
+    else:
+        lines = [f"*Unassigned* — *{count}* item(s):"]
+    for it in items:
+        iid = (it.get("id") or "").strip()
+        num = item_numbers.get(iid)
+        if num is None:
+            continue
+        lines.append(_format_item_line(it, num))
+    return "\n".join(lines)
+
+
 def format_action_items_message(
     items: list[dict],
     range_label: str,
@@ -249,30 +332,35 @@ def format_action_items_message(
     include_instructions: bool = True,
     sheet_url: str | None = None,
 ) -> str:
-    """Slack mrkdwn digest with numbered items and <@U…> mentions."""
+    """Full preview text: header plus one block per assignee (same layout as channel posts)."""
     active = [it for it in items if it.get("status") in ACTION_ITEM_ACTIVE_STATUSES]
     if not active:
-        body = "_No outstanding action items._"
-    else:
-        lines: list[str] = []
-        for i, it in enumerate(active, 1):
-            assignee = it.get("assignee_slack_id")
-            owner = f"<@{assignee}>" if assignee else "_unassigned_"
-            st = _STATUS_LABELS.get(it.get("status") or "open", "open")
-            note = (it.get("status_note") or "").strip()
-            note_part = f" — _{note}_" if note else ""
-            lines.append(f"*{i}.* {it['text']} — {owner} _({st}{note_part})_")
-        body = "\n".join(lines)
-
-    header = f"*Outstanding action items* — {range_label}\n\n{body}"
-    if sheet_url:
-        header += f"\n\n📎 *Ledger:* <{sheet_url}|Open Google Sheet> _(edit tasks/status here — Susan syncs on the next run)_"
+        return format_action_items_header(
+            range_label,
+            include_instructions=include_instructions,
+            sheet_url=sheet_url,
+            item_count=0,
+        )
+    item_numbers = _build_item_numbers(active)
+    parts = [
+        format_action_items_header(
+            range_label,
+            include_instructions=False,
+            sheet_url=sheet_url,
+            item_count=len(active),
+        )
+    ]
+    for assignee_id, group in _group_items_by_assignee(active):
+        block = format_assignee_action_items_message(assignee_id, group, item_numbers)
+        if block:
+            parts.append(block)
+    body = "\n\n".join(parts)
     if include_instructions:
-        header += (
+        body += (
             "\n\n_Reply in this thread with status updates: `done`, `in progress`, or `won't do` "
             "(reference `#1` or describe the item). Susan remembers updates for the next roundup._"
         )
-    return header
+    return body
 
 
 async def _extract_action_items_with_claude(
@@ -346,25 +434,38 @@ async def publish_action_items_digest(
     items: list[dict],
     sheet_url: str | None = None,
 ) -> str:
-    """Post digest to channel, persist items, return digest message ts."""
+    """Post digest to channel (header + one @mention message per assignee), persist items."""
     active_for_display = [
         it
         for it in items
         if it.get("status") in ACTION_ITEM_ACTIVE_STATUSES
     ]
-    body = format_action_items_message(active_for_display, range_label, sheet_url=sheet_url)
+    header = format_action_items_header(
+        range_label,
+        sheet_url=sheet_url,
+        item_count=len(active_for_display),
+    )
     title = f"Action items — {range_label}"
     post_thread = thread_ts
     if post_thread:
-        data = await post_message(channel_id, body, thread_ts=post_thread)
+        data = await post_message(channel_id, header, thread_ts=post_thread)
         message_ts = str(data.get("ts") or "")
         thread_root_ts = post_thread
     else:
-        data = await post_message(channel_id, f"*{title}*\n\n{body}")
+        data = await post_message(channel_id, header if active_for_display else f"*{title}*\n\n{header}")
         message_ts = str(data.get("ts") or "")
         thread_root_ts = message_ts
     if not message_ts:
         raise RuntimeError("Slack did not return message ts for action items digest")
+
+    if active_for_display:
+        item_numbers = _build_item_numbers(active_for_display)
+        for assignee_id, group in _group_items_by_assignee(active_for_display):
+            block = format_assignee_action_items_message(
+                assignee_id, group, item_numbers
+            )
+            if block:
+                await post_message(channel_id, block, thread_ts=thread_root_ts)
 
     digest_id = await create_action_item_digest(
         channel_id, message_ts, thread_root_ts, user, range_label, since_d, until_d
@@ -492,7 +593,7 @@ async def process_action_items(
                 "type": "mrkdwn",
                 "text": (
                     f"*Susan preview — action items*\n_(Only visible to you)_\n"
-                    "_Approve to post to the channel with @mentions; team replies in the thread update status._"
+                    "_Approve to post grouped @mention messages to the channel; team replies in the thread update status._"
                     f"{sheet_note}"
                 ),
             },
