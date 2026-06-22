@@ -73,6 +73,7 @@ from app.weekly_context import (
 from app.granola_summarize import parse_granola_slash_command, process_granola_summarize
 from app.action_items import parse_action_items_command, process_action_items
 from app.slack_events import handle_slack_event_callback, parse_events_body
+from app.scheduler import handle_schedule_slash, parse_schedule_command, start_scheduler, stop_scheduler
 from app.weekly_status import process_weekly_status
 
 @asynccontextmanager
@@ -84,7 +85,9 @@ async def lifespan(app: FastAPI):
         _h.setFormatter(logging.Formatter("%(levelname)s [susan] %(message)s"))
         susan_log.addHandler(_h)
     await init_db()
+    scheduler_task = await start_scheduler()
     yield
+    await stop_scheduler(scheduler_task)
 
 app = FastAPI(lifespan=lifespan)
 
@@ -601,7 +604,9 @@ def susan_slash_help_response() -> JSONResponse:
         "`/susan weekly status` · `/susan weekly report last 14 days` · `/susan team status last calendar week`\n"
         "`/susan weekly status --no-approval` — generate and *post immediately* to the channel (for schedules / Mondays); "
         "same with `-no-approval`. Optional: set `SUSAN_WEEKLY_AUTO_POST_USER_IDS` to comma-separated Slack user ids "
-        "to restrict who may use that flag."
+        "to restrict who may use that flag.\n"
+        "`/susan schedule add weekly status last calendar week every monday at 9:00 in #team-tech` — "
+        "recurring jobs (see `schedule help`)"
     )
     body_pr = (
         "*PR summaries & weekly status — time ranges* (optional; default is last 7 days)\n"
@@ -702,6 +707,15 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
 
     if is_susan_help_command(text_lower):
         return susan_slash_help_response()
+
+    schedule_remainder = parse_schedule_command(text)
+    if schedule_remainder is not None:
+        return await handle_schedule_slash(
+            schedule_remainder,
+            user=user,
+            channel=channel,
+            channel_name=form.get("channel_name"),
+        )
 
     granola_remainder = parse_granola_slash_command(text)
     if granola_remainder is not None:
@@ -811,7 +825,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                 "response_type": "ephemeral",
                 "text": (
                     "Susan doesn’t understand that command. Try `/susan help` for examples, "
-                    "or keywords like `connect`, `doc`, `email`, `invite`, `issue`, `pr`, "
+                    "or keywords like `connect`, `schedule`, `doc`, `email`, `invite`, `issue`, `pr`, "
                     "`summarize prs`, `weekly status`, `actions` / `action items`, or Granola-only: `granola` / `gn`."
                 ),
             }

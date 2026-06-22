@@ -22,19 +22,26 @@ from db import (
 from db import get_valid_access_token
 
 from app.config import logger
-from app.slack_api import slack_api_conversation_channel_name
+from app.slack_api import (
+    resolve_slack_user_from_sheet_cell,
+    slack_api_conversation_channel_name,
+    slack_build_user_lookup,
+    slack_fetch_workspace_members,
+    slack_members_by_id,
+    slack_user_label_from_member,
+)
 
 SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets"
 SHEET_HEADERS = [
     "id",
     "task",
-    "assignee_slack_id",
+    "assignee",
     "status",
     "status_note",
     "source",
     "created_at",
     "updated_at",
-    "updated_by_slack_id",
+    "updated_by",
 ]
 _DEFAULT_TITLE = "Susan Action Items"
 
@@ -48,13 +55,12 @@ def spreadsheet_url(spreadsheet_id: str, gid: int | None = None) -> str:
 
 def sanitize_sheet_tab_title(channel_name: str | None, channel_id: str) -> str:
     """Sheet tab title from Slack channel name (falls back to channel id)."""
-    raw = (channel_name or "").strip().lstrip("#")
-    if not raw:
-        raw = channel_id
-    # Google Sheets: no [] * ? : / \
-    cleaned = re.sub(r"[\[\]*?:/\\]", "", raw).strip()
-    cleaned = cleaned[:80] or channel_id[:12]
-    return cleaned
+    named = (channel_name or "").strip().lstrip("#")
+    if named:
+        cleaned = re.sub(r"[\[\]*?:/\\]", "", named).strip()
+        cleaned = cleaned[:78] or channel_id[:12]
+        return f"#{cleaned}" if cleaned and not cleaned.startswith("#") else cleaned
+    return channel_id[:12]
 
 
 def _a1_tab(tab_title: str) -> str:
@@ -115,7 +121,7 @@ async def _create_spreadsheet(token: str, title: str) -> tuple[str, int]:
         SHEET_HEADERS,
         [
             "(Susan)",
-            "One tab per Slack channel. Edit status/task here — Susan syncs on each `/susan actions` run and after Slack thread replies.",
+            "One tab per Slack channel (#name). Assignee/Updated by are people names — edit freely; Susan maps names back on sync.",
             "",
             "",
             "",
@@ -204,9 +210,13 @@ async def ensure_channel_tab(
     channel_name: str | None = None,
 ) -> tuple[str, int]:
     """Ensure channel tab exists; return (tab_title, gid)."""
-    name = channel_name or await slack_api_conversation_channel_name(channel_id)
-    tab_title = sanitize_sheet_tab_title(name, channel_id)
     existing = await get_channel_sheet_tab(channel_id)
+    if existing and existing.get("tab_title"):
+        tab_title = existing["tab_title"]
+    else:
+        name = channel_name or await slack_api_conversation_channel_name(channel_id)
+        tab_title = sanitize_sheet_tab_title(name, channel_id)
+
     if existing and existing.get("tab_title") == tab_title and existing.get("sheet_gid"):
         return tab_title, int(existing["sheet_gid"])
 
@@ -227,6 +237,11 @@ def _parse_sheet_row(row: list[Any]) -> dict | None:
         return None
     if not vals["task"]:
         return None
+    # Legacy sheets used assignee_slack_id / updated_by_slack_id headers in the same columns.
+    if len(row) >= 3 and not vals["assignee"] and isinstance(row[2], str):
+        vals["assignee"] = row[2].strip()
+    if len(row) >= 9 and not vals["updated_by"] and isinstance(row[8], str):
+        vals["updated_by"] = row[8].strip()
     return vals
 
 
@@ -235,8 +250,16 @@ def _status_ok(status: str) -> bool:
     return s in ACTION_ITEM_ACTIVE_STATUSES | ACTION_ITEM_TERMINAL_STATUSES
 
 
-async def import_sheet_rows_to_db(channel_id: str, rows: list[list[Any]]) -> int:
+async def import_sheet_rows_to_db(
+    channel_id: str,
+    rows: list[list[Any]],
+    *,
+    user_lookup: dict[str, str] | None = None,
+) -> int:
     """Apply sheet rows to DB (sheet wins on edits). Returns rows applied."""
+    lookup = user_lookup
+    if lookup is None:
+        lookup = slack_build_user_lookup(await slack_fetch_workspace_members())
     applied = 0
     for row in rows[1:]:
         parsed = _parse_sheet_row(row)
@@ -245,14 +268,18 @@ async def import_sheet_rows_to_db(channel_id: str, rows: list[list[Any]]) -> int
         status = parsed["status"].lower() or "open"
         if not _status_ok(status):
             status = "open"
+        assignee_id = resolve_slack_user_from_sheet_cell(parsed["assignee"], lookup)
+        updated_by_id = resolve_slack_user_from_sheet_cell(parsed["updated_by"], lookup)
         payload: dict = {
             "text": parsed["task"],
-            "assignee_slack_id": parsed["assignee_slack_id"] or None,
+            "assignee_slack_id": assignee_id,
             "status": status,
             "status_note": parsed["status_note"] or None,
             "source": parsed["source"] or "sheet",
             "sync_from_sheet": True,
         }
+        if updated_by_id:
+            payload["updated_by_slack_user_id"] = updated_by_id
         if parsed["id"]:
             payload["id"] = parsed["id"]
         await upsert_action_items(channel_id, [payload])
@@ -278,7 +305,8 @@ async def sync_sheet_to_db(slack_user_id: str, channel_id: str) -> int:
     rows = data.get("values") or []
     if len(rows) <= 1:
         return 0
-    return await import_sheet_rows_to_db(channel_id, rows)
+    lookup = slack_build_user_lookup(await slack_fetch_workspace_members())
+    return await import_sheet_rows_to_db(channel_id, rows, user_lookup=lookup)
 
 
 async def sync_db_to_sheet(slack_user_id: str, channel_id: str) -> None:
@@ -289,19 +317,29 @@ async def sync_db_to_sheet(slack_user_id: str, channel_id: str) -> None:
     if not tab:
         return
     items = await list_action_items_for_sheet(channel_id)
+    members_by_id = await slack_members_by_id()
+
+    def label(uid: str | None) -> str:
+        if not uid:
+            return ""
+        m = members_by_id.get(uid.strip().upper())
+        if m:
+            return slack_user_label_from_member(m)
+        return uid
+
     values = [SHEET_HEADERS]
     for it in items:
         values.append(
             [
                 it["id"],
                 it["text"],
-                it.get("assignee_slack_id") or "",
+                label(it.get("assignee_slack_id")),
                 it.get("status") or "open",
                 it.get("status_note") or "",
                 it.get("source") or "",
                 it.get("created_at") or "",
                 it.get("updated_at") or "",
-                it.get("updated_by_slack_user_id") or "",
+                label(it.get("updated_by_slack_user_id")),
             ]
         )
     token = await get_valid_access_token(slack_user_id)
@@ -313,6 +351,29 @@ async def sync_db_to_sheet(slack_user_id: str, channel_id: str) -> None:
         token,
         params={"valueInputOption": "RAW"},
         json_body={"range": range_a1, "values": values},
+    )
+
+
+def format_google_sheets_user_error(exc: BaseException) -> str:
+    """Short Slack-friendly message for common GCP API-not-enabled errors."""
+    raw = str(exc)
+    if "SERVICE_DISABLED" in raw or "has not been used in project" in raw:
+        if "sheets.googleapis.com" in raw or "Google Sheets API" in raw:
+            return (
+                "Google *Sheets API* is off for your OAuth GCP project. "
+                "Enable it: https://console.developers.google.com/apis/api/sheets.googleapis.com/overview "
+                "(pick the same project as your `GOOGLE_CLIENT_ID`). Also enable *Google Drive API*, "
+                "wait 2–5 minutes, then run `/susan connect google` again."
+            )
+        if "drive.googleapis.com" in raw or "Google Drive API" in raw:
+            return (
+                "Google *Drive API* is off for your OAuth GCP project. "
+                "Enable it: https://console.developers.google.com/apis/api/drive.googleapis.com/overview "
+                "then `/susan connect google` again."
+            )
+    return (
+        "Google Sheet sync failed — enable *Sheets* and *Drive* APIs in the GCP project "
+        "that owns your OAuth client, then `/susan connect google` again."
     )
 
 
@@ -335,11 +396,7 @@ async def sync_action_items_sheet(
         return spreadsheet_url(spreadsheet_id, gid)
     except Exception as e:
         logger.exception("Action items sheet sync failed")
-        raise RuntimeError(
-            f"Google Sheet sync failed: {e}. Enable **Google Sheets API** and **Google Drive API** "
-            "in GCP, then revoke Susan at https://myaccount.google.com/permissions and "
-            "run `/susan connect google` again."
-        ) from e
+        raise RuntimeError(format_google_sheets_user_error(e)) from e
 
 
 async def sync_sheet_after_status_updates(

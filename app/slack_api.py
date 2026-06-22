@@ -255,10 +255,63 @@ async def _slack_conversations_history_page(
     return r.json()
 
 
+async def _slack_conversations_replies_page(
+    channel: str, thread_ts: str, cursor: str | None
+) -> dict:
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    params: dict[str, str] = {"channel": channel, "ts": thread_ts, "limit": "200"}
+    if cursor:
+        params["cursor"] = cursor
+    async with httpx.AsyncClient(timeout=45) as client:
+        r = await client.get(
+            "https://slack.com/api/conversations.replies",
+            headers=headers,
+            params=params,
+        )
+    return r.json()
+
+
+async def _fetch_thread_reply_lines(
+    channel: str,
+    thread_ts: str,
+    *,
+    max_replies: int,
+) -> list[str]:
+    """Return indented ``user: text`` lines for thread replies (excludes parent message)."""
+    collected: list[dict] = []
+    cursor: str | None = None
+    while len(collected) < max_replies:
+        data = await _slack_conversations_replies_page(channel, thread_ts, cursor)
+        if not data.get("ok"):
+            err = data.get("error", "unknown_error")
+            logger.warning(
+                "Slack conversations.replies failed channel=%s ts=%s: %s",
+                channel,
+                thread_ts,
+                err,
+            )
+            break
+        batch = data.get("messages") or []
+        collected.extend(batch)
+        cursor = (data.get("response_metadata") or {}).get("next_cursor") or None
+        if not cursor or not batch:
+            break
+    lines: list[str] = []
+    for m in collected[1:]:
+        uid = m.get("user", "unknown")
+        text = m.get("text", "")
+        lines.append(f"  {uid}: {text}")
+        if len(lines) >= max_replies:
+            break
+    return lines
+
+
 async def fetch_slack_channel_history_since(
     channel: str,
     oldest_slack_ts: str,
     slack_user_id: str | None,
+    *,
+    include_thread_replies: bool = False,
 ) -> str:
     """Paginated channel messages at or after oldest_slack_ts (Slack epoch string)."""
     max_msgs = max(50, min(2000, int(os.environ.get("WEEKLY_STATUS_MAX_SLACK_MESSAGES", "800"))))
@@ -320,6 +373,13 @@ async def fetch_slack_channel_history_since(
 
     msgs = await fetch_all()
     msgs.sort(key=lambda m: float(m.get("ts", "0") or 0))
+    max_threads = max(
+        0, min(200, int(os.environ.get("ACTION_ITEMS_MAX_THREADS", "80")))
+    )
+    max_thread_replies = max(
+        5, min(500, int(os.environ.get("ACTION_ITEMS_MAX_THREAD_REPLIES", "150")))
+    )
+    threads_fetched = 0
     lines: list[str] = []
     total_len = 0
     truncated = False
@@ -332,6 +392,34 @@ async def fetch_slack_channel_history_since(
             break
         lines.append(line)
         total_len += len(line) + 1
+
+        reply_count = int(m.get("reply_count") or 0)
+        if (
+            include_thread_replies
+            and reply_count > 0
+            and threads_fetched < max_threads
+        ):
+            thread_ts = str(m.get("ts") or "")
+            if thread_ts:
+                reply_lines = await _fetch_thread_reply_lines(
+                    work_channel,
+                    thread_ts,
+                    max_replies=max_thread_replies,
+                )
+                if reply_lines:
+                    header = f"  [thread replies on {thread_ts}]"
+                    if total_len + len(header) + 1 <= max_chars:
+                        lines.append(header)
+                        total_len += len(header) + 1
+                    for rl in reply_lines:
+                        if total_len + len(rl) + 1 > max_chars:
+                            truncated = True
+                            break
+                        lines.append(rl)
+                        total_len += len(rl) + 1
+                    threads_fetched += 1
+        if truncated:
+            break
     out = "\n".join(lines)
     if truncated:
         out += (
@@ -646,6 +734,132 @@ async def post_pr_summary_to_channel(
 
 
 SLACK_USER_MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]+)?>")
+SLACK_USER_ID_RE = re.compile(r"^U[A-Z0-9]{8,}$", re.I)
+
+
+def slack_user_label_from_member(member: dict) -> str:
+    """Human-readable Slack user label for spreadsheets (display name, real name, or @handle)."""
+    profile = member.get("profile") or {}
+    display = (profile.get("display_name") or "").strip()
+    real = (profile.get("real_name") or profile.get("real_name_normalized") or "").strip()
+    username = (member.get("name") or "").strip()
+    if display:
+        return display
+    if real:
+        return real
+    if username:
+        return f"@{username}"
+    return str(member.get("id") or "unknown")
+
+
+def slack_user_directory_keys(member: dict) -> list[str]:
+    """Normalized keys for resolving sheet cells back to a Slack user id."""
+    keys: list[str] = []
+    uid = (member.get("id") or "").strip().upper()
+    if uid:
+        keys.extend([uid, uid.lower()])
+    profile = member.get("profile") or {}
+    for raw in (
+        profile.get("display_name"),
+        profile.get("real_name"),
+        profile.get("real_name_normalized"),
+        member.get("name"),
+    ):
+        s = (raw or "").strip()
+        if not s:
+            continue
+        low = s.lower()
+        keys.append(low)
+        keys.append(low.lstrip("@"))
+    return keys
+
+
+async def slack_fetch_workspace_members() -> list[dict]:
+    """Paginated users.list (requires users:read)."""
+    members: list[dict] = []
+    cursor: str | None = None
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    async with httpx.AsyncClient(timeout=45) as client:
+        while True:
+            params: dict[str, str] = {"limit": "200"}
+            if cursor:
+                params["cursor"] = cursor
+            r = await client.get(
+                "https://slack.com/api/users.list",
+                headers=headers,
+                params=params,
+            )
+            data = r.json()
+            if not data.get("ok"):
+                logger.warning("users.list failed: %s", data.get("error"))
+                break
+            batch = data.get("members") or []
+            members.extend([m for m in batch if isinstance(m, dict)])
+            cursor = (data.get("response_metadata") or {}).get("next_cursor") or None
+            if not cursor:
+                break
+    return members
+
+
+def slack_build_user_lookup(members: list[dict]) -> dict[str, str]:
+    """Map display names, @handles, and ids (any case) → Slack user id."""
+    lookup: dict[str, str] = {}
+    for m in members:
+        uid = (m.get("id") or "").strip().upper()
+        if not uid or m.get("deleted") or m.get("is_bot"):
+            continue
+        for key in slack_user_directory_keys(m):
+            if key and key not in lookup:
+                lookup[key] = uid
+    return lookup
+
+
+async def slack_user_display_name(
+    user_id: str,
+    *,
+    members_by_id: dict[str, dict] | None = None,
+) -> str:
+    """Resolve U… to a display label; passthrough non-ids unchanged."""
+    uid = (user_id or "").strip().upper()
+    if not uid:
+        return ""
+    if not SLACK_USER_ID_RE.match(uid):
+        return user_id
+    if members_by_id and uid in members_by_id:
+        return slack_user_label_from_member(members_by_id[uid])
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            "https://slack.com/api/users.info",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            params={"user": uid},
+        )
+    data = r.json()
+    if not data.get("ok"):
+        return uid
+    user = data.get("user") or {}
+    if user.get("deleted"):
+        return f"{uid} (deactivated)"
+    return slack_user_label_from_member(user)
+
+
+def resolve_slack_user_from_sheet_cell(cell: str, lookup: dict[str, str]) -> str | None:
+    """Map a sheet assignee/updated-by cell to Slack user id (or None)."""
+    s = (cell or "").strip()
+    if not s:
+        return None
+    if SLACK_USER_ID_RE.match(s):
+        return s.upper()
+    return lookup.get(s.lower()) or lookup.get(s.lower().lstrip("@"))
+
+
+async def slack_members_by_id() -> dict[str, dict]:
+    """Workspace members indexed by user id (for batch label resolution)."""
+    out: dict[str, dict] = {}
+    for m in await slack_fetch_workspace_members():
+        uid = (m.get("id") or "").strip().upper()
+        if uid:
+            out[uid] = m
+    return out
 
 
 def _slack_unresolved_recipients_help(user_ids: str) -> str:

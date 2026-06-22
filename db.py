@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
-from sqlalchemy import String, Text, DateTime, Integer
+from sqlalchemy import Boolean, String, Text, DateTime, Integer
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -32,11 +33,38 @@ def _async_database_url(url: str) -> str:
     return url
 
 
+def _postgres_ssl_insecure_context() -> ssl.SSLContext:
+    """TLS without cert verification (Railway public Postgres proxy only)."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def _postgres_connect_args(url: str) -> dict:
     u = url.lower()
+    ssl_mode = (os.environ.get("DATABASE_SSL") or "").strip().lower()
+
+    if ssl_mode in ("disable", "off", "false", "0"):
+        return {}
+    if ssl_mode in ("insecure", "no-verify", "require-no-verify"):
+        return {"ssl": _postgres_ssl_insecure_context()}
+
     if "localhost" in u or "127.0.0.1" in u:
         return {}
+    # Railway private network — no TLS between services in the same project.
+    if "railway.internal" in u:
+        return {}
+    # Railway public proxy (*.proxy.rlwy.net) — TLS required but chain may not verify.
+    if "proxy.rlwy.net" in u or ".rlwy.net" in u:
+        return {"ssl": _postgres_ssl_insecure_context()}
+
     return {"ssl": True}
+
+
+def _postgres_database_url() -> str:
+    """Prefer DATABASE_URL; Railway users should reference Postgres DATABASE_PRIVATE_URL there."""
+    return (os.environ.get("DATABASE_URL") or "").strip()
 
 
 def _sqlite_path() -> str:
@@ -47,7 +75,7 @@ def _sqlite_path() -> str:
 
 
 def _build_engine():
-    database_url = os.environ.get("DATABASE_URL", "").strip()
+    database_url = _postgres_database_url()
     if database_url:
         return create_async_engine(
             _async_database_url(database_url),
@@ -312,6 +340,28 @@ class ActionItemChannelTab(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class ScheduledJob(Base):
+    """Recurring job configured via `/susan schedule` in Slack."""
+
+    __tablename__ = "scheduled_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    created_by_slack_user_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    run_as_slack_user_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    channel_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    job_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    job_params: Mapped[str] = mapped_column(Text, nullable=False)
+    hour: Mapped[int] = mapped_column(Integer, nullable=False)
+    minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    days_of_week: Mapped[str] = mapped_column(Text, nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 ACTION_ITEMS_REGISTRY_KEY = "default"
 ACTION_ITEM_ACTIVE_STATUSES = frozenset({"open", "in_progress"})
 ACTION_ITEM_TERMINAL_STATUSES = frozenset({"done", "wont_do"})
@@ -521,6 +571,7 @@ async def upsert_action_items(
             assignee = (it.get("assignee_slack_id") or "").strip() or None
             source = (it.get("source") or "slack").strip()[:16] or "slack"
             note = (it.get("status_note") or "").strip() or None
+            updated_by = (it.get("updated_by_slack_user_id") or "").strip() or None
 
             row: ActionItemRecord | None = None
             if iid:
@@ -541,6 +592,8 @@ async def upsert_action_items(
                 if note:
                     row.status_note = note
                 row.source = source
+                if updated_by:
+                    row.updated_by_slack_user_id = updated_by
                 row.last_digest_id = digest_id
                 row.updated_at = now
             else:
@@ -552,7 +605,7 @@ async def upsert_action_items(
                     status=status,
                     status_note=note,
                     source=source,
-                    updated_by_slack_user_id=None,
+                    updated_by_slack_user_id=updated_by,
                     last_digest_id=digest_id,
                     created_at=now,
                     updated_at=now,
@@ -912,3 +965,150 @@ async def get_valid_access_token(slack_user_id: str) -> str:
         row.updated_at = datetime.now(timezone.utc)
         await session.commit()
         return new_access
+
+
+def _scheduled_job_dict(row: ScheduledJob) -> dict:
+    return {
+        "id": row.id,
+        "short_id": row.id.split("-")[0],
+        "created_by_slack_user_id": row.created_by_slack_user_id,
+        "run_as_slack_user_id": row.run_as_slack_user_id,
+        "channel_id": row.channel_id,
+        "job_type": row.job_type,
+        "job_params": row.job_params,
+        "hour": row.hour,
+        "minute": row.minute,
+        "days_of_week": row.days_of_week,
+        "timezone": row.timezone,
+        "enabled": row.enabled,
+        "last_run_at": row.last_run_at,
+        "last_error": row.last_error,
+        "next_run_at": row.next_run_at,
+        "created_at": row.created_at,
+    }
+
+
+async def create_scheduled_job(
+    *,
+    created_by_slack_user_id: str,
+    run_as_slack_user_id: str,
+    channel_id: str,
+    job_type: str,
+    job_params: dict,
+    hour: int,
+    minute: int,
+    days_of_week: list[int],
+    tz_name: str,
+    next_run_at: datetime,
+) -> dict:
+    job_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        session.add(
+            ScheduledJob(
+                id=job_id,
+                created_by_slack_user_id=created_by_slack_user_id,
+                run_as_slack_user_id=run_as_slack_user_id,
+                channel_id=channel_id,
+                job_type=job_type,
+                job_params=json.dumps(job_params),
+                hour=hour,
+                minute=minute,
+                days_of_week=json.dumps(days_of_week),
+                timezone=tz_name,
+                enabled=True,
+                last_run_at=None,
+                last_error=None,
+                next_run_at=next_run_at,
+                created_at=now,
+            )
+        )
+        await session.commit()
+    row = await get_scheduled_job(job_id)
+    assert row is not None
+    return row
+
+
+async def get_scheduled_job(job_id: str) -> dict | None:
+    async with SessionLocal() as session:
+        row = await session.get(ScheduledJob, job_id)
+        return _scheduled_job_dict(row) if row else None
+
+
+async def find_scheduled_job_by_prefix(id_prefix: str) -> dict | None:
+    prefix = (id_prefix or "").strip().lower()
+    if not prefix:
+        return None
+    async with SessionLocal() as session:
+        from sqlalchemy import select
+
+        q = select(ScheduledJob).where(ScheduledJob.id.like(f"{prefix}%"))
+        rows = (await session.execute(q)).scalars().all()
+        if len(rows) != 1:
+            return None
+        return _scheduled_job_dict(rows[0])
+
+
+async def list_scheduled_jobs(*, created_by: str | None = None) -> list[dict]:
+    async with SessionLocal() as session:
+        from sqlalchemy import select
+
+        q = select(ScheduledJob).order_by(ScheduledJob.created_at.desc())
+        if created_by:
+            q = q.where(ScheduledJob.created_by_slack_user_id == created_by)
+        rows = (await session.execute(q)).scalars().all()
+        return [_scheduled_job_dict(r) for r in rows]
+
+
+async def list_due_scheduled_jobs(now_utc: datetime) -> list[dict]:
+    async with SessionLocal() as session:
+        from sqlalchemy import select
+
+        q = (
+            select(ScheduledJob)
+            .where(
+                ScheduledJob.enabled.is_(True),
+                ScheduledJob.next_run_at.is_not(None),
+                ScheduledJob.next_run_at <= now_utc,
+            )
+            .order_by(ScheduledJob.next_run_at.asc())
+        )
+        rows = (await session.execute(q)).scalars().all()
+        return [_scheduled_job_dict(r) for r in rows]
+
+
+async def set_scheduled_job_enabled(job_id: str, enabled: bool) -> dict | None:
+    async with SessionLocal() as session:
+        row = await session.get(ScheduledJob, job_id)
+        if not row:
+            return None
+        row.enabled = enabled
+        await session.commit()
+        return _scheduled_job_dict(row)
+
+
+async def delete_scheduled_job(job_id: str) -> bool:
+    async with SessionLocal() as session:
+        row = await session.get(ScheduledJob, job_id)
+        if not row:
+            return False
+        await session.delete(row)
+        await session.commit()
+        return True
+
+
+async def update_scheduled_job_after_run(
+    job_id: str,
+    *,
+    last_run_at: datetime,
+    next_run_at: datetime,
+    last_error: str | None,
+) -> None:
+    async with SessionLocal() as session:
+        row = await session.get(ScheduledJob, job_id)
+        if not row:
+            return
+        row.last_run_at = last_run_at
+        row.next_run_at = next_run_at
+        row.last_error = last_error
+        await session.commit()

@@ -26,7 +26,7 @@ from app.claude_client import call_claude
 from app.config import logger
 from app.github_http import fetch_merged_prs_for_repo_range, fetch_opened_prs_for_repo_range
 from app.action_items_sheet import sync_action_items_sheet, sync_sheet_after_status_updates
-from app.granola_summarize import collect_granola_notes_for_window
+from app.granola_summarize import _format_notes_for_prompt, collect_granola_notes_for_window
 from app.slack_api import (
     fetch_slack_channel_history_since,
     notify_user_ephemeral,
@@ -38,7 +38,7 @@ from app.weekly_context import (
     resolve_github_repos_for_weekly_status,
     utc_date_start_slack_ts,
 )
-from app.weekly_drive import weekly_status_drive_activity_block
+from app.weekly_drive import action_items_google_docs_block
 
 _ACTION_PREFIXES = (
     "action items",
@@ -105,18 +105,21 @@ async def _gather_context_blocks(
 
     if await user_has_google_tokens(user):
         try:
-            drive_block = await weekly_status_drive_activity_block(
+            docs_block = await action_items_google_docs_block(
                 user,
-                since_d,
-                until_d,
                 slack_digest,
                 extra_google_urls=bookmark_google,
             )
-            if drive_block.strip():
-                blocks.append(drive_block.strip())
+            if docs_block.strip():
+                blocks.append(docs_block.strip())
+            else:
+                blocks.append(
+                    "_(No Google Doc links in channel messages or bookmarks — "
+                    "post or bookmark a doc URL to include outstanding tasks from Docs.)_"
+                )
         except Exception as e:
-            logger.warning("Action items Drive block failed: %s", e)
-            blocks.append(f"_(Google Drive unavailable: {e})_")
+            logger.warning("Action items Google Docs block failed: %s", e)
+            blocks.append(f"_(Google Docs unavailable: {e})_")
     else:
         blocks.append("_(Google not connected — skipping Docs/Drive scan.)_")
 
@@ -125,12 +128,25 @@ async def _gather_context_blocks(
             bearer = await get_granola_token(user)
             notes = await collect_granola_notes_for_window(bearer, since_d, until_d)
             if notes:
-                lines = []
-                for n in notes[:15]:
-                    title = n.get("title") or "(untitled)"
-                    sm = n.get("summary_markdown") or n.get("summary_text") or ""
-                    lines.append(f"- *{title}*\n{sm[:1500]}")
-                blocks.append("### Granola meeting notes\n" + "\n\n".join(lines))
+                max_chars = max(
+                    4000,
+                    min(
+                        80_000,
+                        int(
+                            (os.environ.get("ACTION_ITEMS_GRANOLA_MAX_CHARS") or "28000").strip()
+                            or "28000"
+                        ),
+                    ),
+                )
+                blocks.append(
+                    "### Granola meeting notes\n"
+                    "_Extract action items, next steps, and owners from summaries and transcripts._\n\n"
+                    + _format_notes_for_prompt(notes, max_chars)
+                )
+            else:
+                blocks.append(
+                    f"_(No Granola notes between {since_d} and {until_d} — widen the date window if needed.)_"
+                )
         except Exception as e:
             logger.warning("Action items Granola fetch failed: %s", e)
             blocks.append(f"_(Granola unavailable: {e})_")
@@ -268,7 +284,8 @@ async def _extract_action_items_with_claude(
 ) -> list[dict]:
     system = cleandoc(
         """
-        You are Susan. Extract actionable tasks with clear owners from the provided sources.
+        You are Susan. Extract actionable tasks with clear owners from ALL provided sources.
+
         Output ONLY valid JSON (no markdown outside the JSON):
 
         {
@@ -284,20 +301,31 @@ async def _extract_action_items_with_claude(
           ]
         }
 
+        Where to look (scan every section — do not rely on Slack main messages alone):
+        - **Slack channel**: top-level messages AND lines indented under `[thread replies on …]`.
+          Commitments, "I'll …", "@mention please …", and numbered follow-ups in threads count.
+        - **Google Docs**: unchecked checklist items, "Action items", "TODO", "Owner", tables with
+          open tasks, and any line that implies someone still owes work. Use source "drive".
+        - **Granola notes**: "Action items", "Next steps", "Follow-ups", and transcript commitments.
+          Map owners to Slack U… ids only when the same person appears in the Slack transcript;
+          otherwise assignee_slack_id is null but still include the task (source "granola").
+        - **GitHub**: opened PRs that imply follow-up work (reviews, merges pending, TODO in title).
+
         Rules:
-        - Merge with EXISTING TRACKED ITEMS: reuse `id` when the same task; preserve in_progress/done/wont_do unless sources clearly contradict.
+        - Merge with EXISTING TRACKED ITEMS: reuse `id` when the same task; preserve
+          in_progress/done/wont_do unless sources clearly contradict.
         - Do not re-open done/wont_do items unless explicitly reopened in new sources.
-        - Prefer Slack user ids (U…) seen in the transcript for assignees; use null if unknown.
-        - Include new action items from Granola/GitHub/Drive when present.
-        - Skip vague items with no owner and no clear action unless they are important and unassigned.
-        - Maximum 25 items.
+        - Prefer Slack user ids (U…) seen anywhere in the Slack section for assignees.
+        - Include important unassigned items rather than dropping them.
+        - Deduplicate the same task across sources (one row, best source label).
+        - Maximum 25 items; prefer still-open / outstanding work.
         """
     )
     user_prompt = (
         f"Window: {range_label}\n\n"
         f"--- EXISTING TRACKED ITEMS ---\n{_format_items_for_claude(existing_items)}\n\n"
-        f"--- SLACK CHANNEL ---\n{slack_digest}\n\n"
-        f"--- OTHER SOURCES ---\n{extra_context}"
+        f"--- SLACK CHANNEL (main messages + thread replies; user ids are U…) ---\n{slack_digest}\n\n"
+        f"--- OTHER SOURCES (Docs, Granola, GitHub) ---\n{extra_context}"
     )
     raw = await call_claude(system, user_prompt, max_tokens=4096)
     try:
@@ -376,7 +404,9 @@ async def process_action_items(
         )
 
     try:
-        slack_digest = await fetch_slack_channel_history_since(hist_channel, oldest_ts, user)
+        slack_digest = await fetch_slack_channel_history_since(
+            hist_channel, oldest_ts, user, include_thread_replies=True
+        )
     except Exception as e:
         logger.exception("Action items Slack fetch failed")
         await notify_user_ephemeral(channel, user, f"Susan error (Slack): {e}", None, response_url)
@@ -410,7 +440,7 @@ async def process_action_items(
     if sheet_url:
         sheet_note = f"\n\n📎 Ledger: {sheet_url}"
     elif sheet_err:
-        sheet_note = f"\n\n_{sheet_err}_"
+        sheet_note = f"\n\n⚠️ _Sheet ledger (optional): {sheet_err}_"
 
     if auto_publish:
         try:
