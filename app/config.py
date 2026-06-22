@@ -11,6 +11,8 @@ logger = logging.getLogger("susan")
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"].strip()
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"].strip()
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+# claude-sonnet-4-20250514 was retired 2026-06-15; override via ANTHROPIC_MODEL if needed.
+ANTHROPIC_MODEL = (os.environ.get("ANTHROPIC_MODEL") or "claude-sonnet-4-6").strip()
 
 ACTIONS = {
     "doc": ("create a doc", ["doc", "document", "notes"]),

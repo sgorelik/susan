@@ -104,6 +104,7 @@ Run tests / checks (if you add them): `python -m py_compile app/*.py` is a minim
 | `SLACK_SIGNING_SECRET` | Yes | Slack app → Basic Information |
 | `SLACK_BOT_TOKEN` | Yes | Bot token (`xoxb-…`); needs **`users:read.email`** if you resolve `<@U…>` for Gmail/Calendar |
 | `ANTHROPIC_API_KEY` | Yes | [Anthropic Console](https://console.anthropic.com) |
+| `ANTHROPIC_MODEL` | Optional | Default `claude-sonnet-4-6` (Sonnet 4 snapshot retired 2026-06-15) |
 | `GOOGLE_CLIENT_ID` | For Google features | OAuth client ID |
 | `GOOGLE_CLIENT_SECRET` | For Google features | OAuth client secret |
 | `GOOGLE_REDIRECT_URI` | For Google features | e.g. `https://<host>/auth/google/callback` |

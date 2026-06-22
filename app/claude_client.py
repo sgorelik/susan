@@ -7,7 +7,7 @@ import os
 
 import httpx
 
-from app.config import ANTHROPIC_API_KEY, logger
+from app.config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, logger
 
 def _anthropic_error_payload(data: dict) -> str:
     err = data.get("error")
@@ -65,7 +65,7 @@ async def call_claude(system: str, user: str, max_tokens: int | None = None) -> 
                     "content-type": "application/json",
                 },
                 json={
-                    "model": "claude-sonnet-4-20250514",
+                    "model": ANTHROPIC_MODEL,
                     "max_tokens": max_tokens if max_tokens is not None else 1500,
                     "system": system,
                     "messages": [{"role": "user", "content": user}],
