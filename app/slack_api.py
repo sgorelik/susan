@@ -11,7 +11,42 @@ import urllib.parse
 
 import httpx
 
-from app.config import ACTIONS, EMAIL_IN_TEXT_RE, logger, SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET
+from app.config import (
+    ACTIONS,
+    EMAIL_IN_TEXT_RE,
+    F1_ATTRIBUTION,
+    f1_model_active,
+    logger,
+    SLACK_BOT_TOKEN,
+    SLACK_SIGNING_SECRET,
+)
+
+
+def _append_attribution(
+    text: str | None, blocks: list | None
+) -> tuple[str | None, list | None]:
+    """When running on the sovereign model, attribute every outgoing message.
+
+    Adds a Slack *context* footer (small grey text) to block messages and an
+    italic line to text. No-op unless F1_MODEL_BASE_URL is configured.
+    """
+    if not f1_model_active():
+        return text, blocks
+    footer = F1_ATTRIBUTION
+    out_blocks = blocks
+    if blocks is not None:
+        already = any(
+            footer.lower() in str(b).lower() for b in blocks if isinstance(b, dict)
+        )
+        if not already:
+            out_blocks = [
+                *blocks,
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"_{footer}_"}]},
+            ]
+    out_text = text
+    if footer.lower() not in (text or "").lower():
+        out_text = f"{text}\n\n_{footer}_" if (text or "").strip() else footer
+    return out_text, out_blocks
 
 def _slack_form_fields(body: bytes) -> dict[str, str]:
     """Parse application/x-www-form-urlencoded body into single string per key (Slack sends one value each)."""
@@ -577,6 +612,11 @@ async def slack_views_open(trigger_id: str, view: dict) -> tuple[bool, str]:
 
 async def post_slack_delayed_response(response_url: str, payload: dict) -> None:
     """Follow-up message for slash commands (same payload shape as slash JSON response)."""
+    if isinstance(payload, dict):
+        new_text, new_blocks = _append_attribution(payload.get("text"), payload.get("blocks"))
+        payload = {**payload, "text": new_text}
+        if new_blocks is not None:
+            payload["blocks"] = new_blocks
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(response_url, json=payload)
     if r.status_code >= 400:
@@ -613,6 +653,7 @@ async def post_message(
     unfurl_links: bool | None = None,
     unfurl_media: bool | None = None,
 ) -> dict:
+    text, blocks = _append_attribution(text, blocks)
     payload: dict = {"channel": channel, "text": text}
     if thread_ts:
         payload["thread_ts"] = thread_ts

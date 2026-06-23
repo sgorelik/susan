@@ -7,7 +7,56 @@ import os
 
 import httpx
 
-from app.config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, logger
+from app.config import (
+    ANTHROPIC_API_KEY,
+    ANTHROPIC_MODEL,
+    F1_MODEL_API_KEY,
+    F1_MODEL_BASE_URL,
+    F1_MODEL_NAME,
+    f1_model_active,
+    logger,
+)
+
+
+async def _call_f1_sovereign(system: str, user: str, max_tokens: int | None = None) -> str:
+    """Call the self-hosted FrontierOne model via its OpenAI-compatible endpoint.
+
+    Used instead of Anthropic when F1_MODEL_BASE_URL is set (dogfooding on our own
+    OVH-served model). Same (system, user) -> text contract as call_claude.
+    """
+    url = f"{F1_MODEL_BASE_URL}/chat/completions"
+    headers = {"content-type": "application/json"}
+    if F1_MODEL_API_KEY:
+        headers["Authorization"] = f"Bearer {F1_MODEL_API_KEY}"
+    body = {
+        "model": F1_MODEL_NAME,
+        "max_tokens": max_tokens if max_tokens is not None else 1500,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    max_attempts = max(1, min(8, int(os.environ.get("F1_MODEL_MAX_RETRIES", "4"))))
+    base_delay = max(1.0, float(os.environ.get("F1_MODEL_RETRY_DELAY_SECONDS", "2")))
+    last = ""
+    for attempt in range(max_attempts):
+        async with httpx.AsyncClient(timeout=180) as client:
+            r = await client.post(url, headers=headers, json=body)
+        if r.status_code < 400:
+            try:
+                data = r.json()
+                return data["choices"][0]["message"]["content"]
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                logger.error("Unexpected F1 model response: %s", r.text[:500])
+                raise RuntimeError("Unexpected response from FrontierOne model")
+        last = f"HTTP {r.status_code}: {r.text[:300]}"
+        logger.error("F1 sovereign model %s", last)
+        if r.status_code < 500 and r.status_code != 429:
+            break
+        if attempt >= max_attempts - 1:
+            break
+        await asyncio.sleep(min(base_delay * (2**attempt), 30.0))
+    raise RuntimeError(f"FrontierOne model error ({last or 'unreachable'})")
 
 def _anthropic_error_payload(data: dict) -> str:
     err = data.get("error")
@@ -49,6 +98,9 @@ def _anthropic_should_retry(status: int, data: dict) -> bool:
 
 
 async def call_claude(system: str, user: str, max_tokens: int | None = None) -> str:
+    # Dogfooding: route to the self-hosted FrontierOne sovereign model when configured.
+    if f1_model_active():
+        return await _call_f1_sovereign(system, user, max_tokens)
     max_attempts = max(1, min(8, int(os.environ.get("ANTHROPIC_MAX_RETRIES", "5"))))
     base_delay = max(1.0, float(os.environ.get("ANTHROPIC_RETRY_DELAY_SECONDS", "2")))
     last_data: dict = {}
