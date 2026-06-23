@@ -12,6 +12,8 @@ from app.config import (
     ANTHROPIC_MODEL,
     F1_MODEL_API_KEY,
     F1_MODEL_BASE_URL,
+    F1_MODEL_MAX_COMPLETION_TOKENS,
+    F1_MODEL_MAX_PROMPT_CHARS,
     F1_MODEL_NAME,
     f1_model_active,
     logger,
@@ -28,9 +30,14 @@ async def _call_f1_sovereign(system: str, user: str, max_tokens: int | None = No
     headers = {"content-type": "application/json"}
     if F1_MODEL_API_KEY:
         headers["Authorization"] = f"Bearer {F1_MODEL_API_KEY}"
+    # Cap context for the sovereign 7B model: keep the most recent prompt text and
+    # bound the completion, so requests never exceed the served context window.
+    if len(user) > F1_MODEL_MAX_PROMPT_CHARS:
+        user = "[earlier context truncated]\n" + user[-F1_MODEL_MAX_PROMPT_CHARS:]
+    req_max = max_tokens if max_tokens is not None else 1500
     body = {
         "model": F1_MODEL_NAME,
-        "max_tokens": max_tokens if max_tokens is not None else 1500,
+        "max_tokens": min(req_max, F1_MODEL_MAX_COMPLETION_TOKENS),
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},

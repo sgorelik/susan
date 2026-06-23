@@ -23,6 +23,11 @@ F1_MODEL_BASE_URL = (os.environ.get("F1_MODEL_BASE_URL") or "").strip().rstrip("
 F1_MODEL_API_KEY = (os.environ.get("F1_MODEL_API_KEY") or "").strip()
 F1_MODEL_NAME = (os.environ.get("F1_MODEL_NAME") or "model-a").strip()
 F1_ATTRIBUTION = "running on Secure Sovereign FrontierOne AI model"
+# Keep susan within a small, model-friendly context (a 7B model doesn't benefit
+# from huge contexts, and this removes any dependence on the served context size).
+# Prompt is truncated (keeping the most recent text) to this many chars (~4 chars/token).
+F1_MODEL_MAX_PROMPT_CHARS = int(os.environ.get("F1_MODEL_MAX_PROMPT_CHARS", "20000"))
+F1_MODEL_MAX_COMPLETION_TOKENS = int(os.environ.get("F1_MODEL_MAX_COMPLETION_TOKENS", "1500"))
 
 
 def f1_model_active() -> bool:
