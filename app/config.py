@@ -10,9 +10,23 @@ logger = logging.getLogger("susan")
 
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"].strip()
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"].strip()
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+# Optional now: when F1_MODEL_BASE_URL is set, LLM calls route to our sovereign
+# model and an Anthropic key is not required to boot.
+ANTHROPIC_API_KEY = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
 # claude-sonnet-4-20250514 was retired 2026-06-15; override via ANTHROPIC_MODEL if needed.
 ANTHROPIC_MODEL = (os.environ.get("ANTHROPIC_MODEL") or "claude-sonnet-4-6").strip()
+
+# --- FrontierOne sovereign model (OpenAI-compatible, self-hosted on OVH) ---
+# When F1_MODEL_BASE_URL is set, ALL LLM calls route here instead of Anthropic,
+# and every Slack message is attributed to the sovereign model.
+F1_MODEL_BASE_URL = (os.environ.get("F1_MODEL_BASE_URL") or "").strip().rstrip("/")
+F1_MODEL_API_KEY = (os.environ.get("F1_MODEL_API_KEY") or "").strip()
+F1_MODEL_NAME = (os.environ.get("F1_MODEL_NAME") or "model-a").strip()
+F1_ATTRIBUTION = "running on Secure Sovereign FrontierOne AI model"
+
+
+def f1_model_active() -> bool:
+    return bool(F1_MODEL_BASE_URL)
 
 ACTIONS = {
     "doc": ("create a doc", ["doc", "document", "notes"]),
