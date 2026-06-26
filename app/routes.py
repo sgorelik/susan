@@ -72,6 +72,9 @@ from app.weekly_context import (
 )
 from app.granola_summarize import parse_granola_slash_command, process_granola_summarize
 from app.action_items import parse_action_items_command, process_action_items
+import asyncio
+import os
+
 from app.sales_prep import parse_sales_prep_command, process_sales_prep
 from app.slack_events import handle_slack_event_callback, parse_events_body
 from app.scheduler import handle_schedule_slash, parse_schedule_command, start_scheduler, stop_scheduler
@@ -838,14 +841,35 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
             )
 
         async def run_sales_prep():
+            timeout_s = int((os.environ.get("SALES_PREP_TIMEOUT_SECONDS") or "480").strip() or "480")
+            timeout_s = max(120, min(900, timeout_s))
             try:
-                await process_sales_prep(
-                    sales_prep_target,
-                    channel,
-                    user,
-                    thread_ts,
-                    response_url,
+                await asyncio.wait_for(
+                    process_sales_prep(
+                        sales_prep_target,
+                        channel,
+                        user,
+                        thread_ts,
+                        response_url,
+                    ),
+                    timeout=timeout_s,
                 )
+            except asyncio.TimeoutError:
+                logger.error("Sales prep timed out after %ss", timeout_s)
+                try:
+                    await notify_user_ephemeral(
+                        channel,
+                        user,
+                        (
+                            f"Sales prep for *{sales_prep_target}* timed out after {timeout_s}s. "
+                            "Susan may still be waiting on Drive, Granola, or Claude Opus — try again, "
+                            "or ask an admin to raise `SALES_PREP_TIMEOUT_SECONDS`."
+                        ),
+                        None,
+                        response_url,
+                    )
+                except Exception as e2:
+                    logger.error("Could not notify user after sales prep timeout: %s", e2)
             except Exception as e:
                 logger.exception("Sales prep task failed")
                 try:

@@ -113,6 +113,86 @@ def _note_sort_key(n: dict[str, Any]) -> str:
     return (n.get("updated_at") or n.get("created_at") or "")[:32]
 
 
+def _note_list_blob(n: dict[str, Any]) -> str:
+    parts = [str(n.get(k) or "") for k in ("title", "summary_text", "summary_markdown")]
+    attendees = n.get("attendees")
+    if isinstance(attendees, list):
+        for a in attendees:
+            if isinstance(a, dict):
+                parts.append(str(a.get("email") or ""))
+                parts.append(str(a.get("name") or ""))
+    return " ".join(parts).lower()
+
+
+def note_matches_search_terms(note: dict[str, Any], terms: list[str]) -> bool:
+    blob = _note_list_blob(note)
+    return any(t.lower() in blob for t in terms if len(t) >= 2)
+
+
+async def collect_granola_notes_matching_terms(
+    bearer: str,
+    since_d: str,
+    until_d: str,
+    terms: list[str],
+    *,
+    max_detail_fetch: int = 5,
+    max_list_pages: int | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """List Granola notes in window; fetch detail only for title/summary matches.
+
+    Returns ``(matched_notes_with_detail, total_summaries_scanned)``.
+    """
+    until_date = datetime.strptime(until_d, "%Y-%m-%d").date()
+    created_before = (until_date + timedelta(days=1)).isoformat()
+    created_after = f"{since_d}T00:00:00Z"
+    summaries: list[dict[str, Any]] = []
+    cursor: str | None = None
+    page_size = 30
+    pages = max_list_pages if max_list_pages is not None else _granola_max_list_pages()
+    pages = max(1, min(20, pages))
+    matched_ids: list[str] = []
+    async with httpx.AsyncClient(timeout=45) as client:
+        for _ in range(pages):
+            data = await _granola_list_page(
+                client,
+                bearer,
+                created_after=created_after,
+                created_before=created_before,
+                cursor=cursor,
+                page_size=page_size,
+            )
+            batch = data.get("notes") or []
+            if isinstance(batch, list):
+                for x in batch:
+                    if not isinstance(x, dict):
+                        continue
+                    summaries.append(x)
+                    if len(matched_ids) >= max_detail_fetch:
+                        continue
+                    nid = x.get("id")
+                    if isinstance(nid, str) and nid.startswith("not_") and note_matches_search_terms(x, terms):
+                        if nid not in matched_ids:
+                            matched_ids.append(nid)
+            if len(matched_ids) >= max_detail_fetch:
+                break
+            if not data.get("hasMore"):
+                break
+            cursor = data.get("cursor")
+            if not cursor:
+                break
+
+        out: list[dict[str, Any]] = []
+        for nid in matched_ids[:max_detail_fetch]:
+            try:
+                detail = await _granola_get_note(client, bearer, nid, include_transcript=False)
+                out.append(detail)
+            except httpx.HTTPStatusError as e:
+                logger.warning("Granola get note %s: HTTP %s", nid, e.response.status_code)
+            except Exception as e:
+                logger.warning("Granola get note %s: %s", nid, e)
+    return out, len(summaries)
+
+
 async def collect_granola_notes_for_window(
     bearer: str, since_d: str, until_d: str
 ) -> list[dict[str, Any]]:

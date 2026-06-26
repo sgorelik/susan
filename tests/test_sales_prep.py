@@ -48,3 +48,13 @@ def test_doc_name_relevance_scoring() -> None:
     assert doc_name_relevance_score("Acme Corp — qualification", ["Acme Corp"]) >= 12
     assert not is_sales_relevant_filename("Team lunch notes", ["Acme"])
     assert is_sales_relevant_filename("Acme discovery call notes", ["Acme"])
+
+
+def test_cap_sales_prep_context() -> None:
+    from app.sales_prep import _cap_sales_prep_context
+
+    docs = "D" * 50_000
+    granola = "G" * 1000
+    d, g = _cap_sales_prep_context(docs, granola, 10_000)
+    assert len(d) + len(g) <= 10_500
+    assert "truncated" in d or "omitted" in d

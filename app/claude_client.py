@@ -125,22 +125,45 @@ async def _call_anthropic(
 
     model = resolve_model(action=action, model_route=model_route)
     logger.info("Anthropic request model=%s action=%s route=%s", model, action, model_route)
+    if action == "sales_prep":
+        read_timeout = float(os.environ.get("SALES_PREP_ANTHROPIC_TIMEOUT_SECONDS", "300"))
+    elif is_commercial_action(action, model_route):
+        read_timeout = float(os.environ.get("ANTHROPIC_COMMERCIAL_TIMEOUT_SECONDS", "180"))
+    else:
+        read_timeout = float(os.environ.get("ANTHROPIC_TIMEOUT_SECONDS", "120"))
+    http_timeout = httpx.Timeout(30.0, read=read_timeout)
     for attempt in range(max_attempts):
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "max_tokens": max_tokens if max_tokens is not None else 1500,
-                    "system": system,
-                    "messages": [{"role": "user", "content": user}],
-                },
+        try:
+            async with httpx.AsyncClient(timeout=http_timeout) as client:
+                r = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": model,
+                        "max_tokens": max_tokens if max_tokens is not None else 1500,
+                        "system": system,
+                        "messages": [{"role": "user", "content": user}],
+                    },
+                )
+        except httpx.TimeoutException as e:
+            last_status = 0
+            last_text = f"timed out: {e}"
+            last_data = {}
+            logger.error(
+                "Anthropic timeout action=%s attempt=%s/%s",
+                action,
+                attempt + 1,
+                max_attempts,
             )
+            if attempt >= max_attempts - 1:
+                break
+            delay = min(base_delay * (2**attempt), 60.0)
+            await asyncio.sleep(delay)
+            continue
         last_status = r.status_code
         last_text = r.text
         try:
@@ -168,6 +191,11 @@ async def _call_anthropic(
         )
         await asyncio.sleep(delay)
 
+    if last_status == 0 and "timed out" in (last_text or "").lower():
+        raise RuntimeError(
+            "Claude request timed out. Try again — or ask an admin to raise "
+            "SALES_PREP_ANTHROPIC_TIMEOUT_SECONDS for large briefs."
+        )
     if _anthropic_is_overloaded(last_status, last_data):
         raise RuntimeError(
             "Claude is temporarily overloaded. Please try again in a minute or two."

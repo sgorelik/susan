@@ -1,6 +1,7 @@
 """Sales call prep: internal docs + Granola + company research for Frontier One (F1)."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -12,12 +13,13 @@ import httpx
 
 from app.claude_client import call_claude
 from app.config import logger
-from app.granola_summarize import collect_granola_notes_for_window
+from app.granola_summarize import collect_granola_notes_matching_terms
 from app.slack_api import (
     markdownish_to_slack_mrkdwn,
     notify_user_ephemeral,
     post_ephemeral,
     post_message,
+    post_slack_delayed_response,
     resolve_slack_post_channel,
 )
 from app.weekly_drive import (
@@ -212,12 +214,17 @@ async def _discover_relevant_drive_files(
     search_terms: list[str],
     budget: _WeeklyDriveBudget,
     max_list: int,
+    *,
+    stop_after_candidates: int,
 ) -> list[dict]:
     """Scan accessible Drive; return Docs/Slides whose names look sales- or prospect-related."""
     candidates: list[dict] = []
     page_token: str | None = None
     listed = 0
-    while listed < max_list and budget.take_call():
+    pages = 0
+    max_pages = max(1, min(20, (max_list + 99) // 100))
+    while listed < max_list and budget.take_call() and pages < max_pages:
+        pages += 1
         batch, page_token = await _drive_list_accessible_files_page(
             client, headers, page_token
         )
@@ -238,8 +245,12 @@ async def _discover_relevant_drive_files(
                     "_score": score,
                 }
             )
+            if len(candidates) >= stop_after_candidates:
+                break
             if listed >= max_list:
                 break
+        if len(candidates) >= stop_after_candidates:
+            break
         if not page_token:
             break
     candidates.sort(
@@ -361,7 +372,7 @@ async def gather_internal_docs_block(slack_user_id: str, target: str) -> str:
             + "_Google is not connected. Run `/susan connect google` to load internal docs._\n"
         )
 
-    max_list = _env_int("SALES_PREP_DRIVE_MAX_LIST", 500, 50, 5000)
+    max_list = _env_int("SALES_PREP_DRIVE_MAX_LIST", 100, 30, 5000)
     max_folders = _env_int("SALES_PREP_MAX_FOLDERS", 8, 1, 20)
     max_depth = _env_int("SALES_PREP_DRIVE_DEPTH", 10, 1, 25)
     max_docs = _env_int("SALES_PREP_MAX_DOCS", 12, 1, 30)
@@ -379,11 +390,17 @@ async def gather_internal_docs_block(slack_user_id: str, target: str) -> str:
     sections: list[str] = [header]
 
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             by_id: dict[str, dict] = {}
+            stop_after = max(max_docs + max_slides, 15) * 2
 
             discovered = await _discover_relevant_drive_files(
-                client, headers, search_terms, budget, max_list
+                client,
+                headers,
+                search_terms,
+                budget,
+                max_list,
+                stop_after_candidates=stop_after,
             )
             for item in discovered:
                 fid = item.get("id")
@@ -447,14 +464,6 @@ async def gather_internal_docs_block(slack_user_id: str, target: str) -> str:
     return "\n\n".join(sections)
 
 
-def _note_matches_target(note: dict[str, Any], terms: list[str]) -> bool:
-    blob = " ".join(
-        str(note.get(k) or "")
-        for k in ("title", "summary", "transcript", "notes_markdown")
-    ).lower()
-    return any(t.lower() in blob for t in terms if len(t) >= 2)
-
-
 async def gather_granola_block(slack_user_id: str, target: str) -> str:
     """Prior Granola meetings mentioning the prospect or company."""
     terms = extract_search_terms(target)
@@ -466,30 +475,43 @@ async def gather_granola_block(slack_user_id: str, target: str) -> str:
     today = datetime.now(timezone.utc).date()
     since_d = (today - timedelta(days=lookback)).isoformat()
     until_d = today.isoformat()
+    max_notes = _env_int("SALES_PREP_GRANOLA_MAX_NOTES", 5, 1, 20)
+    max_pages = _env_int("SALES_PREP_GRANOLA_MAX_LIST_PAGES", 4, 1, 15)
 
     try:
         token = await get_granola_token(slack_user_id)
-        notes = await collect_granola_notes_for_window(token, since_d, until_d)
+        matched, scanned = await collect_granola_notes_matching_terms(
+            token,
+            since_d,
+            until_d,
+            terms,
+            max_detail_fetch=max_notes,
+            max_list_pages=max_pages,
+        )
     except Exception as e:
         logger.warning("sales prep Granola fetch failed: %s", e)
         return header + f"_(Could not load Granola notes: {e})_\n"
 
-    matched = [n for n in notes if _note_matches_target(n, terms)]
     if not matched:
         return (
             header
             + f"_No Granola notes in the last {lookback} days mention "
-            f"{target!r} (searched {len(notes)} notes)._ \n"
+            f"{target!r} (scanned {scanned} note titles)._ \n"
         )
 
-    max_notes = _env_int("SALES_PREP_GRANOLA_MAX_NOTES", 8, 1, 20)
     max_chars = _env_int("SALES_PREP_GRANOLA_MAX_CHARS", 6000, 500, 30_000)
     lines = [header, f"_Matched {len(matched)} note(s) for {target!r}:_\n"]
     total = 0
-    for note in matched[:max_notes]:
+    for note in matched:
         title = (note.get("title") or "Untitled").strip()
         when = (note.get("created_at") or note.get("updated_at") or "")[:10]
-        summary = (note.get("summary") or note.get("notes_markdown") or "").strip()
+        summary = (
+            note.get("summary_markdown")
+            or note.get("summary_text")
+            or note.get("summary")
+            or note.get("notes_markdown")
+            or ""
+        ).strip()
         block = f"#### {title} ({when})\n{summary}"
         if total + len(block) > max_chars:
             lines.append("_…further Granola notes omitted (size cap)._")
@@ -497,6 +519,53 @@ async def gather_granola_block(slack_user_id: str, target: str) -> str:
         lines.append(block)
         total += len(block)
     return "\n\n".join(lines)
+
+
+def _cap_sales_prep_context(
+    internal_docs: str, granola_block: str, max_total: int
+) -> tuple[str, str]:
+    """Keep Claude prompt within a bounded size so Opus calls finish reliably."""
+    internal_docs = internal_docs or ""
+    granola_block = granola_block or ""
+    combined = len(internal_docs) + len(granola_block)
+    if combined <= max_total:
+        return internal_docs, granola_block
+    # Preserve granola (usually smaller); trim internal docs from the middle.
+    granola_budget = min(len(granola_block), max_total // 4)
+    docs_budget = max_total - granola_budget
+    if len(granola_block) > granola_budget:
+        granola_block = granola_block[: granola_budget - 40] + "\n…_(granola truncated)_"
+    if len(internal_docs) > docs_budget:
+        keep = max(2000, docs_budget - 80)
+        internal_docs = (
+            internal_docs[: keep // 2]
+            + "\n\n…_(middle of internal docs omitted for size)_\n\n"
+            + internal_docs[-(keep - keep // 2) :]
+        )
+    return internal_docs, granola_block
+
+
+async def _sales_prep_progress(
+    response_url: str | None,
+    channel_id: str,
+    slack_user_id: str,
+    message: str,
+) -> None:
+    """Best-effort status ping so the user knows Susan is still working."""
+    logger.info("sales prep progress: %s", message)
+    if response_url:
+        try:
+            await post_slack_delayed_response(
+                response_url,
+                {"response_type": "ephemeral", "text": message},
+            )
+            return
+        except Exception as e:
+            logger.warning("sales prep progress via response_url failed: %s", e)
+    try:
+        await post_ephemeral(channel_id, slack_user_id, message)
+    except Exception as e:
+        logger.warning("sales prep progress ephemeral failed: %s", e)
 
 
 def _parse_prep_response(raw: str) -> dict[str, Any]:
@@ -634,9 +703,48 @@ async def process_sales_prep(
         )
         return
 
-    internal_docs = await gather_internal_docs_block(slack_user_id, target)
-    granola_block = await gather_granola_block(slack_user_id, target)
+    gather_timeout = _env_int("SALES_PREP_GATHER_TIMEOUT_SECONDS", 120, 30, 600)
+    context_cap = _env_int("SALES_PREP_MAX_CONTEXT_CHARS", 80_000, 10_000, 200_000)
 
+    await _sales_prep_progress(
+        response_url,
+        channel_id,
+        slack_user_id,
+        f"Still working on *{target}* — scanning Google Drive and Granola…",
+    )
+
+    async def _gather() -> tuple[str, str]:
+        docs_task = asyncio.create_task(gather_internal_docs_block(slack_user_id, target))
+        granola_task = asyncio.create_task(gather_granola_block(slack_user_id, target))
+        return await asyncio.gather(docs_task, granola_task)
+
+    try:
+        internal_docs, granola_block = await asyncio.wait_for(
+            _gather(), timeout=gather_timeout
+        )
+    except asyncio.TimeoutError:
+        await notify_user_ephemeral(
+            channel_id,
+            slack_user_id,
+            (
+                f"Sales prep timed out while loading Drive/Granola (>{gather_timeout}s). "
+                "Try again, or ask an admin to raise `SALES_PREP_GATHER_TIMEOUT_SECONDS`."
+            ),
+            None,
+            response_url,
+        )
+        return
+
+    internal_docs, granola_block = _cap_sales_prep_context(
+        internal_docs, granola_block, context_cap
+    )
+
+    await _sales_prep_progress(
+        response_url,
+        channel_id,
+        slack_user_id,
+        f"Generating the *{target}* brief with *Claude Opus* (this can take a few minutes)…",
+    )
     system = cleandoc(
         f"""
         You are Susan, a sales preparation assistant for Frontier One (F1).
@@ -710,6 +818,13 @@ async def process_sales_prep(
             response_url,
         )
         return
+
+    await _sales_prep_progress(
+        response_url,
+        channel_id,
+        slack_user_id,
+        f"Posting the *{target}* brief to Slack…",
+    )
 
     try:
         await _publish_prep_thread(
