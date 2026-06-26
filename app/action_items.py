@@ -415,7 +415,7 @@ async def _extract_action_items_with_claude(
         f"--- SLACK CHANNEL (main messages + thread replies; user ids are U…) ---\n{slack_digest}\n\n"
         f"--- OTHER SOURCES (Docs, Granola, GitHub) ---\n{extra_context}"
     )
-    raw = await call_claude(system, user_prompt, max_tokens=4096)
+    raw = await call_claude(system, user_prompt, max_tokens=4096, action="action_items_cmd")
     try:
         return _parse_extraction_json(raw)
     except json.JSONDecodeError as e:

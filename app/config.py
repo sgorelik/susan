@@ -73,6 +73,10 @@ ACTIONS = {
         "action items digest",
         [],  # Routed via `/susan actions` / `/susan action items` / `/susan todos`.
     ),
+    "sales_prep": (
+        "sales call prep",
+        [],  # Routed via `/susan prep me for a sales call with …` (explicit parser).
+    ),
     "pr": ("create a GitHub PR", ["pull request", "create pr", "open pr", "pr"]),
 }
 

@@ -72,6 +72,7 @@ from app.weekly_context import (
 )
 from app.granola_summarize import parse_granola_slash_command, process_granola_summarize
 from app.action_items import parse_action_items_command, process_action_items
+from app.sales_prep import parse_sales_prep_command, process_sales_prep
 from app.slack_events import handle_slack_event_callback, parse_events_body
 from app.scheduler import handle_schedule_slash, parse_schedule_command, start_scheduler, stop_scheduler
 from app.weekly_status import process_weekly_status
@@ -602,6 +603,8 @@ def susan_slash_help_response() -> JSONResponse:
         "`/susan summarize merged prs for org/repo last 30 days`\n"
         "`/susan summarize merged prs for org/a org/b org/c last 14 days`\n"
         "`/susan weekly status` · `/susan weekly report last 14 days` · `/susan team status last calendar week`\n"
+        "`/susan prep me for a sales call with Acme Corp` — F1-focused brief (scans your Drive for "
+        "sales/GTM docs by name, Granola, company research; TLDR + threaded details)\n"
         "`/susan weekly status --no-approval` — generate and *post immediately* to the channel (for schedules / Mondays); "
         "same with `-no-approval`. Optional: set `SUSAN_WEEKLY_AUTO_POST_USER_IDS` to comma-separated Slack user ids "
         "to restrict who may use that flag.\n"
@@ -818,6 +821,56 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
             )
         return JSONResponse({"response_type": "ephemeral", "text": ack})
 
+    sales_prep_target = parse_sales_prep_command(text)
+    if sales_prep_target is not None:
+        if not await user_has_google_tokens(user):
+            resume_id = await create_oauth_resume_pending(
+                user, channel, thread_ts, text, "sales_prep", "google"
+            )
+            return connect_google_slack_response(
+                user,
+                intro=(
+                    "*Google isn’t connected yet.* Sales prep scans your Google Drive for "
+                    "sales/GTM and F1 docs. Sign in below — Susan will continue when you’re done."
+                ),
+                channel_id=channel or None,
+                resume_id=resume_id,
+            )
+
+        async def run_sales_prep():
+            try:
+                await process_sales_prep(
+                    sales_prep_target,
+                    channel,
+                    user,
+                    thread_ts,
+                    response_url,
+                )
+            except Exception as e:
+                logger.exception("Sales prep task failed")
+                try:
+                    await notify_user_ephemeral(
+                        channel,
+                        user,
+                        f"Susan error (sales prep): {str(e)}",
+                        None,
+                        response_url,
+                    )
+                except Exception as e2:
+                    logger.error("Could not notify user after sales prep error: %s", e2)
+
+        background_tasks.add_task(run_sales_prep)
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": (
+                    f"Got it — Susan is preparing a *sales call brief* for *{sales_prep_target}* "
+                    "(internal docs, Granola, and company research). You'll get a TLDR plus "
+                    "detailed sections in a thread when ready."
+                ),
+            }
+        )
+
     action = detect_action(text)
     if not action:
         return JSONResponse(
@@ -826,7 +879,8 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                 "text": (
                     "Susan doesn’t understand that command. Try `/susan help` for examples, "
                     "or keywords like `connect`, `schedule`, `doc`, `email`, `invite`, `issue`, `pr`, "
-                    "`summarize prs`, `weekly status`, `actions` / `action items`, or Granola-only: `granola` / `gn`."
+                    "`summarize prs`, `weekly status`, `prep me for a sales call with …`, "
+                    "`actions` / `action items`, or Granola-only: `granola` / `gn`."
                 ),
             }
         )

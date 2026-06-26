@@ -23,6 +23,7 @@ from app.github_repos import (
 )
 from app.pr_summary import process_pr_summary
 from app.granola_summarize import parse_granola_slash_command, process_granola_summarize
+from app.sales_prep import parse_sales_prep_command, process_sales_prep
 from app.slack_api import (
     extract_slack_archives_link,
     fetch_slack_history,
@@ -454,6 +455,31 @@ async def resume_slash_after_oauth(row: dict) -> None:
                     channel,
                     user,
                     f"Could not resume your Granola command after sign-in: {e}",
+                    None,
+                    response_url,
+                )
+            except Exception as e2:
+                logger.error("resume_slash_after_oauth notify: %s", e2)
+        return
+    if action == "sales_prep":
+        target = parse_sales_prep_command(text) or ""
+        try:
+            await post_ephemeral(
+                channel,
+                user,
+                "Resuming your *sales call prep* after Google sign-in…",
+            )
+        except Exception as e:
+            logger.warning("resume_slash_after_oauth intro ephemeral: %s", e)
+        try:
+            await process_sales_prep(target, channel, user, thread_ts, response_url)
+        except Exception as e:
+            logger.exception("resume_slash_after_oauth sales_prep failed")
+            try:
+                await notify_user_ephemeral(
+                    channel,
+                    user,
+                    f"Could not resume sales prep after sign-in: {e}",
                     None,
                     response_url,
                 )

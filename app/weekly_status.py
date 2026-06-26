@@ -259,7 +259,7 @@ async def process_weekly_status(
 
     max_tok = max(1500, min(32000, int(os.environ.get("WEEKLY_STATUS_MAX_TOKENS", "8192"))))
     try:
-        summary = await call_claude(system, user_prompt, max_tokens=max_tok)
+        summary = await call_claude(system, user_prompt, max_tokens=max_tok, action="weekly_status")
     except Exception as e:
         logger.exception("Weekly status Claude failed")
         await notify_user_ephemeral(channel, user, f"Susan error: {e}", None, response_url)

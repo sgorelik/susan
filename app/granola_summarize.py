@@ -274,7 +274,7 @@ async def process_granola_summarize(
     )
 
     try:
-        summary = await call_claude(system, user_prompt, max_tokens=8192)
+        summary = await call_claude(system, user_prompt, max_tokens=8192, action="granola_cmd")
     except Exception as e:
         logger.exception("Granola Claude summarize failed")
         await notify_user_ephemeral(

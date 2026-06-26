@@ -1,4 +1,4 @@
-"""Anthropic Claude API with backoff retries."""
+"""LLM client: Anthropic (commercial) or self-hosted FrontierOne sovereign model."""
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +9,6 @@ import httpx
 
 from app.config import (
     ANTHROPIC_API_KEY,
-    ANTHROPIC_MODEL,
     F1_MODEL_API_KEY,
     F1_MODEL_BASE_URL,
     F1_MODEL_MAX_COMPLETION_TOKENS,
@@ -18,20 +17,19 @@ from app.config import (
     f1_model_active,
     logger,
 )
+from app.model_routing import resolve_model, route_for_action
 
 
 async def _call_f1_sovereign(system: str, user: str, max_tokens: int | None = None) -> str:
     """Call the self-hosted FrontierOne model via its OpenAI-compatible endpoint.
 
-    Used instead of Anthropic when F1_MODEL_BASE_URL is set (dogfooding on our own
-    OVH-served model). Same (system, user) -> text contract as call_claude.
+    Used for light commands when F1_MODEL_BASE_URL is set. Same (system, user) -> text
+    contract as call_claude.
     """
     url = f"{F1_MODEL_BASE_URL}/chat/completions"
     headers = {"content-type": "application/json"}
     if F1_MODEL_API_KEY:
         headers["Authorization"] = f"Bearer {F1_MODEL_API_KEY}"
-    # Cap context for the sovereign 7B model: keep the most recent prompt text and
-    # bound the completion, so requests never exceed the served context window.
     if len(user) > F1_MODEL_MAX_PROMPT_CHARS:
         user = "[earlier context truncated]\n" + user[-F1_MODEL_MAX_PROMPT_CHARS:]
     req_max = max_tokens if max_tokens is not None else 1500
@@ -64,6 +62,7 @@ async def _call_f1_sovereign(system: str, user: str, max_tokens: int | None = No
             break
         await asyncio.sleep(min(base_delay * (2**attempt), 30.0))
     raise RuntimeError(f"FrontierOne model error ({last or 'unreachable'})")
+
 
 def _anthropic_error_payload(data: dict) -> str:
     err = data.get("error")
@@ -104,16 +103,27 @@ def _anthropic_should_retry(status: int, data: dict) -> bool:
     return False
 
 
-async def call_claude(system: str, user: str, max_tokens: int | None = None) -> str:
-    # Dogfooding: route to the self-hosted FrontierOne sovereign model when configured.
-    if f1_model_active():
-        return await _call_f1_sovereign(system, user, max_tokens)
+async def _call_anthropic(
+    system: str,
+    user: str,
+    max_tokens: int | None,
+    *,
+    action: str | None = None,
+    model_route: str | None = None,
+) -> str:
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not set. Context-heavy commands (sales prep, weekly status, "
+            "Granola, action items) require Anthropic; light commands need F1_MODEL_BASE_URL "
+            "or an Anthropic key."
+        )
     max_attempts = max(1, min(8, int(os.environ.get("ANTHROPIC_MAX_RETRIES", "5"))))
     base_delay = max(1.0, float(os.environ.get("ANTHROPIC_RETRY_DELAY_SECONDS", "2")))
     last_data: dict = {}
     last_status = 0
     last_text = ""
 
+    model = resolve_model(action=action, model_route=model_route)
     for attempt in range(max_attempts):
         async with httpx.AsyncClient(timeout=120) as client:
             r = await client.post(
@@ -124,7 +134,7 @@ async def call_claude(system: str, user: str, max_tokens: int | None = None) -> 
                     "content-type": "application/json",
                 },
                 json={
-                    "model": ANTHROPIC_MODEL,
+                    "model": model,
                     "max_tokens": max_tokens if max_tokens is not None else 1500,
                     "system": system,
                     "messages": [{"role": "user", "content": user}],
@@ -166,3 +176,22 @@ async def call_claude(system: str, user: str, max_tokens: int | None = None) -> 
             "Claude API rate limit — please wait a bit and try again."
         )
     raise RuntimeError(_anthropic_error_payload(last_data) if last_data else last_text or "Claude API error")
+
+
+async def call_claude(
+    system: str,
+    user: str,
+    max_tokens: int | None = None,
+    *,
+    action: str | None = None,
+    model_route: str | None = None,
+) -> str:
+    """Route to commercial Anthropic or the self-hosted sovereign model."""
+    route = (model_route or route_for_action(action)).strip().lower()
+    if route == "commercial":
+        return await _call_anthropic(
+            system, user, max_tokens, action=action, model_route="commercial"
+        )
+    if f1_model_active():
+        return await _call_f1_sovereign(system, user, max_tokens)
+    return await _call_anthropic(system, user, max_tokens, action=action, model_route=model_route)
