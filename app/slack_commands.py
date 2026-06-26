@@ -482,6 +482,7 @@ async def resume_slash_after_oauth(row: dict) -> None:
                     f"Could not resume sales prep after sign-in: {e}",
                     None,
                     response_url,
+                    skip_sovereign_attribution=True,
                 )
             except Exception as e2:
                 logger.error("resume_slash_after_oauth notify: %s", e2)

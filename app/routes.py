@@ -867,6 +867,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                         ),
                         None,
                         response_url,
+                        skip_sovereign_attribution=True,
                     )
                 except Exception as e2:
                     logger.error("Could not notify user after sales prep timeout: %s", e2)
@@ -879,6 +880,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                         f"Susan error (sales prep): {str(e)}",
                         None,
                         response_url,
+                        skip_sovereign_attribution=True,
                     )
                 except Exception as e2:
                     logger.error("Could not notify user after sales prep error: %s", e2)

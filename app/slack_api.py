@@ -586,7 +586,21 @@ SLACK_JSON_HEADERS = {
 }
 
 
-async def post_ephemeral(channel: str, user: str, text: str, blocks: list | None = None):
+async def post_ephemeral(
+    channel: str,
+    user: str,
+    text: str,
+    blocks: list | None = None,
+    *,
+    skip_sovereign_attribution: bool = False,
+    commercial_footer: str | None = None,
+):
+    text, blocks = _append_attribution(
+        text,
+        blocks,
+        skip_sovereign_attribution=skip_sovereign_attribution,
+        commercial_footer=commercial_footer,
+    )
     payload = {"channel": channel, "user": user, "text": text}
     if blocks:
         payload["blocks"] = blocks
@@ -636,10 +650,21 @@ async def slack_views_open(trigger_id: str, view: dict) -> tuple[bool, str]:
     return False, err
 
 
-async def post_slack_delayed_response(response_url: str, payload: dict) -> None:
+async def post_slack_delayed_response(
+    response_url: str,
+    payload: dict,
+    *,
+    skip_sovereign_attribution: bool = False,
+    commercial_footer: str | None = None,
+) -> None:
     """Follow-up message for slash commands (same payload shape as slash JSON response)."""
     if isinstance(payload, dict):
-        new_text, new_blocks = _append_attribution(payload.get("text"), payload.get("blocks"))
+        new_text, new_blocks = _append_attribution(
+            payload.get("text"),
+            payload.get("blocks"),
+            skip_sovereign_attribution=skip_sovereign_attribution,
+            commercial_footer=commercial_footer,
+        )
         payload = {**payload, "text": new_text}
         if new_blocks is not None:
             payload["blocks"] = new_blocks
@@ -656,10 +681,20 @@ async def notify_user_ephemeral(
     text: str,
     blocks: list | None = None,
     response_url: str | None = None,
+    *,
+    skip_sovereign_attribution: bool = False,
+    commercial_footer: str | None = None,
 ) -> None:
     """Prefer chat.postEphemeral; if channel is not visible to the bot, use slash response_url."""
     try:
-        await post_ephemeral(channel, user, text, blocks)
+        await post_ephemeral(
+            channel,
+            user,
+            text,
+            blocks,
+            skip_sovereign_attribution=skip_sovereign_attribution,
+            commercial_footer=commercial_footer,
+        )
     except Exception as e:
         logger.warning("post_ephemeral failed (%s), trying response_url", e)
         if not response_url:
@@ -667,7 +702,12 @@ async def notify_user_ephemeral(
         payload: dict = {"response_type": "ephemeral", "text": text}
         if blocks:
             payload["blocks"] = blocks
-        await post_slack_delayed_response(response_url, payload)
+        await post_slack_delayed_response(
+            response_url,
+            payload,
+            skip_sovereign_attribution=skip_sovereign_attribution,
+            commercial_footer=commercial_footer,
+        )
 
 
 async def post_message(

@@ -545,6 +545,29 @@ def _cap_sales_prep_context(
     return internal_docs, granola_block
 
 
+_COMMERCIAL_PREP_FOOTER = "Prepared with Claude Opus via Susan"
+
+
+async def _prep_notify(
+    channel_id: str,
+    slack_user_id: str,
+    text: str,
+    response_url: str | None,
+    *,
+    commercial_footer: str | None = None,
+) -> None:
+    """Ephemeral sales-prep message — never shows the F1 sovereign attribution."""
+    await notify_user_ephemeral(
+        channel_id,
+        slack_user_id,
+        text,
+        None,
+        response_url,
+        skip_sovereign_attribution=True,
+        commercial_footer=commercial_footer,
+    )
+
+
 async def _sales_prep_progress(
     response_url: str | None,
     channel_id: str,
@@ -558,12 +581,15 @@ async def _sales_prep_progress(
             await post_slack_delayed_response(
                 response_url,
                 {"response_type": "ephemeral", "text": message},
+                skip_sovereign_attribution=True,
             )
             return
         except Exception as e:
             logger.warning("sales prep progress via response_url failed: %s", e)
     try:
-        await post_ephemeral(channel_id, slack_user_id, message)
+        await post_ephemeral(
+            channel_id, slack_user_id, message, skip_sovereign_attribution=True
+        )
     except Exception as e:
         logger.warning("sales prep progress ephemeral failed: %s", e)
 
@@ -596,9 +622,6 @@ def _parse_prep_response(raw: str) -> dict[str, Any]:
     return {"tldr": tldr, "topics": cleaned}
 
 
-_COMMERCIAL_PREP_FOOTER = "Prepared with Claude Opus via Susan"
-
-
 async def _publish_prep_ephemeral_fallback(
     channel_id: str,
     slack_user_id: str,
@@ -615,20 +638,18 @@ async def _publish_prep_ephemeral_fallback(
         f"_Could not post to the channel (bot may lack access). "
         f"Detailed sections follow as private messages._\n\n_{_COMMERCIAL_PREP_FOOTER}_"
     )
-    await notify_user_ephemeral(
-        channel_id, slack_user_id, header[:3900], None, response_url
-    )
+    await _prep_notify(channel_id, slack_user_id, header[:3900], response_url)
     for topic in topics:
         topic_title = markdownish_to_slack_mrkdwn(topic["title"])
         topic_body = markdownish_to_slack_mrkdwn(topic["body"])
         msg = f"*{topic_title}*\n\n{topic_body}"[:3900]
         try:
-            await post_ephemeral(channel_id, slack_user_id, msg)
+            await post_ephemeral(
+                channel_id, slack_user_id, msg, skip_sovereign_attribution=True
+            )
         except Exception as e:
             logger.warning("sales prep ephemeral topic failed: %s", e)
-            await notify_user_ephemeral(
-                channel_id, slack_user_id, msg[:3900], None, response_url
-            )
+            await _prep_notify(channel_id, slack_user_id, msg[:3900], response_url)
 
 
 async def _publish_prep_thread(
@@ -693,12 +714,11 @@ async def process_sales_prep(
     """Gather context and post a TLDR + threaded deep-dive for a sales call."""
     target = (target or "").strip()
     if not target:
-        await notify_user_ephemeral(
+        await _prep_notify(
             channel_id,
             slack_user_id,
             "Please specify who the call is with, e.g. "
             "`/susan prep me for a sales call with Acme Corp`.",
-            None,
             response_url,
         )
         return
@@ -723,14 +743,13 @@ async def process_sales_prep(
             _gather(), timeout=gather_timeout
         )
     except asyncio.TimeoutError:
-        await notify_user_ephemeral(
+        await _prep_notify(
             channel_id,
             slack_user_id,
             (
                 f"Sales prep timed out while loading Drive/Granola (>{gather_timeout}s). "
                 "Try again, or ask an admin to raise `SALES_PREP_GATHER_TIMEOUT_SECONDS`."
             ),
-            None,
             response_url,
         )
         return
@@ -800,21 +819,19 @@ async def process_sales_prep(
         parsed = _parse_prep_response(raw)
     except json.JSONDecodeError as e:
         logger.error("sales prep JSON parse failed: %s raw=%r", e, (raw or "")[:500])
-        await notify_user_ephemeral(
+        await _prep_notify(
             channel_id,
             slack_user_id,
             "Susan generated a prep brief but could not parse the structured output. Please try again.",
-            None,
             response_url,
         )
         return
     except Exception as e:
         logger.exception("sales prep Claude call failed")
-        await notify_user_ephemeral(
+        await _prep_notify(
             channel_id,
             slack_user_id,
             f"Sales prep failed: {e}",
-            None,
             response_url,
         )
         return
@@ -838,22 +855,20 @@ async def process_sales_prep(
         )
     except Exception as e:
         logger.exception("sales prep Slack publish failed")
-        await notify_user_ephemeral(
+        await _prep_notify(
             channel_id,
             slack_user_id,
             f"Prep brief was generated but could not be posted: {e}",
-            None,
             response_url,
         )
         return
 
-    await notify_user_ephemeral(
+    await _prep_notify(
         channel_id,
         slack_user_id,
         (
             f"✓ *Sales prep ready* for *{target}* — see the TLDR above and detailed "
             f"sections in the thread. _(Prepared with Claude Opus.)_"
         ),
-        None,
         response_url,
     )
