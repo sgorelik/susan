@@ -23,16 +23,23 @@ from app.config import (
 
 
 def _append_attribution(
-    text: str | None, blocks: list | None
+    text: str | None,
+    blocks: list | None,
+    *,
+    skip_sovereign_attribution: bool = False,
+    commercial_footer: str | None = None,
 ) -> tuple[str | None, list | None]:
-    """When running on the sovereign model, attribute every outgoing message.
+    """Append model attribution footer when appropriate.
 
-    Adds a Slack *context* footer (small grey text) to block messages and an
-    italic line to text. No-op unless F1_MODEL_BASE_URL is configured.
+    Sovereign footer applies when F1_MODEL_BASE_URL is set unless skipped (e.g. commercial
+    Anthropic responses). Optional ``commercial_footer`` for context-heavy commands.
     """
-    if not f1_model_active():
+    if commercial_footer:
+        footer = commercial_footer
+    elif skip_sovereign_attribution or not f1_model_active():
         return text, blocks
-    footer = F1_ATTRIBUTION
+    else:
+        footer = F1_ATTRIBUTION
     out_blocks = blocks
     if blocks is not None:
         already = any(
@@ -192,6 +199,25 @@ async def _try_slack_open_by_channel_id(channel: str) -> str | None:
         return cid
     logger.warning("Slack: conversations.open(channel) failed: %s", data)
     return None
+
+
+async def resolve_slack_post_channel(
+    channel: str, slack_user_id: str | None = None
+) -> str:
+    """Return a channel id the bot should be able to post to (open DM, join public, etc.)."""
+    cid = (channel or "").strip()
+    if slack_user_id and (not cid or _is_dm_slack_channel(cid)):
+        opened = await _try_slack_open_im_with_user(slack_user_id)
+        if opened:
+            return opened
+    if cid and _is_public_slack_channel(cid):
+        await _try_slack_join_channel(cid)
+        return cid
+    if cid and _is_private_or_mpim_slack_channel(cid):
+        opened = await _try_slack_open_by_channel_id(cid)
+        if opened:
+            return opened
+    return cid
 
 
 async def _try_slack_join_channel(channel: str) -> None:
@@ -652,8 +678,16 @@ async def post_message(
     *,
     unfurl_links: bool | None = None,
     unfurl_media: bool | None = None,
+    slack_user_id: str | None = None,
+    skip_sovereign_attribution: bool = False,
+    commercial_footer: str | None = None,
 ) -> dict:
-    text, blocks = _append_attribution(text, blocks)
+    text, blocks = _append_attribution(
+        text,
+        blocks,
+        skip_sovereign_attribution=skip_sovereign_attribution,
+        commercial_footer=commercial_footer,
+    )
     payload: dict = {"channel": channel, "text": text}
     if thread_ts:
         payload["thread_ts"] = thread_ts
@@ -663,20 +697,39 @@ async def post_message(
         payload["unfurl_links"] = unfurl_links
     if unfurl_media is not None:
         payload["unfurl_media"] = unfurl_media
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
-            "https://slack.com/api/chat.postMessage",
-            headers=SLACK_JSON_HEADERS,
-            json=payload,
-        )
+
+    async def _send(target_channel: str) -> dict:
+        send_payload = {**payload, "channel": target_channel}
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://slack.com/api/chat.postMessage",
+                headers=SLACK_JSON_HEADERS,
+                json=send_payload,
+            )
+        try:
+            data = r.json()
+        except json.JSONDecodeError:
+            data = {}
+        if not data.get("ok"):
+            logger.error("chat.postMessage failed: %s", data)
+            raise RuntimeError(str(data.get("error", "chat.postMessage failed")))
+        return data
+
     try:
-        data = r.json()
-    except json.JSONDecodeError:
-        data = {}
-    if not data.get("ok"):
-        logger.error("chat.postMessage failed: %s", data)
-        raise RuntimeError(str(data.get("error", "chat.postMessage failed")))
-    return data
+        return await _send(channel)
+    except RuntimeError as e:
+        err = str(e)
+        if slack_user_id and err in ("channel_not_found", "not_in_channel"):
+            resolved = await resolve_slack_post_channel(channel, slack_user_id)
+            if resolved and resolved != channel:
+                logger.info(
+                    "chat.postMessage retry channel %s -> %s after %s",
+                    channel,
+                    resolved,
+                    err,
+                )
+                return await _send(resolved)
+        raise
 
 
 def _md_double_star_to_slack_bold(s: str) -> str:

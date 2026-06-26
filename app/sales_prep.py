@@ -13,7 +13,13 @@ import httpx
 from app.claude_client import call_claude
 from app.config import logger
 from app.granola_summarize import collect_granola_notes_for_window
-from app.slack_api import markdownish_to_slack_mrkdwn, notify_user_ephemeral, post_message
+from app.slack_api import (
+    markdownish_to_slack_mrkdwn,
+    notify_user_ephemeral,
+    post_ephemeral,
+    post_message,
+    resolve_slack_post_channel,
+)
 from app.weekly_drive import (
     GOOGLE_DRIVE_DOC_MIME,
     GOOGLE_DRIVE_FOLDER_MIME,
@@ -521,18 +527,71 @@ def _parse_prep_response(raw: str) -> dict[str, Any]:
     return {"tldr": tldr, "topics": cleaned}
 
 
+_COMMERCIAL_PREP_FOOTER = "Prepared with Claude Opus via Susan"
+
+
+async def _publish_prep_ephemeral_fallback(
+    channel_id: str,
+    slack_user_id: str,
+    target: str,
+    tldr: str,
+    topics: list[dict[str, str]],
+    response_url: str | None,
+) -> None:
+    """Private fallback when channel post fails — TLDR + one ephemeral per topic."""
+    title = f"Sales prep — {target}"
+    tldr_body = markdownish_to_slack_mrkdwn(tldr)
+    header = (
+        f"*{title}*\n\n{tldr_body}\n\n"
+        f"_Could not post to the channel (bot may lack access). "
+        f"Detailed sections follow as private messages._\n\n_{_COMMERCIAL_PREP_FOOTER}_"
+    )
+    await notify_user_ephemeral(
+        channel_id, slack_user_id, header[:3900], None, response_url
+    )
+    for topic in topics:
+        topic_title = markdownish_to_slack_mrkdwn(topic["title"])
+        topic_body = markdownish_to_slack_mrkdwn(topic["body"])
+        msg = f"*{topic_title}*\n\n{topic_body}"[:3900]
+        try:
+            await post_ephemeral(channel_id, slack_user_id, msg)
+        except Exception as e:
+            logger.warning("sales prep ephemeral topic failed: %s", e)
+            await notify_user_ephemeral(
+                channel_id, slack_user_id, msg[:3900], None, response_url
+            )
+
+
 async def _publish_prep_thread(
     channel_id: str,
+    slack_user_id: str,
     thread_ts: str | None,
     target: str,
     tldr: str,
     topics: list[dict[str, str]],
+    response_url: str | None,
 ) -> None:
     """Post TLDR as parent message, detailed topics as thread replies."""
+    channel_id = await resolve_slack_post_channel(channel_id, slack_user_id)
     title = f"Sales prep — {target}"
     tldr_body = markdownish_to_slack_mrkdwn(tldr)
     parent = f"*{title}*\n\n{tldr_body}\n\n_Thread below has detailed sections — posted via Susan._"
-    data = await post_message(channel_id, parent[:3900], thread_ts=thread_ts)
+    post_kw = {
+        "slack_user_id": slack_user_id,
+        "skip_sovereign_attribution": True,
+        "commercial_footer": _COMMERCIAL_PREP_FOOTER,
+    }
+    try:
+        data = await post_message(
+            channel_id, parent[:3900], thread_ts=thread_ts, **post_kw
+        )
+    except RuntimeError as e:
+        logger.warning("sales prep channel post failed (%s); using ephemeral fallback", e)
+        await _publish_prep_ephemeral_fallback(
+            channel_id, slack_user_id, target, tldr, topics, response_url
+        )
+        return
+
     root_ts = thread_ts or str(data.get("ts") or "")
     if not root_ts:
         raise RuntimeError("Slack did not return a message ts for sales prep")
@@ -550,7 +609,9 @@ async def _publish_prep_thread(
             first = False
             msg = (prefix + chunk).strip()
             if msg:
-                await post_message(channel_id, msg[:3900], thread_ts=root_ts)
+                await post_message(
+                    channel_id, msg[:3900], thread_ts=root_ts, **post_kw
+                )
 
 
 async def process_sales_prep(
@@ -621,7 +682,13 @@ async def process_sales_prep(
     max_tokens = _env_int("SALES_PREP_MAX_TOKENS", 8192, 2048, 16_384)
     raw = ""
     try:
-        raw = await call_claude(system, user_prompt, max_tokens=max_tokens, action="sales_prep")
+        raw = await call_claude(
+            system,
+            user_prompt,
+            max_tokens=max_tokens,
+            action="sales_prep",
+            model_route="commercial",
+        )
         parsed = _parse_prep_response(raw)
     except json.JSONDecodeError as e:
         logger.error("sales prep JSON parse failed: %s raw=%r", e, (raw or "")[:500])
@@ -647,10 +714,12 @@ async def process_sales_prep(
     try:
         await _publish_prep_thread(
             channel_id,
+            slack_user_id,
             thread_ts,
             target,
             parsed["tldr"],
             parsed["topics"],
+            response_url,
         )
     except Exception as e:
         logger.exception("sales prep Slack publish failed")
@@ -666,7 +735,10 @@ async def process_sales_prep(
     await notify_user_ephemeral(
         channel_id,
         slack_user_id,
-        f"✓ *Sales prep ready* for *{target}* — see the TLDR above and detailed sections in the thread.",
+        (
+            f"✓ *Sales prep ready* for *{target}* — see the TLDR above and detailed "
+            f"sections in the thread. _(Prepared with Claude Opus.)_"
+        ),
         None,
         response_url,
     )

@@ -17,7 +17,7 @@ from app.config import (
     f1_model_active,
     logger,
 )
-from app.model_routing import resolve_model, route_for_action
+from app.model_routing import is_commercial_action, resolve_model
 
 
 async def _call_f1_sovereign(system: str, user: str, max_tokens: int | None = None) -> str:
@@ -124,6 +124,7 @@ async def _call_anthropic(
     last_text = ""
 
     model = resolve_model(action=action, model_route=model_route)
+    logger.info("Anthropic request model=%s action=%s route=%s", model, action, model_route)
     for attempt in range(max_attempts):
         async with httpx.AsyncClient(timeout=120) as client:
             r = await client.post(
@@ -187,11 +188,16 @@ async def call_claude(
     model_route: str | None = None,
 ) -> str:
     """Route to commercial Anthropic or the self-hosted sovereign model."""
-    route = (model_route or route_for_action(action)).strip().lower()
-    if route == "commercial":
+    if is_commercial_action(action, model_route):
+        model = resolve_model(action=action, model_route="commercial")
+        logger.info(
+            "LLM route: commercial Anthropic (action=%s model=%s)", action, model
+        )
         return await _call_anthropic(
             system, user, max_tokens, action=action, model_route="commercial"
         )
     if f1_model_active():
+        logger.info("LLM route: F1 sovereign (action=%s)", action)
         return await _call_f1_sovereign(system, user, max_tokens)
+    logger.info("LLM route: default Anthropic (action=%s)", action)
     return await _call_anthropic(system, user, max_tokens, action=action, model_route=model_route)
