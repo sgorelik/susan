@@ -555,13 +555,14 @@ async def _prep_notify(
     response_url: str | None,
     *,
     commercial_footer: str | None = None,
+    blocks: list[dict] | None = None,
 ) -> None:
     """Ephemeral sales-prep message — never shows the F1 sovereign attribution."""
     await notify_user_ephemeral(
         channel_id,
         slack_user_id,
         text,
-        None,
+        blocks,
         response_url,
         skip_sovereign_attribution=True,
         commercial_footer=commercial_footer,
@@ -595,7 +596,7 @@ async def _sales_prep_progress(
 
 
 def _parse_prep_response(raw: str) -> dict[str, Any]:
-    """Parse Claude JSON output for TLDR + topic threads."""
+    """Parse Claude JSON: Slack TLDR, talking points, action items, detail sections."""
     text = (raw or "").strip()
     fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if fence:
@@ -603,105 +604,196 @@ def _parse_prep_response(raw: str) -> dict[str, Any]:
     data = json.loads(text)
     if not isinstance(data, dict):
         raise ValueError("expected JSON object")
-    tldr = str(data.get("tldr") or "").strip()
-    topics = data.get("topics")
+
+    tldr = str(data.get("tldr_slack") or data.get("tldr") or "").strip()
     if not tldr:
-        raise ValueError("missing tldr")
-    if not isinstance(topics, list) or not topics:
-        raise ValueError("missing topics")
-    cleaned: list[dict[str, str]] = []
-    for t in topics:
-        if not isinstance(t, dict):
+        raise ValueError("missing tldr_slack")
+
+    talking_points = _parse_string_list(data.get("talking_points"))
+    action_items = _parse_string_list(data.get("action_items"))
+    if not talking_points:
+        raise ValueError("missing talking_points")
+    if not action_items:
+        raise ValueError("missing action_items")
+
+    sections_raw = data.get("sections") or data.get("topics") or []
+    if not isinstance(sections_raw, list) or not sections_raw:
+        raise ValueError("missing sections")
+    sections: list[dict[str, str]] = []
+    for s in sections_raw:
+        if not isinstance(s, dict):
             continue
-        title = str(t.get("title") or "").strip()
-        body = str(t.get("body") or "").strip()
+        title = str(s.get("title") or "").strip()
+        body = str(s.get("body") or "").strip()
         if title and body:
-            cleaned.append({"title": title, "body": body})
-    if not cleaned:
-        raise ValueError("no valid topics")
-    return {"tldr": tldr, "topics": cleaned}
+            sections.append({"title": title, "body": body})
+    if not sections:
+        raise ValueError("no valid sections")
+
+    return {
+        "tldr_slack": tldr,
+        "talking_points": talking_points,
+        "action_items": action_items,
+        "sections": sections,
+    }
 
 
-async def _publish_prep_ephemeral_fallback(
-    channel_id: str,
-    slack_user_id: str,
-    target: str,
-    tldr: str,
-    topics: list[dict[str, str]],
-    response_url: str | None,
-) -> None:
-    """Private fallback when channel post fails — TLDR + one ephemeral per topic."""
-    title = f"Sales prep — {target}"
-    tldr_body = markdownish_to_slack_mrkdwn(tldr)
-    header = (
-        f"*{title}*\n\n{tldr_body}\n\n"
-        f"_Could not post to the channel (bot may lack access). "
-        f"Detailed sections follow as private messages._\n\n_{_COMMERCIAL_PREP_FOOTER}_"
+def _parse_string_list(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        s = str(item or "").strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _strip_slack_mrkdwn_for_doc(text: str) -> str:
+    """Rough conversion of Slack mrkdwn to readable plain text for Google Docs."""
+    s = (text or "").strip()
+    s = re.sub(r"<(https?://[^>|]+)\|([^>]+)>", r"\2 (\1)", s)
+    s = re.sub(r"<(https?://[^>]+)>", r"\1", s)
+    s = re.sub(r"\*([^*]+)\*", r"\1", s)
+    s = re.sub(r"_([^_]+)_", r"\1", s)
+    return s.strip()
+
+
+def format_sales_prep_doc_content(target: str, parsed: dict[str, Any]) -> str:
+    """Build a scannable Google Doc body with marked talking points and action items."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    lines: list[str] = [
+        f"Sales Call Prep — {target}",
+        f"Prepared by Susan · {today} UTC",
+        "",
+        "—" * 40,
+        "",
+        "TL;DR",
+        _strip_slack_mrkdwn_for_doc(parsed["tldr_slack"]),
+        "",
+        "▸ TALKING POINTS",
+        "Use these on the call — in order of priority.",
+        "",
+    ]
+    for i, point in enumerate(parsed["talking_points"], 1):
+        lines.append(f"{i}. {_strip_slack_mrkdwn_for_doc(point)}")
+    lines.extend(
+        [
+            "",
+            "▸ ACTION ITEMS",
+            "Before, during, and after the call.",
+            "",
+        ]
     )
-    await _prep_notify(channel_id, slack_user_id, header[:3900], response_url)
-    for topic in topics:
-        topic_title = markdownish_to_slack_mrkdwn(topic["title"])
-        topic_body = markdownish_to_slack_mrkdwn(topic["body"])
-        msg = f"*{topic_title}*\n\n{topic_body}"[:3900]
-        try:
-            await post_ephemeral(
-                channel_id, slack_user_id, msg, skip_sovereign_attribution=True
-            )
-        except Exception as e:
-            logger.warning("sales prep ephemeral topic failed: %s", e)
-            await _prep_notify(channel_id, slack_user_id, msg[:3900], response_url)
+    for item in parsed["action_items"]:
+        lines.append(f"☐ {_strip_slack_mrkdwn_for_doc(item)}")
+    lines.extend(["", "—" * 40, "", "DETAILED BRIEF", ""])
+    for section in parsed["sections"]:
+        lines.append(section["title"].upper())
+        lines.append("")
+        lines.append(_strip_slack_mrkdwn_for_doc(section["body"]))
+        lines.append("")
+        lines.append("—" * 40)
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
 
 
-async def _publish_prep_thread(
+def format_sales_prep_slack_payload(
+    target: str, parsed: dict[str, Any], doc_url: str
+) -> tuple[str, list[dict]]:
+    """Slack TLDR + Google Doc link using Block Kit mrkdwn (links render reliably)."""
+    tldr = markdownish_to_slack_mrkdwn(parsed["tldr_slack"]).strip()
+    max_tldr = 2800
+    if len(tldr) > max_tldr:
+        tldr = tldr[: max_tldr - 1].rstrip() + "…"
+
+    title = f"*Sales prep — {target}*"
+    link_mrkdwn = f"<{doc_url}|Open full brief in Google Docs>"
+    link_plain = doc_url.strip()
+
+    blocks: list[dict] = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"{title}\n\n{link_mrkdwn}\n{link_plain}",
+            },
+        },
+        {"type": "divider"},
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": tldr or "_No summary generated._"},
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "_Full brief includes talking points, action items, and F1 fit._",
+                }
+            ],
+        },
+    ]
+    fallback = f"Sales prep — {target}\n{link_plain}\n\n{tldr}"
+    return fallback, blocks
+
+
+def format_sales_prep_slack_message(target: str, parsed: dict[str, Any], doc_url: str) -> str:
+    """Plain-text fallback (notifications); prefer ``format_sales_prep_slack_payload`` for posting."""
+    fallback, _ = format_sales_prep_slack_payload(target, parsed, doc_url)
+    return fallback
+
+
+async def _create_sales_prep_google_doc(
+    target: str, parsed: dict[str, Any], slack_user_id: str
+) -> tuple[str | None, str | None]:
+    from app.google_workspace import create_google_doc_titled
+
+    title = f"Sales prep — {target}"[:200]
+    body = format_sales_prep_doc_content(target, parsed)
+    return await create_google_doc_titled(title, body, slack_user_id)
+
+
+async def _publish_prep_result(
     channel_id: str,
     slack_user_id: str,
     thread_ts: str | None,
     target: str,
-    tldr: str,
-    topics: list[dict[str, str]],
+    parsed: dict[str, Any],
     response_url: str | None,
-) -> None:
-    """Post TLDR as parent message, detailed topics as thread replies."""
+) -> str:
+    """Post a Slack TLDR with link to a formatted Google Doc (no thread replies). Returns doc URL."""
+    doc_url, doc_err = await _create_sales_prep_google_doc(target, parsed, slack_user_id)
+    if not doc_url:
+        raise RuntimeError(doc_err or "Could not create Google Doc")
+    logger.info("sales prep Google Doc created for %s: %s", target, doc_url)
+
     channel_id = await resolve_slack_post_channel(channel_id, slack_user_id)
-    title = f"Sales prep — {target}"
-    tldr_body = markdownish_to_slack_mrkdwn(tldr)
-    parent = f"*{title}*\n\n{tldr_body}\n\n_Thread below has detailed sections — posted via Susan._"
+    fallback_text, blocks = format_sales_prep_slack_payload(target, parsed, doc_url)
     post_kw = {
         "slack_user_id": slack_user_id,
         "skip_sovereign_attribution": True,
         "commercial_footer": _COMMERCIAL_PREP_FOOTER,
     }
     try:
-        data = await post_message(
-            channel_id, parent[:3900], thread_ts=thread_ts, **post_kw
+        await post_message(
+            channel_id,
+            fallback_text,
+            thread_ts=thread_ts,
+            blocks=blocks,
+            **post_kw,
         )
     except RuntimeError as e:
-        logger.warning("sales prep channel post failed (%s); using ephemeral fallback", e)
-        await _publish_prep_ephemeral_fallback(
-            channel_id, slack_user_id, target, tldr, topics, response_url
+        logger.warning("sales prep channel post failed (%s); using ephemeral", e)
+        await _prep_notify(
+            channel_id,
+            slack_user_id,
+            fallback_text,
+            response_url,
+            commercial_footer=_COMMERCIAL_PREP_FOOTER,
+            blocks=blocks,
         )
-        return
-
-    root_ts = thread_ts or str(data.get("ts") or "")
-    if not root_ts:
-        raise RuntimeError("Slack did not return a message ts for sales prep")
-
-    for topic in topics:
-        topic_title = markdownish_to_slack_mrkdwn(topic["title"])
-        topic_body = markdownish_to_slack_mrkdwn(topic["body"])
-        chunk_limit = 2800
-        body = topic_body
-        first = True
-        while body or first:
-            chunk = body[:chunk_limit]
-            body = body[chunk_limit:]
-            prefix = f"*{topic_title}*\n\n" if first else ""
-            first = False
-            msg = (prefix + chunk).strip()
-            if msg:
-                await post_message(
-                    channel_id, msg[:3900], thread_ts=root_ts, **post_kw
-                )
+    return doc_url
 
 
 async def process_sales_prep(
@@ -711,7 +803,7 @@ async def process_sales_prep(
     thread_ts: str | None,
     response_url: str | None,
 ) -> None:
-    """Gather context and post a TLDR + threaded deep-dive for a sales call."""
+    """Gather context, write a Google Doc, and post a Slack TLDR with the doc link."""
     target = (target or "").strip()
     if not target:
         await _prep_notify(
@@ -787,15 +879,28 @@ async def process_sales_prep(
 
         Output ONLY valid JSON (no markdown fence) with this shape:
         {{
-          "tldr": "<3-6 bullet TLDR in Slack mrkdwn: *bold* not **, links as <url|label>>",
-          "topics": [
-            {{"title": "<section title>", "body": "<detailed mrkdwn for one thread reply>"}},
+          "tldr_slack": "<3-5 short bullets for Slack; *bold* labels ok; keep under 120 words total>",
+          "talking_points": [
+            "<priority-ordered point to raise on the call>",
+            "..."
+          ],
+          "action_items": [
+            "<concrete before/during/after call task>",
+            "..."
+          ],
+          "sections": [
+            {{"title": "<section title>", "body": "<detailed plain-text paragraphs and bullets>"}},
             ...
           ]
         }}
 
-        Include 4-8 topic sections. Each topic body should be self-contained and actionable.
-        Use Slack mrkdwn in tldr and topic bodies.
+        Requirements:
+        - ``tldr_slack``: scannable bullets only — what matters most going into the call.
+        - ``talking_points``: 5-8 specific, F1-relevant points to say (not generic fluff).
+        - ``action_items``: 4-8 checkboxes — prep work, questions to ask, follow-ups after.
+        - ``sections``: 4-7 deeper sections (company context, inference/regulatory needs,
+          hyperscaler landscape, decision makers, F1 fit, competitive angles, discovery questions).
+          Use plain text in section bodies (no Slack mrkdwn).
         """
     )
 
@@ -840,35 +945,46 @@ async def process_sales_prep(
         response_url,
         channel_id,
         slack_user_id,
-        f"Posting the *{target}* brief to Slack…",
+        f"Writing the *{target}* brief to Google Docs…",
     )
 
     try:
-        await _publish_prep_thread(
+        doc_url = await _publish_prep_result(
             channel_id,
             slack_user_id,
             thread_ts,
             target,
-            parsed["tldr"],
-            parsed["topics"],
+            parsed,
             response_url,
         )
     except Exception as e:
-        logger.exception("sales prep Slack publish failed")
+        logger.exception("sales prep publish failed")
         await _prep_notify(
             channel_id,
             slack_user_id,
-            f"Prep brief was generated but could not be posted: {e}",
+            f"Prep brief was generated but could not be published: {e}",
             response_url,
         )
         return
 
+    link = f"<{doc_url}|Open full brief in Google Docs>"
+    done_blocks: list[dict] = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"✓ *Sales prep ready* for *{target}*\n\n"
+                    f"{link}\n{doc_url}\n\n"
+                    f"_Talking points, action items, and full brief are in the doc._"
+                ),
+            },
+        },
+    ]
     await _prep_notify(
         channel_id,
         slack_user_id,
-        (
-            f"✓ *Sales prep ready* for *{target}* — see the TLDR above and detailed "
-            f"sections in the thread. _(Prepared with Claude Opus.)_"
-        ),
+        f"Sales prep ready for {target}: {doc_url}",
         response_url,
+        blocks=done_blocks,
     )

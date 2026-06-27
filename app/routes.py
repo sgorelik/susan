@@ -607,7 +607,7 @@ def susan_slash_help_response() -> JSONResponse:
         "`/susan summarize merged prs for org/a org/b org/c last 14 days`\n"
         "`/susan weekly status` · `/susan weekly report last 14 days` · `/susan team status last calendar week`\n"
         "`/susan prep me for a sales call with Acme Corp` — F1-focused brief (scans your Drive for "
-        "sales/GTM docs by name, Granola, company research; TLDR + threaded details)\n"
+        "sales/GTM docs by name, Granola, company research; concise TLDR in Slack + full brief in Google Docs)\n"
         "`/susan weekly status --no-approval` — generate and *post immediately* to the channel (for schedules / Mondays); "
         "same with `-no-approval`. Optional: set `SUSAN_WEEKLY_AUTO_POST_USER_IDS` to comma-separated Slack user ids "
         "to restrict who may use that flag.\n"
@@ -891,8 +891,8 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                 "response_type": "ephemeral",
                 "text": (
                     f"Got it — Susan is preparing a *sales call brief* for *{sales_prep_target}* "
-                    "(internal docs, Granola, and company research). You'll get a TLDR plus "
-                    "detailed sections in a thread when ready."
+                    "(internal docs, Granola, and company research). You'll get a concise TLDR in "
+                    "Slack with a link to the full Google Doc when ready."
                 ),
             }
         )

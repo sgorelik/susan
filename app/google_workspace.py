@@ -9,20 +9,26 @@ import httpx
 
 from db import get_valid_access_token
 
-from app.config import EMAIL_IN_TEXT_RE
+from app.config import EMAIL_IN_TEXT_RE, logger
 from app.slack_api import _slack_unresolved_recipients_help, resolve_slack_recipients_to_emails
 from app.slack_commands import parse_email_draft, parse_invite_draft
 
-async def create_google_doc(content: str, slack_user_id: str) -> str:
+
+async def create_google_doc_titled(
+    title: str, content: str, slack_user_id: str
+) -> tuple[str | None, str | None]:
+    """Create a Google Doc with plain-text body. Returns ``(doc_url, error)``."""
     try:
         token = await get_valid_access_token(slack_user_id)
     except ValueError as e:
-        return str(e)
-    async with httpx.AsyncClient() as client:
+        return None, str(e)
+    doc_title = (title or "Susan document").strip()[:200] or "Susan document"
+    body = content if content.endswith("\n") else content + "\n"
+    async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
             "https://docs.googleapis.com/v1/documents",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"title": "Susan — Meeting Notes"},
+            json={"title": doc_title},
         )
         doc = r.json()
         if r.status_code >= 400:
@@ -32,17 +38,27 @@ async def create_google_doc(content: str, slack_user_id: str) -> str:
                 "Then revoke Susan at https://myaccount.google.com/permissions and run `/susan connect` again."
             )
             if r.status_code in (401, 403):
-                return f"Google Docs rejected this token ({r.status_code}).{hint} Raw: {doc}"
-            return f"Failed to create doc: {doc}"
+                return None, f"Google Docs rejected this token ({r.status_code}).{hint} Raw: {doc}"
+            return None, f"Failed to create doc: {doc}"
         doc_id = doc.get("documentId")
         if not doc_id:
-            return f"Failed to create doc: {doc}"
-        await client.post(
+            return None, f"Failed to create doc: {doc}"
+        br = await client.post(
             f"https://docs.googleapis.com/v1/documents/{doc_id}:batchUpdate",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"requests": [{"insertText": {"location": {"index": 1}, "text": content}}]},
+            json={"requests": [{"insertText": {"location": {"index": 1}, "text": body}}]},
         )
-    return f"Google Doc created: https://docs.google.com/document/d/{doc_id}"
+        if br.status_code >= 400:
+            logger.error("Google Docs batchUpdate failed: %s", br.text[:400])
+            return None, f"Failed to write doc body: {br.text[:300]}"
+    return f"https://docs.google.com/document/d/{doc_id}/edit", None
+
+
+async def create_google_doc(content: str, slack_user_id: str) -> str:
+    url, err = await create_google_doc_titled("Susan — Meeting Notes", content, slack_user_id)
+    if err:
+        return err
+    return f"Google Doc created: {url}"
 
 
 async def send_gmail(content: str, slack_user_id: str) -> str:
