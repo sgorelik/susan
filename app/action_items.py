@@ -23,7 +23,7 @@ from db import (
 )
 
 from app.claude_client import call_claude
-from app.config import logger
+from app.config import SUSAN_VOICE, logger
 from app.github_http import fetch_merged_prs_for_repo_range, fetch_opened_prs_for_repo_range
 from app.action_items_sheet import sync_action_items_sheet, sync_sheet_after_status_updates
 from app.granola_summarize import _format_notes_for_prompt, collect_granola_notes_for_window
@@ -207,6 +207,64 @@ def _format_items_for_claude(items: list[dict]) -> str:
     return "\n".join(lines)
 
 
+_TERMINAL_STATUSES = frozenset({"done", "wont_do"})
+_MAX_ITEMS_PER_ASSIGNEE = 7
+
+
+def _item_priority_key(it: dict) -> tuple[int, str]:
+    """Lower sort key = higher priority (in_progress before open)."""
+    status_rank = 0 if it.get("status") == "in_progress" else 1
+    return (status_rank, (it.get("text") or "").lower())
+
+
+def _drop_terminal_and_completed(
+    items: list[dict], existing_items: list[dict]
+) -> list[dict]:
+    """Exclude done/won't-do items and tasks already marked complete in prior rounds."""
+    terminal_ids = {
+        (it.get("id") or "").strip()
+        for it in existing_items
+        if it.get("status") in _TERMINAL_STATUSES and (it.get("id") or "").strip()
+    }
+    terminal_keys = {
+        ((it.get("text") or "").strip().lower(), it.get("assignee_slack_id"))
+        for it in existing_items
+        if it.get("status") in _TERMINAL_STATUSES
+    }
+    out: list[dict] = []
+    for it in items:
+        if it.get("status") in _TERMINAL_STATUSES:
+            continue
+        iid = (it.get("id") or "").strip()
+        if iid and iid in terminal_ids:
+            continue
+        key = ((it.get("text") or "").strip().lower(), it.get("assignee_slack_id"))
+        if key in terminal_keys:
+            continue
+        out.append(it)
+    return out
+
+
+def _cap_items_per_assignee(
+    items: list[dict], max_per: int = _MAX_ITEMS_PER_ASSIGNEE
+) -> list[dict]:
+    """Keep at most ``max_per`` highest-priority items per assignee (fewer is fine)."""
+    if not items:
+        return []
+    by_assignee: dict[str | None, list[dict]] = {}
+    for it in items:
+        aid = (it.get("assignee_slack_id") or "").strip() or None
+        by_assignee.setdefault(aid, []).append(it)
+    capped: list[dict] = []
+    for group in by_assignee.values():
+        group.sort(key=_item_priority_key)
+        capped.extend(group[:max_per])
+    # Preserve rough global priority: in_progress first, then original extraction order
+    order = {id(it): i for i, it in enumerate(items)}
+    capped.sort(key=lambda it: (_item_priority_key(it), order.get(id(it), 0)))
+    return capped
+
+
 def _parse_extraction_json(raw: str) -> list[dict]:
     text = raw.strip()
     fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
@@ -371,42 +429,40 @@ async def _extract_action_items_with_claude(
     existing_items: list[dict],
 ) -> list[dict]:
     system = cleandoc(
-        """
+        f"""
         You are Susan. Extract actionable tasks with clear owners from ALL provided sources.
+        {SUSAN_VOICE}
 
         Output ONLY valid JSON (no markdown outside the JSON):
 
-        {
+        {{
           "items": [
-            {
+            {{
               "id": "<existing uuid or null for new>",
-              "text": "<short imperative task>",
+              "text": "<short imperative task — one line>",
               "assignee_slack_id": "<Slack user id U… from transcript, or null>",
-              "status": "open|in_progress|done|wont_do",
+              "status": "open|in_progress",
               "source": "slack|granola|drive|github",
               "status_note": "<optional>"
-            }
+            }}
           ]
-        }
+        }}
 
         Where to look (scan every section — do not rely on Slack main messages alone):
-        - **Slack channel**: top-level messages AND lines indented under `[thread replies on …]`.
-          Commitments, "I'll …", "@mention please …", and numbered follow-ups in threads count.
-        - **Google Docs**: unchecked checklist items, "Action items", "TODO", "Owner", tables with
-          open tasks, and any line that implies someone still owes work. Use source "drive".
-        - **Granola notes**: "Action items", "Next steps", "Follow-ups", and transcript commitments.
-          Map owners to Slack U… ids only when the same person appears in the Slack transcript;
-          otherwise assignee_slack_id is null but still include the task (source "granola").
-        - **GitHub**: opened PRs that imply follow-up work (reviews, merges pending, TODO in title).
+        - **Slack channel**: top-level messages AND thread replies. Commitments and @mention asks count.
+        - **Google Docs**: unchecked checklist items, "Action items", "TODO", "Owner", open tasks.
+        - **Granola notes**: "Action items", "Next steps", "Follow-ups", transcript commitments.
+        - **GitHub**: opened PRs that imply follow-up work.
 
         Rules:
-        - Merge with EXISTING TRACKED ITEMS: reuse `id` when the same task; preserve
-          in_progress/done/wont_do unless sources clearly contradict.
-        - Do not re-open done/wont_do items unless explicitly reopened in new sources.
-        - Prefer Slack user ids (U…) seen anywhere in the Slack section for assignees.
-        - Include important unassigned items rather than dropping them.
-        - Deduplicate the same task across sources (one row, best source label).
-        - Maximum 25 items; prefer still-open / outstanding work.
+        - Output **only open or in_progress** items. Never include done/wont_do in JSON.
+        - **Never resurface** tasks marked done or won't do in EXISTING TRACKED ITEMS — omit them entirely,
+          even if old Slack/Docs still mention them, unless a source explicitly reopens the task.
+        - Merge with EXISTING TRACKED ITEMS: reuse `id` when the same task; preserve in_progress status.
+        - Prefer Slack user ids (U…) for assignees when seen in the Slack section.
+        - Deduplicate the same task across sources (one row).
+        - **Cap at 5–7 items per assignee** (3 is fine if that's all that matters). Rank by priority —
+          drop low-urgency noise. Overall list should be short and actionable.
         """
     )
     user_prompt = (
@@ -417,7 +473,9 @@ async def _extract_action_items_with_claude(
     )
     raw = await call_claude(system, user_prompt, max_tokens=4096, action="action_items_cmd")
     try:
-        return _parse_extraction_json(raw)
+        parsed = _parse_extraction_json(raw)
+        parsed = _drop_terminal_and_completed(parsed, existing_items)
+        return _cap_items_per_assignee(parsed)
     except json.JSONDecodeError as e:
         logger.error("Action items JSON parse failed: %s raw=%r", e, raw[:500])
         raise RuntimeError("Could not parse action items from Claude") from e

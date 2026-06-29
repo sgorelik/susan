@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from app.claude_client import call_claude
-from app.config import logger
+from app.config import SUSAN_VOICE, logger
 from app.slack_api import notify_user_ephemeral
 from app.weekly_context import parse_weekly_status_time_range
 from db import get_granola_token
@@ -299,7 +299,9 @@ async def process_granola_summarize(
 ) -> None:
     """Fetch Granola notes for the parsed window and post a Claude summary (ephemeral)."""
     since_d, until_d, label = parse_granola_time_window(remainder)
-    user_instr = (remainder or "").strip() or "Give a concise overview: themes, decisions, and follow-ups."
+    user_instr = (remainder or "").strip() or (
+        "Concise overview: top themes, decisions, and follow-ups only."
+    )
 
     try:
         token = await get_granola_token(slack_user_id)
@@ -342,10 +344,12 @@ async def process_granola_summarize(
 
     bundle = _format_notes_for_prompt(notes, max_chars=100_000)
     system = (
-        "You are Susan. The user asked for a summary of their Granola meeting notes for a specific time window. "
-        "Use only the note content provided. Be accurate; if something is not in the notes, say so. "
-        "Structure with short sections (e.g. Overview, Key themes, Decisions, Action items / follow-ups). "
-        "Use Slack mrkdwn: *bold* bullets, not **."
+        f"You are Susan. {SUSAN_VOICE} "
+        "Summarize Granola meeting notes for the given time window. "
+        "Use only provided note content; if something is missing, say so briefly. "
+        "Structure: *Overview* (2-3 lines), then *Key themes* and *Decisions* as short bullet lists "
+        "(priority order). *Action items* only if present — max 5-7, one line each. "
+        "Skip empty sections. Use Slack mrkdwn: *bold* bullets, not **."
     )
     user_prompt = (
         f"Time window: {label} ({since_d} → {until_d} UTC, inclusive dates).\n"

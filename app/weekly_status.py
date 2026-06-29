@@ -10,7 +10,7 @@ from inspect import cleandoc
 from db import create_user_draft, get_github_token
 
 from app.claude_client import call_claude
-from app.config import ACTIONS, logger
+from app.config import ACTIONS, SUSAN_VOICE, logger
 from app.github_http import (
     _pr_turnaround_hours,
     fetch_dependabot_alert_stats,
@@ -32,32 +32,34 @@ _WEEKLY_SLACK_MRKDN = cleandoc(
     only — never **double-asterisk** bold. Do not use # or ## headings. Links must use
     Slack syntax: <https://example.com/path|short visible label>. Prefer real URLs from
     the prompt (GitHub PR/issue links, Google Doc/Drive links, bookmark links); do not invent URLs.
+    Group related people with `<@U123>` mentions on the same theme line.
     """
 )
 
 _WEEKLY_STRUCTURE = cleandoc(
     """
-    **Output shape** (match a structured team update people can post as-is):
+    **Output shape** — concise, founder-ready (Jesse should be able to forward this as-is):
 
-    - First line: *Tech team update — <plain-language reporting window>* (use *Weekly update — …*
-      if the channel is not engineering-focused).
+    - First line: *Tech team update — <plain-language reporting window>*
+      (or *Weekly update — …* for non-engineering channels).
 
-    - Split the body into **workstream / project sections**. Each section starts with a bold title line:
-      *<Short workstream or initiative> (<owners>)* — owners may be Slack user ids from the transcript
-      (e.g. U01…), @mentions if they appear in the thread, or names you infer; use `<@U123>` when you have a user id.
+    - **3–6 theme sections** (not per-repo dumps). Group PRs, Slack topics, and Drive work
+      by initiative/theme (e.g. *Inference platform*, *Customer onboarding*, *Infra & reliability*).
+      Order sections by business impact — highest priority first.
 
-    - Under **each** workstream use exactly this pattern (Slack mrkdwn):
-      *1. Last week:*
-      a. …
-      b. …
-      *2. Next steps:*
-      a. …
-      b. …
+    - Each section format:
+      *<Theme> (<@U123> <@U456> — key people)>*
+      - *Shipped / progress:* 2–4 outcome bullets in plain language (impact first, not implementation detail).
+        For PRs: state the count (*12 PRs merged*) and name the theme — do **not** list every PR.
+        At most 1–2 example PR links per theme when a specific change is worth calling out.
+      - *Next:* 1–3 bullets only.
 
-    - Use sub-bullets **a. b. c.** under each numbered block. Keep lines scannable. Where a fact comes from
-      GitHub, Drive, or a linked doc, include a Slack link `<url|short label>` on that line.
-    - Optional short status hints in parentheses are fine when supported by the data, e.g. _(in progress)_
-      or _(next week)_.
+    - Skip low-signal noise, stale threads, and deep technical internals unless they affect
+      delivery or customers. Translate engineering work into outcomes a non-engineer founder understands.
+
+    - Optional one-line *GitHub snapshot* at the end: total merged PRs, top contributors — no PR-by-PR list.
+
+    - Target length: ~800–1200 words. Scannable on one Slack screen.
 
     - Close with nothing that says the message is a private draft or ephemeral.
     """
@@ -204,9 +206,9 @@ async def process_weekly_status(
         facts = "\n\n".join(github_sections)
         user_prompt = (
             f"Reporting window: {range_label}.\n"
-            "Sources (use all that apply — synthesize into the workstream sections, do not dump raw tables):\n"
+            "Sources (synthesize into themed sections — do not dump raw tables or list every PR):\n"
             f"1) Slack channel messages in the window.\n"
-            f"2) GitHub metrics and PR titles per repo (below).\n"
+            f"2) GitHub metrics and PR data per repo (below) — group by theme, cite counts not full lists.\n"
             f"3) Google Drive file activity (below), including links from channel bookmarks when present.\n\n"
             f"---\n### Slack transcript (opaque user ids U…; infer roles from content)\n{slack_digest}\n"
             f"{bookmark_section}"
@@ -216,18 +218,18 @@ async def process_weekly_status(
         system = "\n\n".join(
             [
                 cleandoc(
-                    """
-                    You are Susan, writing for an **engineering / tech** channel. Ground the update in:
-                    - Slack conversation and bookmark links,
-                    - GitHub merged/opened PR lines (each includes `html_url` when available), authors, Dependabot
-                      posture, and turnaround hints from the data,
-                    - Google Drive lines (files modified in the window under linked folders/files).
+                    f"""
+                    You are Susan, writing a weekly update for an **engineering / tech** channel
+                    that leadership will read. {SUSAN_VOICE}
 
-                    Weave GitHub facts into the *1. Last week* / *2. Next steps* bullets under the relevant workstreams.
-                    Turn each provided GitHub `html_url` into a Slack mrkdwn link `<url|#123 short title>` in the final text.
-                    If a repo does not map to a workstream, you may add one short *GitHub — misc* section.
-                    If Dependabot data was unavailable for a repo, note it briefly in place.
-                    If the Drive block is empty, skip inventing Drive content.
+                    Ground the update in Slack, GitHub, and Drive data provided — but **synthesize**:
+                    - Group merged/opened PRs by **theme**, not repository. Mention PR *counts* per theme;
+                      link at most 1–2 exemplar PRs per theme.
+                    - Weave Dependabot posture and turnaround hints into relevant themes only when material.
+                    - Tag key people per theme with `<@U…>` when you have Slack user ids from the transcript.
+                    - Outcomes and customer/delivery impact first; trim implementation jargon.
+                    If a repo does not map to a theme, fold it into the closest theme or one short bullet.
+                    If Dependabot data was unavailable, note briefly. If Drive block is empty, skip Drive content.
                     """
                 ),
                 _WEEKLY_SLACK_MRKDN,
@@ -245,11 +247,13 @@ async def process_weekly_status(
         system = "\n\n".join(
             [
                 cleandoc(
-                    """
-                    You are Susan, writing for a **general team** channel. **Do not** lead with pull requests or
-                    repo lists unless the transcript clearly discusses them. Still use the same
-                    *workstream → 1. Last week / 2. Next steps* structure and Slack links.
-                    Use Google Drive facts only from the provided Drive block; use bookmark links from the prompt when relevant.
+                    f"""
+                    You are Susan, writing a weekly update for a **general team** channel
+                    that leadership may forward to founders. {SUSAN_VOICE}
+
+                    **Do not** lead with pull requests or repo lists unless the transcript clearly discusses them.
+                    Group topics by theme; tag key people per theme with `<@U…>` when available.
+                    Outcomes and decisions first — minimal jargon. Use Drive/bookmark links only from provided data.
                     """
                 ),
                 _WEEKLY_SLACK_MRKDN,

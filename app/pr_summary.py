@@ -7,7 +7,7 @@ import json
 from db import create_user_draft, get_github_token
 
 from app.claude_client import call_claude
-from app.config import ACTIONS, logger
+from app.config import ACTIONS, SUSAN_VOICE, logger
 from app.github_http import (
     build_pr_summary_engagement_appendix,
     fetch_merged_prs_for_repo_range,
@@ -84,22 +84,18 @@ async def process_pr_summary(
     if (convo or "").strip():
         prompt += f"\nSlack thread context (optional):\n{convo.strip()[:6000]}\n"
     system = (
-        "You are Susan. Write a concise summary for Slack Block Kit *mrkdwn* (not GitHub/CommonMark). "
-        "Rules: use *single asterisks* for bold (e.g. *Major updates*); never use **double-asterisk** bold. "
-        "Do not use # or ## headings — use a short bold title on its own line instead (e.g. *Contributors*). "
-        "Use bullets with leading hyphen (-). Italic uses _underscores_ if needed. "
-        "Merged pull requests across one or more repositories. "
-        "Whenever you mention a specific PR in the body, include its repository slug in parentheses "
-        "using the exact `owner/repo` from the data, e.g. `#35 Model deployment UI cleanup (frontier-one/f1-asgardos)`. "
-        "If you use Slack link syntax, put the same slug in the visible text, e.g. "
-        "<https://github.com/…|#35 Model deployment UI cleanup (frontier-one/f1-asgardos)>. "
-        "Group by theme or area when it helps; you may group by repository or combine cross-repo themes. "
-        "State the date range and repo list at the top. "
-        "Always end with a *Contributors & commenters* section (bold title line): briefly highlight who merged the most PRs "
-        "(contributors / authors) and who was most active commenting or reviewing, informed by the "
-        "aggregated participation block in the prompt; use @login handles. "
-        "If there were zero PRs everywhere, say so and suggest widening the time range. "
-        "Do not say the summary is private, ephemeral, or “only visible to you” — the app handles visibility."
+        f"You are Susan. {SUSAN_VOICE} "
+        "Write a concise PR summary for Slack Block Kit *mrkdwn* (not GitHub/CommonMark). "
+        "Rules: use *single asterisks* for bold; never **double-asterisk** bold. "
+        "Do not use # headings — use a short bold title line instead. "
+        "Use bullets with leading hyphen (-). "
+        "Group merged PRs by **theme or area** — state PR *counts* per theme; do **not** list every PR. "
+        "At most 1–2 example PR links per theme when a specific change is worth calling out. "
+        "Whenever you mention a PR, include `owner/repo` in parentheses from the data. "
+        "State the date range and repo list at the top in one line. "
+        "End with a short *Contributors* line: top mergers and active reviewers (@login) — one line each, no tables. "
+        "If zero PRs, say so briefly. "
+        "Do not say the summary is private or ephemeral."
     )
     try:
         summary = await call_claude(system, prompt)

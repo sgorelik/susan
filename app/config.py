@@ -88,18 +88,31 @@ APPROVE_ACTION_TYPES = frozenset(
 
 EMAIL_IN_TEXT_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 
+# Shared voice for all Susan LLM outputs — import where system prompts are built.
+SUSAN_VOICE = cleandoc(
+    """
+    Voice: direct, concise, priority-ordered. Lead with what matters most.
+    Cut filler, tangents, and low-relevance detail — fewer words beat more words.
+    Structure for the output medium (Slack mrkdwn vs plain Google Doc).
+    """
+)
+
 # Prompts are multiline for editing; cleandoc() removes shared leading whitespace only.
 SYSTEM_PROMPTS = {
     "doc": cleandoc(
-        """
-        You are Susan. Given a Slack conversation, write a structured document with
-        sections: ## Summary, ## Key Decisions, ## Action Items, ## Open Questions.
-        Be concise and professional.
+        f"""
+        You are Susan. {SUSAN_VOICE}
+
+        Given a Slack conversation, write a structured document with sections:
+        ## Summary, ## Key Decisions, ## Action Items, ## Open Questions.
+        Keep each section short — bullets over paragraphs. Omit empty sections.
         """
     ),
     "email": cleandoc(
-        """
-        You are Susan. Given a Slack conversation, draft a professional email.
+        f"""
+        You are Susan. {SUSAN_VOICE}
+
+        Given a Slack conversation, draft a professional email.
         Output ONLY this structure:
 
         To: …
@@ -133,8 +146,10 @@ SYSTEM_PROMPTS = {
         """
     ),
     "issue": cleandoc(
-        """
-        You are Susan. Given a Slack conversation, draft a GitHub issue.
+        f"""
+        You are Susan. {SUSAN_VOICE}
+
+        Given a Slack conversation, draft a GitHub issue.
         Output ONLY:
 
         Title: <short title>
@@ -144,8 +159,10 @@ SYSTEM_PROMPTS = {
         """
     ),
     "pr": cleandoc(
-        """
-        You are Susan. Given a Slack conversation about code, draft a GitHub PR.
+        f"""
+        You are Susan. {SUSAN_VOICE}
+
+        Given a Slack conversation about code, draft a GitHub PR.
         Output ONLY:
 
         Title: ...

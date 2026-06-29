@@ -12,7 +12,7 @@ from typing import Any
 import httpx
 
 from app.claude_client import call_claude
-from app.config import logger
+from app.config import SUSAN_VOICE, logger
 from app.granola_summarize import collect_granola_notes_matching_terms
 from app.slack_api import (
     markdownish_to_slack_mrkdwn,
@@ -611,10 +611,9 @@ def _parse_prep_response(raw: str) -> dict[str, Any]:
 
     talking_points = _parse_string_list(data.get("talking_points"))
     action_items = _parse_string_list(data.get("action_items"))
-    if not talking_points:
+    qualification_highlights = _parse_string_list(data.get("qualification_highlights"))
+    if not talking_points and not qualification_highlights:
         raise ValueError("missing talking_points")
-    if not action_items:
-        raise ValueError("missing action_items")
 
     sections_raw = data.get("sections") or data.get("topics") or []
     if not isinstance(sections_raw, list) or not sections_raw:
@@ -632,6 +631,7 @@ def _parse_prep_response(raw: str) -> dict[str, Any]:
 
     return {
         "tldr_slack": tldr,
+        "qualification_highlights": qualification_highlights,
         "talking_points": talking_points,
         "action_items": action_items,
         "sections": sections,
@@ -671,10 +671,26 @@ def format_sales_prep_doc_content(target: str, parsed: dict[str, Any]) -> str:
         "TL;DR",
         _strip_slack_mrkdwn_for_doc(parsed["tldr_slack"]),
         "",
-        "▸ TALKING POINTS",
-        "Use these on the call — in order of priority.",
-        "",
     ]
+    qual = parsed.get("qualification_highlights") or []
+    if qual:
+        lines.extend(
+            [
+                "▸ FROM QUALIFICATION / SCOPING DOC",
+                "Must-have context for this call (from internal qualification docs).",
+                "",
+            ]
+        )
+        for i, point in enumerate(qual, 1):
+            lines.append(f"{i}. {_strip_slack_mrkdwn_for_doc(point)}")
+        lines.extend(["", "—" * 40, ""])
+    lines.extend(
+        [
+        "▸ TALKING POINTS",
+        "On the call — priority order (max ~10 total across qualification + talking points).",
+        "",
+        ]
+    )
     for i, point in enumerate(parsed["talking_points"], 1):
         lines.append(f"{i}. {_strip_slack_mrkdwn_for_doc(point)}")
     lines.extend(
@@ -859,48 +875,48 @@ async def process_sales_prep(
     system = cleandoc(
         f"""
         You are Susan, a sales preparation assistant for Frontier One (F1).
+        {SUSAN_VOICE}
 
         { _F1_CONTEXT }
 
         The user is preparing for a sales call. Synthesize:
-        1. Internal documentation provided (authoritative for F1 positioning and prior work)
+        1. Internal documentation (authoritative — especially **qualification** and **scoping** docs)
         2. Prior meeting notes (Granola) if any
-        3. Your general knowledge about the prospect company/sector — clearly label these
-           as *general knowledge* and flag anything that should be verified before the call
+        3. General knowledge about the prospect — label as *general knowledge*; flag items to verify
 
-        Focus on what helps the caller sell F1:
-        - Inference needs, GPU/ML workloads, model deployment patterns
-        - Regulatory / data residency / sovereign cloud requirements
-        - Current hyperscaler or neo-cloud usage and pain points
-        - Decision makers and buying process hints
-        - Announced projects or initiatives that may need secure inference
-        - Competitive landscape and F1 differentiation angles
-        - Suggested discovery questions and talk tracks
+        **Less is more.** The caller needs ~10 sharp points for the call, not a research report.
+        Prioritize: qualification/scoping doc facts first, then F1 fit angles.
+
+        Focus areas (only if relevant to this prospect):
+        inference needs, regulatory/sovereign requirements, hyperscaler pain, decision makers,
+        announced initiatives, competitive angles, discovery questions.
 
         Output ONLY valid JSON (no markdown fence) with this shape:
         {{
-          "tldr_slack": "<3-5 short bullets for Slack; *bold* labels ok; keep under 120 words total>",
+          "tldr_slack": "<3-4 bullets for Slack; *bold* labels; under 80 words total>",
+          "qualification_highlights": [
+            "<fact or requirement from qualification/scoping docs — highest priority>"
+          ],
           "talking_points": [
-            "<priority-ordered point to raise on the call>",
-            "..."
+            "<priority-ordered point for the call — include qual doc items not duplicated above>"
           ],
           "action_items": [
-            "<concrete before/during/after call task>",
-            "..."
+            "<essential prep only — before/during/after; 0-3 items>"
           ],
           "sections": [
-            {{"title": "<section title>", "body": "<detailed plain-text paragraphs and bullets>"}},
-            ...
+            {{"title": "<short section title>", "body": "<brief plain-text bullets — no essays>"}}
           ]
         }}
 
         Requirements:
-        - ``tldr_slack``: scannable bullets only — what matters most going into the call.
-        - ``talking_points``: 5-8 specific, F1-relevant points to say (not generic fluff).
-        - ``action_items``: 4-8 checkboxes — prep work, questions to ask, follow-ups after.
-        - ``sections``: 4-7 deeper sections (company context, inference/regulatory needs,
-          hyperscaler landscape, decision makers, F1 fit, competitive angles, discovery questions).
-          Use plain text in section bodies (no Slack mrkdwn).
+        - ``qualification_highlights``: pull every important fact from qualification/scoping docs
+          (budget, timeline, stakeholders, technical requirements, blockers). 0-5 items; skip if no qual doc.
+        - ``talking_points``: **max 10 total** across qualification_highlights + talking_points for the call.
+          No generic fluff. Drop low-relevance industry background.
+        - ``tldr_slack``: only what matters going into the call — scannable in 10 seconds.
+        - ``action_items``: 0-3 essential prep tasks only (fewer is better).
+        - ``sections``: 3-4 short reference sections max (company context, F1 fit, competitive, discovery).
+          Plain text; tight bullets not paragraphs.
         """
     )
 

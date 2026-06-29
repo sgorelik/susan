@@ -102,12 +102,15 @@ def test_format_sales_prep_doc_content() -> None:
 
     parsed = {
         "tldr_slack": "• Key insight",
+        "qualification_highlights": ["Budget approved Q3", "CTO is decision maker"],
         "talking_points": ["Lead with F1", "Ask about compliance"],
-        "action_items": ["Send deck", "Book follow-up"],
+        "action_items": ["Send deck"],
         "sections": [{"title": "Company", "body": "Large enterprise."}],
     }
     doc = format_sales_prep_doc_content("Acme Corp", parsed)
     assert "Sales Call Prep — Acme Corp" in doc
+    assert "▸ FROM QUALIFICATION / SCOPING DOC" in doc
+    assert "Budget approved Q3" in doc
     assert "▸ TALKING POINTS" in doc
     assert "▸ ACTION ITEMS" in doc
     assert "☐ Send deck" in doc
