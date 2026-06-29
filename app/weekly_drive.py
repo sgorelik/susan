@@ -131,7 +131,13 @@ def _drive_work_attribution(file_meta: dict) -> str:
     return "unknown"
 
 
-def _drive_file_record(file_meta: dict, fid: str) -> dict:
+def _drive_file_record(
+    file_meta: dict,
+    fid: str,
+    *,
+    shared_in_channel: bool = False,
+    modified_in_window: bool = False,
+) -> dict:
     return {
         "name": (file_meta.get("name") or fid).replace("\n", " "),
         "mimeType": file_meta.get("mimeType") or "",
@@ -139,7 +145,51 @@ def _drive_file_record(file_meta: dict, fid: str) -> dict:
         "webViewLink": file_meta.get("webViewLink")
         or f"https://drive.google.com/file/d/{fid}/view",
         "attribution": _drive_work_attribution(file_meta),
+        "shared_in_channel": shared_in_channel,
+        "modified_in_window": modified_in_window,
     }
+
+
+def _drive_upsert_record(out: dict[str, dict], fid: str, record: dict) -> None:
+    existing = out.get(fid)
+    if not existing:
+        out[fid] = record
+        return
+    if record.get("shared_in_channel"):
+        existing["shared_in_channel"] = True
+    if record.get("modified_in_window"):
+        existing["modified_in_window"] = True
+
+
+def _format_drive_activity_line(it: dict) -> str:
+    mt = (it.get("modifiedTime") or "")[:19].replace("T", " ")
+    who = it.get("attribution") or "unknown"
+    tags: list[str] = []
+    if it.get("shared_in_channel"):
+        tags.append("shared in Slack this week")
+    if it.get("modified_in_window"):
+        tags.append("modified in window")
+    tag_s = f" ({'; '.join(tags)})" if tags else ""
+    return (
+        f"- {it['name']} ({_drive_mime_label(it.get('mimeType', ''))}) — "
+        f"by {who}{tag_s} — modified {mt} UTC — {it.get('webViewLink', '')}"
+    )
+
+
+def channel_google_urls_from_slack(slack_digest: str) -> list[str]:
+    """Google Doc/Drive URLs posted in Slack channel messages (deduped)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in extract_google_urls_from_slack_transcript(slack_digest):
+        if "google.com" not in u.lower():
+            continue
+        # Bare-url regex can capture trailing `|label` from mrkdwn links — strip it.
+        clean = u.split("|", 1)[0].strip()
+        key = clean.split("?", 1)[0] if "drive.google.com" in clean.lower() else clean
+        if key not in seen:
+            seen.add(key)
+            out.append(clean)
+    return out
 
 
 def _drive_mime_label(mime: str) -> str:
@@ -265,7 +315,11 @@ async def _drive_walk_folder(
                 mod = f.get("modifiedTime")
                 if _drive_modified_in_window(mod, start, end) and fid not in out:
                     if budget.take_hit():
-                        out[fid] = _drive_file_record(f, fid)
+                        _drive_upsert_record(
+                            out,
+                            fid,
+                            _drive_file_record(f, fid, modified_in_window=True),
+                        )
         if not page_token:
             break
 
@@ -279,6 +333,9 @@ async def _drive_process_linked_id(
     budget: _WeeklyDriveBudget,
     out: dict[str, dict],
     max_depth: int,
+    *,
+    require_modified_in_window: bool = True,
+    shared_in_channel: bool = False,
 ) -> None:
     if not budget.take_call():
         return
@@ -292,9 +349,21 @@ async def _drive_process_linked_id(
         )
         return
     mod = meta.get("modifiedTime")
-    if _drive_modified_in_window(mod, start, end) and file_id not in out:
-        if budget.take_hit():
-            out[file_id] = _drive_file_record(meta, file_id)
+    in_window = _drive_modified_in_window(mod, start, end)
+    if require_modified_in_window and not in_window:
+        return
+    if not budget.take_hit():
+        return
+    _drive_upsert_record(
+        out,
+        file_id,
+        _drive_file_record(
+            meta,
+            file_id,
+            shared_in_channel=shared_in_channel,
+            modified_in_window=in_window,
+        ),
+    )
 
 
 async def weekly_status_drive_activity_block(
@@ -305,12 +374,13 @@ async def weekly_status_drive_activity_block(
     *,
     extra_google_urls: Sequence[str] | None = None,
 ) -> str:
-    """Facts for Claude: Drive files under linked folders / linked files modified in the status window.
+    """Drive facts for weekly status: docs shared in Slack + files modified in linked folders.
 
-    ``extra_google_urls`` adds Google Docs/Drive links (e.g. from Slack *channel bookmarks*)
-    in addition to URLs parsed from ``slack_digest``.
+    Documents linked in channel messages during the reporting window are always included,
+    even if their Drive ``modifiedTime`` is older. Folder scans still filter by modified time.
     """
-    urls = [u for u in extract_google_urls_from_slack_transcript(slack_digest) if "google.com" in u.lower()]
+    channel_urls = channel_google_urls_from_slack(slack_digest)
+    urls = list(channel_urls)
     seen: set[str] = set(urls)
     for raw in extra_google_urls or ():
         u = (raw or "").strip()
@@ -322,6 +392,8 @@ async def weekly_status_drive_activity_block(
             urls.append(u)
 
     folders, file_ids = parse_google_drive_targets_from_urls(urls)
+    _, channel_file_ids = parse_google_drive_targets_from_urls(channel_urls)
+    channel_file_id_set = set(channel_file_ids)
     if not folders and not file_ids:
         return ""
 
@@ -331,11 +403,11 @@ async def weekly_status_drive_activity_block(
     max_calls = max(10, min(300, int(os.environ.get("WEEKLY_DRIVE_MAX_API_CALLS", "100"))))
     folders = folders[:max_folders]
 
-    src_note = "URLs from channel messages and channel bookmarks"
     header = (
-        "\n---\n### Google Drive "
-        f"({src_note}; modifiedTime in UTC within the reporting window)\n"
-        f"_Window: {since_d} through {until_d}._\n"
+        "\n---\n### Google Drive & docs\n"
+        f"_Window: {since_d} through {until_d} (UTC). "
+        "Includes documents **linked in Slack channel messages** this week and files "
+        "**modified** under linked folders/files._\n"
     )
 
     if not await user_has_google_tokens(slack_user_id):
@@ -363,8 +435,18 @@ async def weekly_status_drive_activity_block(
                     client, headers, fid, 0, max_depth, start, end, budget, out
                 )
             for fid in file_ids:
+                is_channel_share = fid in channel_file_id_set
                 await _drive_process_linked_id(
-                    client, headers, fid, start, end, budget, out, max_depth
+                    client,
+                    headers,
+                    fid,
+                    start,
+                    end,
+                    budget,
+                    out,
+                    max_depth,
+                    require_modified_in_window=not is_channel_share,
+                    shared_in_channel=is_channel_share,
                 )
     except Exception as e:
         logger.exception("weekly Drive scan failed")
@@ -382,22 +464,27 @@ async def weekly_status_drive_activity_block(
             "`drive.metadata.readonly`, then revoke and run `/susan connect google` again.\n"
         )
 
-    items = sorted(out.values(), key=lambda x: x.get("modifiedTime") or "")
-    if not items and not err:
+    shared = [it for it in out.values() if it.get("shared_in_channel")]
+    modified_only = [
+        it for it in out.values() if it.get("modified_in_window") and not it.get("shared_in_channel")
+    ]
+    if not out and not err:
         lines.append(
-            "(No files found with modifiedTime in this window under linked folders/files, "
-            "or nothing is accessible to the connected Google account.)\n"
+            "(No Google Docs/Drive links in channel messages and no files modified in "
+            "linked folders/files this window.)\n"
         )
     else:
-        for it in items:
-            mt = (it.get("modifiedTime") or "")[:19].replace("T", " ")
-            who = it.get("attribution") or "unknown"
-            lines.append(
-                f"- {it['name']} ({_drive_mime_label(it.get('mimeType', ''))}) — "
-                f"by {who} — modified {mt} UTC — {it.get('webViewLink', '')}"
-            )
-        lines.append("")
-    return "\n".join(lines)
+        if shared:
+            lines.append("**Documents shared in Slack this week** (include in weekly themes):\n")
+            for it in sorted(shared, key=lambda x: x.get("name") or ""):
+                lines.append(_format_drive_activity_line(it))
+            lines.append("")
+        if modified_only:
+            lines.append("**Files modified in window** (from linked folders/files):\n")
+            for it in sorted(modified_only, key=lambda x: x.get("modifiedTime") or ""):
+                lines.append(_format_drive_activity_line(it))
+            lines.append("")
+    return "\n".join(lines).strip() + "\n"
 
 
 def extract_plain_text_from_google_doc(doc: dict) -> str:

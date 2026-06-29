@@ -43,6 +43,8 @@ _WEEKLY_ATTRIBUTION = cleandoc(
       Do **not** credit reviewers, commenters, or merge-by users unless they also opened PRs on that theme.
     - **Google Drive:** credit the **owner or last editor** shown on each Drive line (`by owner: …`).
       Do **not** credit people who only commented in Slack about a doc.
+    - Include **documents shared in Slack this week** (the “Documents shared in Slack” section) in the
+      relevant theme — even if the doc was not modified recently.
     - **Slack:** use `<@U…>` for people who posted substantive updates or decisions in the transcript.
     - Map GitHub `@login` or Drive names to `<@U…>` only when the same person clearly appears in the Slack transcript.
     """
@@ -224,7 +226,7 @@ async def process_weekly_status(
             "Sources (synthesize into themed sections — do not dump raw tables or list every PR):\n"
             f"1) Slack channel messages in the window.\n"
             f"2) GitHub metrics and PR data per repo (below) — group by theme, cite counts not full lists.\n"
-            f"3) Google Drive file activity (below), including links from channel bookmarks when present.\n\n"
+            f"3) Google Drive (below): docs **linked in channel messages** this week plus files modified under linked folders.\n\n"
             f"---\n### Slack transcript (opaque user ids U…; infer roles from content)\n{slack_digest}\n"
             f"{bookmark_section}"
             f"---\n### GitHub (all configured repos for this weekly run)\n{facts}"
