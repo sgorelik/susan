@@ -106,6 +106,42 @@ def _drive_modified_in_window(mod_iso: str | None, start: object, end: object) -
     return start <= t <= end
 
 
+_DRIVE_FILE_FIELDS = (
+    "id,name,mimeType,modifiedTime,webViewLink,"
+    "owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress)"
+)
+
+
+def _drive_work_attribution(file_meta: dict) -> str:
+    """Who did the work on a Drive file — owner or last editor, not commenters."""
+    owner = None
+    owners = file_meta.get("owners") or []
+    if owners and isinstance(owners[0], dict):
+        owner = owners[0].get("displayName") or owners[0].get("emailAddress")
+    editor = None
+    lmu = file_meta.get("lastModifyingUser")
+    if isinstance(lmu, dict):
+        editor = lmu.get("displayName") or lmu.get("emailAddress")
+    if editor and owner and str(editor).lower() != str(owner).lower():
+        return f"owner: {owner}; last editor: {editor}"
+    if editor:
+        return f"last editor: {editor}"
+    if owner:
+        return f"owner: {owner}"
+    return "unknown"
+
+
+def _drive_file_record(file_meta: dict, fid: str) -> dict:
+    return {
+        "name": (file_meta.get("name") or fid).replace("\n", " "),
+        "mimeType": file_meta.get("mimeType") or "",
+        "modifiedTime": file_meta.get("modifiedTime") or "",
+        "webViewLink": file_meta.get("webViewLink")
+        or f"https://drive.google.com/file/d/{fid}/view",
+        "attribution": _drive_work_attribution(file_meta),
+    }
+
+
 def _drive_mime_label(mime: str) -> str:
     if "document" in mime:
         return "Google Doc"
@@ -148,7 +184,7 @@ async def _drive_list_children_page(
 ) -> tuple[list[dict], str | None]:
     params: dict[str, str] = {
         "q": f"'{folder_id}' in parents and trashed = false",
-        "fields": "nextPageToken, files(id,name,mimeType,modifiedTime,webViewLink)",
+        "fields": f"nextPageToken, files({_DRIVE_FILE_FIELDS})",
         "pageSize": "100",
         "supportsAllDrives": "true",
         "includeItemsFromAllDrives": "true",
@@ -181,7 +217,7 @@ async def _drive_get_file_meta(
         f"https://www.googleapis.com/drive/v3/files/{file_id}",
         headers=headers,
         params={
-            "fields": "id,name,mimeType,modifiedTime,webViewLink",
+            "fields": _DRIVE_FILE_FIELDS,
             "supportsAllDrives": "true",
         },
     )
@@ -229,13 +265,7 @@ async def _drive_walk_folder(
                 mod = f.get("modifiedTime")
                 if _drive_modified_in_window(mod, start, end) and fid not in out:
                     if budget.take_hit():
-                        out[fid] = {
-                            "name": (f.get("name") or fid).replace("\n", " "),
-                            "mimeType": mid,
-                            "modifiedTime": mod or "",
-                            "webViewLink": f.get("webViewLink")
-                            or f"https://drive.google.com/file/d/{fid}/view",
-                        }
+                        out[fid] = _drive_file_record(f, fid)
         if not page_token:
             break
 
@@ -264,13 +294,7 @@ async def _drive_process_linked_id(
     mod = meta.get("modifiedTime")
     if _drive_modified_in_window(mod, start, end) and file_id not in out:
         if budget.take_hit():
-            out[file_id] = {
-                "name": (meta.get("name") or file_id).replace("\n", " "),
-                "mimeType": mid,
-                "modifiedTime": mod or "",
-                "webViewLink": meta.get("webViewLink")
-                or f"https://drive.google.com/file/d/{file_id}/view",
-            }
+            out[file_id] = _drive_file_record(meta, file_id)
 
 
 async def weekly_status_drive_activity_block(
@@ -367,8 +391,10 @@ async def weekly_status_drive_activity_block(
     else:
         for it in items:
             mt = (it.get("modifiedTime") or "")[:19].replace("T", " ")
+            who = it.get("attribution") or "unknown"
             lines.append(
-                f"- {it['name']} ({_drive_mime_label(it.get('mimeType', ''))}) — modified {mt} UTC — {it.get('webViewLink', '')}"
+                f"- {it['name']} ({_drive_mime_label(it.get('mimeType', ''))}) — "
+                f"by {who} — modified {mt} UTC — {it.get('webViewLink', '')}"
             )
         lines.append("")
     return "\n".join(lines)

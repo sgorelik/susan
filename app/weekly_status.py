@@ -36,6 +36,18 @@ _WEEKLY_SLACK_MRKDN = cleandoc(
     """
 )
 
+_WEEKLY_ATTRIBUTION = cleandoc(
+    """
+    **Attribution rules** (who gets credit on each theme line):
+    - **GitHub:** credit the **PR author/opener** (`@login` on each PR line in the data).
+      Do **not** credit reviewers, commenters, or merge-by users unless they also opened PRs on that theme.
+    - **Google Drive:** credit the **owner or last editor** shown on each Drive line (`by owner: …`).
+      Do **not** credit people who only commented in Slack about a doc.
+    - **Slack:** use `<@U…>` for people who posted substantive updates or decisions in the transcript.
+    - Map GitHub `@login` or Drive names to `<@U…>` only when the same person clearly appears in the Slack transcript.
+    """
+)
+
 _WEEKLY_STRUCTURE = cleandoc(
     """
     **Output shape** — concise, founder-ready (Jesse should be able to forward this as-is):
@@ -48,7 +60,7 @@ _WEEKLY_STRUCTURE = cleandoc(
       Order sections by business impact — highest priority first.
 
     - Each section format:
-      *<Theme> (<@U123> <@U456> — key people)>*
+      *<Theme> (<@U123> @github-login — people who **shipped** this work)>*
       - *Shipped / progress:* 2–4 outcome bullets in plain language (impact first, not implementation detail).
         For PRs: state the count (*12 PRs merged*) and name the theme — do **not** list every PR.
         At most 1–2 example PR links per theme when a specific change is worth calling out.
@@ -57,7 +69,7 @@ _WEEKLY_STRUCTURE = cleandoc(
     - Skip low-signal noise, stale threads, and deep technical internals unless they affect
       delivery or customers. Translate engineering work into outcomes a non-engineer founder understands.
 
-    - Optional one-line *GitHub snapshot* at the end: total merged PRs, top contributors — no PR-by-PR list.
+    - Optional one-line *GitHub snapshot* at the end: total merged PRs, top **PR authors (openers)** — no PR-by-PR list.
 
     - Target length: ~800–1200 words. Scannable on one Slack screen.
 
@@ -172,19 +184,21 @@ async def process_weekly_status(
                 num = it.get("number")
                 pr_title = ((it.get("title") or "") or "").replace("\n", " ")[:220]
                 url = ((it.get("html_url") or "") or "").strip()
+                login = (it.get("user") or {}).get("login") or "?"
                 if url:
-                    merged_lines.append(f"- {url} — #{num} {pr_title}")
+                    merged_lines.append(f"- {url} — #{num} opener=@{login} | {pr_title}")
                 elif num is not None:
-                    merged_lines.append(f"- #{num} {pr_title}")
+                    merged_lines.append(f"- #{num} opener=@{login} | {pr_title}")
             opened_lines: list[str] = []
             for x in opened[:30]:
                 num = x.get("number")
                 t = ((x.get("title") or "") or "").replace("\n", " ")[:220]
                 url = ((x.get("html_url") or "") or "").strip()
+                login = (x.get("user") or {}).get("login") or "?"
                 if url:
-                    opened_lines.append(f"- {url} — #{num} {t}")
+                    opened_lines.append(f"- {url} — #{num} opener=@{login} | {t}")
                 elif num is not None:
-                    opened_lines.append(f"- #{num} {t}")
+                    opened_lines.append(f"- #{num} opener=@{login} | {t}")
             avg_part = (
                 f"{avg_h:.1f}"
                 if avg_h is not None
@@ -197,7 +211,8 @@ async def process_weekly_status(
                 f"{dep_lines}\n"
                 f"PRs opened in window: {len(opened)}; merged in window: {len(merged)}.\n"
                 f"Average merge turnaround (hours): {avg_part}.\n"
-                f"Top merged-PR authors: {', '.join(f'@{a} ({c})' for a, c in top_authors) or 'none'}.\n"
+                f"Top merged-PR authors (openers — use for attribution, not reviewers): "
+                f"{', '.join(f'@{a} ({c})' for a, c in top_authors) or 'none'}.\n"
                 f"Merged PRs (titles also as quick scan): {'; '.join(titles[:50])}\n"
                 f"Merged PRs with `html_url` (use for Slack links):\n{merged_block}\n"
                 f"Opened PRs with `html_url`:\n{opened_block}\n"
@@ -225,13 +240,16 @@ async def process_weekly_status(
                     Ground the update in Slack, GitHub, and Drive data provided — but **synthesize**:
                     - Group merged/opened PRs by **theme**, not repository. Mention PR *counts* per theme;
                       link at most 1–2 exemplar PRs per theme.
+                    - Credit **PR openers** (`opener=@login` on each PR line) on theme headers — not reviewers.
+                    - Credit **Drive owners/editors** (`by owner: …` on each Drive line) — not Slack commenters.
                     - Weave Dependabot posture and turnaround hints into relevant themes only when material.
-                    - Tag key people per theme with `<@U…>` when you have Slack user ids from the transcript.
+                    - Tag shippers per theme with `@github-login` and `<@U…>` when mappable from Slack.
                     - Outcomes and customer/delivery impact first; trim implementation jargon.
                     If a repo does not map to a theme, fold it into the closest theme or one short bullet.
                     If Dependabot data was unavailable, note briefly. If Drive block is empty, skip Drive content.
                     """
                 ),
+                _WEEKLY_ATTRIBUTION,
                 _WEEKLY_SLACK_MRKDN,
                 _WEEKLY_STRUCTURE,
             ]
@@ -252,10 +270,12 @@ async def process_weekly_status(
                     that leadership may forward to founders. {SUSAN_VOICE}
 
                     **Do not** lead with pull requests or repo lists unless the transcript clearly discusses them.
-                    Group topics by theme; tag key people per theme with `<@U…>` when available.
+                    Group topics by theme; credit **Drive owners/editors** and people who **posted** substantive
+                    Slack updates — not passive commenters. Use `<@U…>` for Slack; map Drive names when clear.
                     Outcomes and decisions first — minimal jargon. Use Drive/bookmark links only from provided data.
                     """
                 ),
+                _WEEKLY_ATTRIBUTION,
                 _WEEKLY_SLACK_MRKDN,
                 _WEEKLY_STRUCTURE,
             ]
@@ -263,7 +283,13 @@ async def process_weekly_status(
 
     max_tok = max(1500, min(32000, int(os.environ.get("WEEKLY_STATUS_MAX_TOKENS", "8192"))))
     try:
-        summary = await call_claude(system, user_prompt, max_tokens=max_tok, action="weekly_status")
+        summary = await call_claude(
+            system,
+            user_prompt,
+            max_tokens=max_tok,
+            action="weekly_status",
+            model_route="commercial",
+        )
     except Exception as e:
         logger.exception("Weekly status Claude failed")
         await notify_user_ephemeral(channel, user, f"Susan error: {e}", None, response_url)

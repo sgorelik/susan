@@ -18,6 +18,7 @@ COMMERCIAL_ACTIONS = frozenset(
 # Default Anthropic model per commercial action (override via env, e.g. SALES_PREP_ANTHROPIC_MODEL).
 COMMERCIAL_ACTION_MODELS: dict[str, str] = {
     "sales_prep": "claude-opus-4-6",
+    "weekly_status": "claude-opus-4-6",
 }
 
 
