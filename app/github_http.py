@@ -1,4 +1,4 @@
-"""GitHub REST: PR search, Dependabot, participants, file commits."""
+"""GitHub REST: PR/issue search, issue reads, Dependabot, participants, file commits."""
 from __future__ import annotations
 
 import asyncio
@@ -49,6 +49,73 @@ async def fetch_opened_prs_for_repo_range(
             if len(batch) < 100:
                 break
     return items
+
+
+async def search_issues(q: str, token: str, *, max_pages: int = 5, sort: str = "updated") -> list[dict]:
+    """Issue/PR search (``/search/issues``) for an arbitrary query string."""
+    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    items: list[dict] = []
+    async with httpx.AsyncClient(timeout=60) as client:
+        for page in range(1, max(1, max_pages) + 1):
+            r = await client.get(
+                "https://api.github.com/search/issues",
+                headers=hdrs,
+                params={"q": q, "per_page": 100, "page": page, "sort": sort, "order": "desc"},
+            )
+            data = r.json()
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"GitHub search failed ({r.status_code}): {data.get('message', data)}"
+                )
+            batch = data.get("items") or []
+            items.extend(batch)
+            if len(batch) < 100:
+                break
+    return items
+
+
+async def fetch_issue(repo: str, number: int, token: str) -> dict | None:
+    """One issue (or PR) with body, labels, state. None when not visible."""
+    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    async with httpx.AsyncClient(timeout=45) as client:
+        r = await client.get(
+            f"https://api.github.com/repos/{repo}/issues/{number}", headers=hdrs
+        )
+    if r.status_code != 200:
+        logger.warning("GitHub issue fetch failed %s#%s: %s", repo, number, r.status_code)
+        return None
+    data = r.json()
+    return data if isinstance(data, dict) else None
+
+
+async def fetch_issue_comments(
+    repo: str, number: int, token: str, *, max_comments: int = 40
+) -> list[dict]:
+    """Comments on an issue, oldest first, capped."""
+    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        out = await _github_list_all_pages(
+            client, f"https://api.github.com/repos/{repo}/issues/{number}/comments", hdrs, 3
+        )
+    return out[-max_comments:] if max_comments else out
+
+
+async def github_create_issue(
+    repo: str, title: str, body: str, token: str, *, labels: list[str] | None = None
+) -> dict:
+    """Create an issue and return the raw GitHub payload (includes ``node_id`` for board writes)."""
+    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    payload: dict = {"title": title, "body": body}
+    if labels:
+        payload["labels"] = labels
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"https://api.github.com/repos/{repo}/issues", headers=hdrs, json=payload
+        )
+    data = r.json()
+    if r.status_code >= 400:
+        raise RuntimeError(f"GitHub issue error ({r.status_code}): {data}")
+    return data if isinstance(data, dict) else {}
 
 
 async def fetch_dependabot_alert_stats(

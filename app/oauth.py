@@ -154,7 +154,11 @@ def _github_oauth_configured() -> bool:
 
 def github_authorize_url(state: str) -> str:
     redirect_uri = os.environ["GITHUB_REDIRECT_URI"]
-    scope = (os.environ.get("GITHUB_OAUTH_SCOPE") or "repo").strip() or "repo"
+    # read:project is what lets Susan see roadmap board fields (Status / Phase / Priority);
+    # they are GraphQL-only and invisible to `repo` alone.
+    scope = (
+        os.environ.get("GITHUB_OAUTH_SCOPE") or "repo read:project"
+    ).strip() or "repo read:project"
     params = {
         "client_id": os.environ["GITHUB_CLIENT_ID"],
         "redirect_uri": redirect_uri,

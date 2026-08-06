@@ -77,13 +77,35 @@ ACTIONS = {
         "sales call prep",
         [],  # Routed via `/susan prep me for a sales call with …` (explicit parser).
     ),
+    "surface_standups": (
+        "standup notes summary",
+        [],  # Routed via `/susan standups …` (explicit parser).
+    ),
+    "surface_failures": (
+        "failing alerts digest",
+        [],  # Routed via `/susan failures` / `surface failures` (explicit parser).
+    ),
+    "surface_reviews": (
+        "items needing your review",
+        [],  # Routed via `/susan needs my review` / `surface reviews` (explicit parser).
+    ),
     "pr": ("create a GitHub PR", ["pull request", "create pr", "open pr", "pr"]),
 }
 
 GOOGLE_ACTIONS = frozenset({"doc", "email", "invite"})
 GITHUB_ACTIONS = frozenset({"pr", "issue", "pr_summary"})
 APPROVE_ACTION_TYPES = frozenset(
-    {"doc", "email", "invite", "pr", "issue", "pr_summary", "weekly_status", "action_items"}
+    {
+        "doc",
+        "email",
+        "invite",
+        "pr",
+        "issue",
+        "pr_summary",
+        "weekly_status",
+        "action_items",
+        "roadmap_add",
+    }
 )
 
 EMAIL_IN_TEXT_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")

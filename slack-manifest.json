@@ -20,7 +20,7 @@
         "command": "/susan",
         "url": "https://your-host.example/susan",
         "description": "Ask Susan to act on this channel or thread",
-        "usage_hint": "help | connect | actions | weekly status [--no-approval] | granola | summarize prs … | …",
+        "usage_hint": "help | standups | surface failures | needs my review | actions | weekly status | granola | …",
         "should_escape": false
       }
     ]
@@ -33,7 +33,9 @@
         "chat:write.public",
         "channels:history",
         "channels:join",
+        "channels:read",
         "groups:history",
+        "groups:read",
         "im:history",
         "im:write",
         "mpim:history",

@@ -17,6 +17,7 @@ from app.google_workspace import create_calendar_invite, create_google_doc, send
 from app.action_items import publish_action_items_digest
 from app.action_items_sheet import sync_action_items_sheet
 from app.pr_summary import process_pr_summary
+from app.roadmap import publish_roadmap_issue
 from app.slack_commands import (
     SLACK_CB_EMAIL_MODAL,
     SLACK_CB_INVITE_MODAL,
@@ -620,6 +621,27 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                 except (json.JSONDecodeError, TypeError, RuntimeError) as e:
                     logger.exception("action_items post failed")
                     result = f"Susan error posting action items: {e}"
+            elif action_type == "roadmap_add":
+                if not _looks_like_draft_id(value):
+                    await post_ephemeral(
+                        channel,
+                        user,
+                        "Invalid roadmap draft. Run `/susan roadmap add …` again.",
+                    )
+                    return
+                row = await consume_user_draft(value, user)
+                if not row or row.get("kind") != "roadmap_add":
+                    await post_ephemeral(
+                        channel,
+                        user,
+                        "That roadmap draft expired. Run `/susan roadmap add …` again.",
+                    )
+                    return
+                try:
+                    result = await publish_roadmap_issue(json.loads(row["content"]), user)
+                except (json.JSONDecodeError, TypeError, ValueError, RuntimeError) as e:
+                    logger.exception("roadmap issue filing failed")
+                    result = f"Susan error filing the roadmap issue: {e}"
             elif action_type == "pr":
                 result = await create_github_pr(value, user)
             else:
