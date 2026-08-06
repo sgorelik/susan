@@ -12,6 +12,18 @@ COMMERCIAL_ACTIONS = frozenset(
         "weekly_status",
         "granola_cmd",
         "action_items_cmd",
+        "surface_standups",
+        "surface_failures",
+        "surface_reviews",
+        # Roadmap board questions: large board + epic + activity context, and the answers
+        # get repeated to customers and investors.
+        "roadmap_status",
+        "roadmap_pack",
+        "roadmap_risks",
+        "roadmap_claims",
+        "roadmap_customer",
+        "roadmap_ask",
+        "roadmap_add",
     }
 )
 
@@ -19,6 +31,8 @@ COMMERCIAL_ACTIONS = frozenset(
 COMMERCIAL_ACTION_MODELS: dict[str, str] = {
     "sales_prep": "claude-opus-4-6",
     "weekly_status": "claude-opus-4-6",
+    "roadmap_status": "claude-opus-4-6",
+    "roadmap_pack": "claude-opus-4-6",
 }
 
 

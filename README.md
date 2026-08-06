@@ -95,7 +95,45 @@ Run tests / checks (if you add them): `python -m py_compile app/*.py` is a minim
 - `/susan create issue …`, `create pr …` (GitHub OAuth + allowlists)
 - `/susan summarize merged prs …` / keywords like `pr summary` — merged PRs over a date range, preview then approve to post to channel
 - `/susan weekly status …` — Structured update (*workstreams* with *1. Last week* / *2. Next steps* and links) from **Slack messages**, **channel bookmarks**, **Google Drive**, and **all `GITHUB_REPOS`** in tech channels. Publishes the full report to a **Slack Canvas** and posts a short link in the channel (needs `canvases:write` + `files:read`; falls back to long channel messages if Canvas is unavailable). Optional `--no-approval` (restrict with `SUSAN_WEEKLY_AUTO_POST_USER_IDS`).
+- `/susan standups …` — Summarize daily standup notes from `#team-tech` (threads) for a date window
+- `/susan surface failures` / `what's failing` — Digest of failing CI/promote/cost alerts from configured alert channels
+- `/susan needs my review` / `surface reviews` — PRs and asks that need *your* review (alerts + `#team-tech`)
+- `/susan board status` · `board pack` · `board risks` · `board claims` · `customer ask <name>` · `roadmap <question>` · `roadmap add <decision>` — the **roadmap board** (see below)
 - `/susan help` — full in-Slack help
+
+## Roadmap board (GitHub Projects v2)
+
+Susan can answer questions about an org-level GitHub **project board** — the plan of record —
+in plain English from Slack. The user-facing guide is
+[docs/ROADMAP_WITH_SUSAN.md](docs/ROADMAP_WITH_SUSAN.md).
+
+| Command | What you get |
+|---------|--------------|
+| `/susan board status [last 14 days]` | Weekly digest: shipped, moved-but-not-done, blocked (and on whom), decisions we owe |
+| `/susan board pack` | Board/investor update, with an honest read on anything *Partial* or *Done (dev)* |
+| `/susan board risks` | P0/P1 items that would stop a pilot handover, ranked by what breaks first |
+| `/susan board claims` | Safe-to-say-today versus do-not-claim, with issue numbers |
+| `/susan customer ask <name>` | Commitments to a customer, current status, and what we await from them |
+| `/susan roadmap <question>` | Anything else, answered from the board and the tracking epic |
+| `/susan roadmap add <decision>` | Duplicate check, then a drafted roadmap issue — **previewed before filing** |
+
+Answers are ephemeral (only you see them); `--no-approval` posts to the channel instead, and
+`/susan schedule add board status last 7 days every monday at 9:00 in #team-tech` makes the digest
+a standing job.
+
+**How it stays honest.** Board fields (`Status`, `Phase`, `Priority`) live in Projects v2 and are
+GraphQL-only, so `app/github_graphql.py` reads them directly rather than inferring status from issue
+text. Susan quotes the Status word verbatim, treats *Partial* and *Done (dev)* as **not done**,
+computes the counts in Python before the model sees them (`render_board_arithmetic`), cites
+`repo#number` for every claim, and reports board/issue disagreements as findings. Read-only
+throughout: Susan files issues and opens PRs, and never merges.
+
+**Setup.** Add `read:project` to `GITHUB_OAUTH_SCOPE` (the new default is `repo read:project`) and
+have each user re-run `/susan connect github`; a shared `GITHUB_TOKEN` PAT must be re-issued with the
+same scope. Then set `SUSAN_ROADMAP_ORG`, `SUSAN_ROADMAP_PROJECT`, `SUSAN_ROADMAP_EPIC` and
+`SUSAN_ROADMAP_REPOS` — full list in `.env.example`. Putting a newly filed issue **onto** the board
+is opt-in via `SUSAN_ROADMAP_BOARD_WRITE=true`, which needs the wider `project` scope; with it off,
+the proposed field values go into the issue body for a human to set.
 
 ## Environment variables
 
@@ -119,7 +157,13 @@ Run tests / checks (if you add them): `python -m py_compile app/*.py` is a minim
 | `GITHUB_REPOS` | **Recommended** for teams | Comma-separated allowlist; enables safe repo pickers |
 | `GITHUB_ISSUES_REPO` | Optional | Default repo for issues |
 | `GITHUB_ISSUES_REPOS` | Optional | Issue allowlist (defaults to `GITHUB_REPOS` if unset) |
-| `GITHUB_OAUTH_SCOPE` | Optional | Default `repo`; add `security_events` for Dependabot in weekly status (e.g. `repo security_events`) |
+| `GITHUB_OAUTH_SCOPE` | Optional | Default `repo read:project` (`read:project` = roadmap board fields); add `security_events` for Dependabot in weekly status |
+| `SUSAN_ROADMAP_ORG` | For roadmap board | Org/user that owns the project board (default: owner of the first configured repo) |
+| `SUSAN_ROADMAP_PROJECT` | For roadmap board | Project number or title, e.g. `Pilot Roadmap` — roadmap commands are off until this is set |
+| `SUSAN_ROADMAP_EPIC` | Recommended | Tracking epic holding the plan as checklists, e.g. `cloud-infra#231` |
+| `SUSAN_ROADMAP_REPOS` | Optional | Repos holding roadmap issues (defaults to `GITHUB_REPOS`) |
+| `SUSAN_ROADMAP_ISSUE_REPO` | Optional | Where `/susan roadmap add` files issues (defaults to the epic's repo) |
+| `SUSAN_ROADMAP_BOARD_WRITE` | Optional | `true` lets Susan add an approved issue to the board and set its fields (needs `project` scope) |
 | `GITHUB_BASE_BRANCH` | Optional | Default `main` |
 | `GITHUB_TOKEN` | Optional | **Shared PAT for all users** — see SECURITY.md |
 | `GOOGLE_ACCESS_TOKEN` | Optional | **Shared Google token for all users** — see SECURITY.md |

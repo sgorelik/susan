@@ -48,6 +48,26 @@ def test_parse_schedule_add_weekly_status_this_channel() -> None:
     assert spec.channel_id == "C0ANY6ASRB5"
 
 
+def test_parse_schedule_add_roadmap_digest() -> None:
+    spec = parse_schedule_add(
+        "add board status last 7 days every monday at 9:00 in this channel",
+        slash_channel_id="C0ANY6ASRB5",
+        slash_channel_name="team-tech",
+    )
+    assert spec.job_type == "roadmap"
+    assert spec.job_params == {"kind": "status", "command_text": "last 7 days"}
+    assert spec.days_of_week == [0]
+
+
+def test_parse_schedule_add_refuses_to_file_roadmap_issues_on_a_timer() -> None:
+    with pytest.raises(ValueError, match="cannot be scheduled"):
+        parse_schedule_add(
+            "add roadmap add a new pipeline every monday at 9:00 in this channel",
+            slash_channel_id="C0ANY6ASRB5",
+            slash_channel_name="team-tech",
+        )
+
+
 def test_resolve_schedule_channel_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SUSAN_DEFAULT_SCHEDULE_CHANNEL", "C0ANY6ASRB5")
     assert default_schedule_channel_id() == "C0ANY6ASRB5"

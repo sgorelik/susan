@@ -461,6 +461,37 @@ async def resume_slash_after_oauth(row: dict) -> None:
             except Exception as e2:
                 logger.error("resume_slash_after_oauth notify: %s", e2)
         return
+    if action == "roadmap_cmd":
+        from app.roadmap import parse_roadmap_command, process_roadmap, process_roadmap_add
+
+        parsed_roadmap = parse_roadmap_command(text)
+        if not parsed_roadmap:
+            return
+        kind, remainder = parsed_roadmap
+        try:
+            await post_ephemeral(
+                channel, user, "Resuming your *roadmap* question after GitHub sign-in…"
+            )
+        except Exception as e:
+            logger.warning("resume_slash_after_oauth intro ephemeral: %s", e)
+        try:
+            if kind == "add":
+                await process_roadmap_add(remainder, channel, user, thread_ts, response_url)
+            else:
+                await process_roadmap(kind, remainder, channel, user, thread_ts, response_url)
+        except Exception as e:
+            logger.exception("resume_slash_after_oauth roadmap failed")
+            try:
+                await notify_user_ephemeral(
+                    channel,
+                    user,
+                    f"Could not resume your roadmap command after sign-in: {e}",
+                    None,
+                    response_url,
+                )
+            except Exception as e2:
+                logger.error("resume_slash_after_oauth notify: %s", e2)
+        return
     if action == "sales_prep":
         target = parse_sales_prep_command(text) or ""
         try:

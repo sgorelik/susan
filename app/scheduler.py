@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 
 from app.action_items import process_action_items
 from app.config import logger
+from app.roadmap import parse_roadmap_command, process_roadmap
 from app.slack_api import _try_slack_open_im_with_user, post_message
 from app.weekly_context import resolve_github_repos_for_weekly_status, weekly_status_include_github
 from app.weekly_status import process_weekly_status
@@ -280,6 +281,23 @@ def parse_schedule_add(
             channel_id=channel_id,
         )
 
+    roadmap_spec = parse_roadmap_command(head)
+    if roadmap_spec is not None:
+        kind, command_text = roadmap_spec
+        if kind == "add":
+            raise ValueError(
+                "Roadmap issues are filed after a human review, so `roadmap add` cannot be "
+                "scheduled. Schedule `board status` or `board pack` instead."
+            )
+        return ParsedScheduleAdd(
+            job_type="roadmap",
+            job_params={"kind": kind, "command_text": command_text},
+            hour=hour,
+            minute=minute,
+            days_of_week=days,
+            channel_id=channel_id,
+        )
+
     if lower_head.startswith("actions") or lower_head.startswith("action items"):
         prefix = "action items" if lower_head.startswith("action items") else "actions"
         command_text = head[len(prefix) :].strip()
@@ -293,7 +311,8 @@ def parse_schedule_add(
         )
 
     raise ValueError(
-        "Unknown job type. Supported: `message \"…\"`, `weekly status …`, `actions …`."
+        "Unknown job type. Supported: `message \"…\"`, `weekly status …`, `actions …`, "
+        "`board status …` / `board pack …`."
     )
 
 
@@ -311,6 +330,9 @@ def _job_summary(job: dict) -> str:
     elif jt == "action_items":
         extra = (params.get("command_text") or "").strip() or "(default lookback)"
         kind = f"actions ({extra})"
+    elif jt == "roadmap":
+        extra = (params.get("command_text") or "").strip() or "(default window)"
+        kind = f"roadmap {params.get('kind') or 'status'} ({extra})"
     else:
         kind = jt
     days = json.loads(job["days_of_week"])
@@ -442,6 +464,7 @@ def _schedule_examples() -> str:
     return (
         f'`/susan schedule add message "☀️ Good morning" every weekday at 9:00 in {ch}`\n'
         f'`/susan schedule add weekly status last calendar week every monday at 9:00 in #team-tech`\n'
+        f'`/susan schedule add board status last 7 days every monday at 9:00 in #team-tech`\n'
         "`/susan schedule list` · `schedule pause abc12345` · `schedule run abc12345`"
     )
 
@@ -454,6 +477,8 @@ def _schedule_help_text() -> str:
         "• `schedule add message \"…\" every weekday at 9:00 in #team-tech`\n"
         "• `schedule add weekly status last calendar week every monday at 9:00 in #team-tech`\n"
         "• `schedule add actions last 14 days every friday at 16:00 in this channel`\n"
+        "• `schedule add board status last 7 days every monday at 9:00 in #team-tech` — the "
+        "roadmap digest, same shape every week (also `board pack`, `board risks`)\n"
         "• `schedule pause <id>` · `schedule enable <id>` · `schedule remove <id>` · `schedule run <id>`\n\n"
         "*Channel:* `in this channel`, `#team-tech`, or a channel id (default `#team-tech` → "
         f"`{default_schedule_channel_id()}`).\n\n"
@@ -486,6 +511,18 @@ async def execute_scheduled_job(job: dict) -> None:
             None,
             None,
             include_github=include_github,
+            auto_publish=True,
+        )
+        return
+
+    if jt == "roadmap":
+        await process_roadmap(
+            params.get("kind") or "status",
+            (params.get("command_text") or "").strip(),
+            channel,
+            user,
+            None,
+            None,
             auto_publish=True,
         )
         return

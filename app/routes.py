@@ -54,6 +54,12 @@ from app.oauth import (
     public_origin_for_connect_links,
 )
 from app.pr_summary import process_pr_summary
+from app.roadmap import (
+    ROADMAP_ACKS,
+    parse_roadmap_command,
+    process_roadmap,
+    process_roadmap_add,
+)
 from app.slack_commands import process_command, resume_slash_after_oauth
 from app.slack_api import (
     _slack_form_fields,
@@ -72,6 +78,12 @@ from app.weekly_context import (
 )
 from app.granola_summarize import parse_granola_slash_command, process_granola_summarize
 from app.action_items import parse_action_items_command, process_action_items
+from app.channel_surface import (
+    parse_failures_command,
+    parse_reviews_command,
+    parse_standup_command,
+    process_channel_surface,
+)
 import asyncio
 import os
 
@@ -598,6 +610,9 @@ def susan_slash_help_response() -> JSONResponse:
         "`/susan actions` or `/susan action items` — outstanding tasks with *@mentions* from Slack, "
         "Drive, Granola, and GitHub; kept in a *Google Sheet* (one tab per channel) for provenance\n"
         "`/susan actions last 14 days --no-approval` — for scheduled Slack messages (posts directly to channel)\n"
+        "`/susan standups last week` — summarize daily standup notes from #team-tech\n"
+        "`/susan surface failures` / `what's failing` — failing CI/promote/cost alerts from alert channels\n"
+        "`/susan needs my review` / `surface reviews` — PRs and asks that need *your* review\n"
         "`/susan create a doc summarizing this thread for the launch notes`\n"
         "`/susan send email to the team thanking them for the release`\n"
         "`/susan create invite for a 30m design review next Tuesday`\n"
@@ -613,6 +628,27 @@ def susan_slash_help_response() -> JSONResponse:
         "to restrict who may use that flag.\n"
         "`/susan schedule add weekly status last calendar week every monday at 9:00 in #team-tech` — "
         "recurring jobs (see `schedule help`)"
+    )
+    body_roadmap = (
+        "*Roadmap board* (GitHub Projects — the plan of record)\n"
+        "`/susan board status` — weekly digest: what shipped, what only moved status, what's "
+        "blocked and on whom (add a range, e.g. `board status last 14 days`)\n"
+        "`/susan board pack` — the board/investor update, including an honest read on anything "
+        "*Partial* or *Done (dev)*\n"
+        "`/susan board risks` — P0/P1 items that would stop a pilot handover, ranked\n"
+        "`/susan board claims` — what you can describe to a customer as live today, and what you "
+        "must not overstate\n"
+        "`/susan customer ask Augur` — what we owe a customer, where each piece stands, and what "
+        "we're waiting on them for\n"
+        "`/susan roadmap can we promise streaming responses in the UK?` — any question, answered "
+        "from the board with issue numbers\n"
+        "`/susan roadmap add we need a continuous path for pushing model updates` — checks for "
+        "duplicates, drafts a properly formed issue, and *shows it to you before filing*\n\n"
+        "Susan quotes the *Status* word verbatim and treats *Partial* and *Done (dev)* as **not "
+        "done**. Every claim comes with an issue number so you can check it in a click. "
+        "Susan can file issues and open PRs — she never merges. "
+        "Needs GitHub connected with the `read:project` scope, plus `SUSAN_ROADMAP_ORG` / "
+        "`SUSAN_ROADMAP_PROJECT` on the server."
     )
     body_pr = (
         "*PR summaries & weekly status — time ranges* (optional; default is last 7 days)\n"
@@ -651,6 +687,9 @@ def susan_slash_help_response() -> JSONResponse:
         {"type": "section", "text": {"type": "mrkdwn", "text": body_what}},
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text": body_ex}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": body_roadmap}},
+        {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text": body_pr}},
         {"type": "section", "text": {"type": "mrkdwn", "text": body_repo}},
     ]
@@ -897,6 +936,113 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
             }
         )
 
+    surface_kind = None
+    if parse_standup_command(text) is not None:
+        surface_kind = "standups"
+    elif parse_failures_command(text) is not None:
+        surface_kind = "failures"
+    elif parse_reviews_command(text) is not None:
+        surface_kind = "reviews"
+
+    if surface_kind is not None:
+
+        async def run_surface():
+            kind = surface_kind
+            try:
+                await process_channel_surface(
+                    kind,  # type: ignore[arg-type]
+                    text,
+                    channel,
+                    user,
+                    thread_ts,
+                    response_url,
+                )
+            except Exception as e:
+                logger.exception("Channel surface task failed kind=%s", kind)
+                try:
+                    await notify_user_ephemeral(
+                        channel,
+                        user,
+                        f"Susan error ({kind}): {str(e)}",
+                        None,
+                        response_url,
+                    )
+                except Exception as e2:
+                    logger.error("Could not notify user after surface error: %s", e2)
+
+        background_tasks.add_task(run_surface)
+        ack_by_kind = {
+            "standups": (
+                "Got it — Susan is reading *standup notes* in #team-tech for the requested window "
+                "and will send you a private summary."
+            ),
+            "failures": (
+                "Got it — Susan is scanning *alert channels* for failures and will send you a "
+                "private digest of what's failing."
+            ),
+            "reviews": (
+                "Got it — Susan is scanning alerts + #team-tech for items that need *your* review "
+                "and will send you a private list."
+            ),
+        }
+        return JSONResponse(
+            {"response_type": "ephemeral", "text": ack_by_kind[surface_kind]}
+        )
+
+    roadmap_cmd = parse_roadmap_command(text)
+    if roadmap_cmd is not None:
+        roadmap_kind, roadmap_remainder = roadmap_cmd
+        _, roadmap_auto_post = strip_weekly_status_auto_post_flags(text)
+        if roadmap_auto_post and not weekly_status_auto_post_user_allowed(user):
+            return JSONResponse(
+                {
+                    "response_type": "ephemeral",
+                    "text": (
+                        "Posting straight to the channel (`--no-approval`) is restricted for your user. "
+                        "Remove the flag to get the answer privately, or ask an admin to add your Slack "
+                        "user id to `SUSAN_WEEKLY_AUTO_POST_USER_IDS`."
+                    ),
+                }
+            )
+        if not await user_has_github_tokens(user):
+            resume_id = await create_oauth_resume_pending(
+                user, channel, thread_ts, text, "roadmap_cmd", "github"
+            )
+            return connect_github_slack_response(
+                user,
+                intro=(
+                    "*GitHub isn’t connected yet.* The roadmap board lives in GitHub, so Susan needs "
+                    "your account to read it. Use the link below — Susan will answer when you’re done "
+                    "(or use `/susan connect github` anytime)."
+                ),
+                channel_id=channel or None,
+                resume_id=resume_id,
+            )
+
+        async def run_roadmap():
+            try:
+                if roadmap_kind == "add":
+                    await process_roadmap_add(
+                        roadmap_remainder, channel, user, thread_ts, response_url
+                    )
+                else:
+                    await process_roadmap(
+                        roadmap_kind, roadmap_remainder, channel, user, thread_ts, response_url
+                    )
+            except Exception as e:
+                logger.exception("Roadmap task failed kind=%s", roadmap_kind)
+                try:
+                    await notify_user_ephemeral(
+                        channel, user, f"Susan error (roadmap): {str(e)}", None, response_url
+                    )
+                except Exception as e2:
+                    logger.error("Could not notify user after roadmap error: %s", e2)
+
+        background_tasks.add_task(run_roadmap)
+        return JSONResponse(
+            {"response_type": "ephemeral", "text": ROADMAP_ACKS[roadmap_kind]}
+        )
+
     action = detect_action(text)
     if not action:
         return JSONResponse(
@@ -906,6 +1052,8 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                     "Susan doesn’t understand that command. Try `/susan help` for examples, "
                     "or keywords like `connect`, `schedule`, `doc`, `email`, `invite`, `issue`, `pr`, "
                     "`summarize prs`, `weekly status`, `prep me for a sales call with …`, "
+                    "`standups`, `surface failures`, `needs my review`, "
+                    "`board status`, `customer ask <name>`, `roadmap add …`, "
                     "`actions` / `action items`, or Granola-only: `granola` / `gn`."
                 ),
             }
