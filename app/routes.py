@@ -80,6 +80,7 @@ from app.weekly_context import (
 from app.granola_summarize import parse_granola_slash_command, process_granola_summarize
 from app.action_items import (
     _strip_all_channels_scope,
+    is_personal_actions_command,
     parse_action_items_command,
     process_action_items,
 )
@@ -616,9 +617,9 @@ def susan_slash_help_response() -> JSONResponse:
         "`/susan granola` or `/susan gn` — summarize *your* Granola meetings (default lookback); "
         "add free text for the window or focus, e.g. `/susan gn last calendar week` or "
         "`/susan granola group sync notes last 14 days`\n"
-        "`/susan actions` or `/susan action items` — outstanding tasks with *@mentions* from Slack, "
+        "`/susan actions` or `/susan action items` — everyone’s outstanding tasks in this channel, with *@mentions*, "
         "Drive, Granola, and GitHub; kept in a *Google Sheet* (one tab per channel) for provenance\n"
-        "`/susan actions all channels last week` — private personal inbox of your Slack asks/mentions, "
+        "`/susan my actions last week` — your private personal inbox of Slack asks/mentions across accessible channels, "
         "Gmail requests, Drive comment mentions, and Granola commitments across the week\n"
         "`/susan actions last 14 days --no-approval` — for scheduled Slack messages (posts directly to channel)\n"
         "`/susan standups last week` — summarize daily standup notes from #team-tech\n"
@@ -821,7 +822,8 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
 
     actions_remainder = parse_action_items_command(text)
     if actions_remainder is not None:
-        _, actions_all_channels = _strip_all_channels_scope(actions_remainder)
+        _, explicit_all_channels = _strip_all_channels_scope(actions_remainder)
+        actions_all_channels = is_personal_actions_command(text) or explicit_all_channels
         _, actions_auto_post = strip_weekly_status_auto_post_flags(text)
         if actions_all_channels:
             actions_auto_post = False
@@ -867,7 +869,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
         background_tasks.add_task(run_action_items)
         if actions_all_channels:
             ack = (
-                "Got it — Susan is building your *private personal action inbox* from "
+                "Got it — Susan is building *My Actions*, your private inbox, from "
                 "all accessible Slack channels, Gmail, Drive comments, Granola, and GitHub."
             )
         elif actions_auto_post:

@@ -6,6 +6,7 @@ import pytest
 from app.action_items import (
     _strip_all_channels_scope,
     format_action_items_message,
+    is_personal_actions_command,
     parse_action_items_command,
     parse_action_items_time_window,
 )
@@ -14,10 +15,20 @@ from app.action_items import (
 def test_parse_action_items_command() -> None:
     assert parse_action_items_command("actions") == ""
     assert parse_action_items_command("actions last week") == "last week"
+    assert parse_action_items_command("my actions last week") == "last week"
+    assert parse_action_items_command("my action items last month") == "last month"
     assert parse_action_items_command("action items last 14 days") == "last 14 days"
     assert parse_action_items_command("todos") == ""
     assert parse_action_items_command("create issue") is None
     assert parse_action_items_command("interactions") is None
+
+
+def test_personal_actions_command_is_explicit() -> None:
+    assert is_personal_actions_command("my actions")
+    assert is_personal_actions_command("my actions last week")
+    assert is_personal_actions_command("my action items last month")
+    assert not is_personal_actions_command("actions")
+    assert not is_personal_actions_command("actions last week")
 
 
 def test_parse_all_channel_actions_scope() -> None:

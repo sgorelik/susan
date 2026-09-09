@@ -30,6 +30,20 @@ class Client:
         return Response()
 
 
+class MissingScopeResponse:
+    def json(self) -> dict:
+        return {
+            "ok": False,
+            "error": "missing_scope",
+            "needed": "channels:read",
+        }
+
+
+class MissingScopeClient(Client):
+    async def get(self, *args: object, **kwargs: object) -> MissingScopeResponse:
+        return MissingScopeResponse()
+
+
 @pytest.mark.asyncio
 async def test_all_channel_scan_only_reads_joined_channels(
     monkeypatch: pytest.MonkeyPatch,
@@ -63,3 +77,13 @@ async def test_all_channel_scan_only_reads_joined_channels(
     assert "#private-sales" in transcript
     assert "not-joined" not in transcript
     assert skipped == []
+
+
+@pytest.mark.asyncio
+async def test_all_channel_scan_explains_missing_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(slack.httpx, "AsyncClient", lambda **kwargs: MissingScopeClient())
+
+    with pytest.raises(RuntimeError, match=r"`channels:read`.*reinstall Susan"):
+        await slack.fetch_slack_all_channel_history_since("123.0", "U-ME")

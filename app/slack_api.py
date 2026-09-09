@@ -549,8 +549,16 @@ async def fetch_slack_all_channel_history_since(
             )
             data = r.json()
             if not data.get("ok"):
+                error = data.get("error", "unknown_error")
+                if error == "missing_scope":
+                    needed = data.get("needed") or "channels:read and groups:read"
+                    raise RuntimeError(
+                        "Susan's installed Slack app is missing the "
+                        f"`{needed}` permission. An admin must reinstall Susan after "
+                        "applying the current Slack manifest."
+                    )
                 raise RuntimeError(
-                    f"Could not list Slack conversations ({data.get('error', 'unknown_error')})."
+                    f"Could not list Slack conversations ({error})."
                 )
             for ch in data.get("channels") or []:
                 cid = str(ch.get("id") or "")

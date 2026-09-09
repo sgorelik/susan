@@ -20,7 +20,7 @@
         "command": "/susan",
         "url": "https://your-host.example/susan",
         "description": "Ask Susan to act on this channel or thread",
-        "usage_hint": "help | standups | surface failures | needs my review | actions | weekly status | granola | …",
+        "usage_hint": "help | standups | my actions | actions | weekly status | granola | …",
         "should_escape": false
       }
     ]

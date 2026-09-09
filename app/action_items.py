@@ -43,11 +43,15 @@ from app.weekly_context import (
 from app.weekly_drive import action_items_google_docs_block
 
 _ACTION_PREFIXES = (
+    "my action items",
+    "my actions",
+    "my todos",
     "action items",
     "action item",
     "actions",
     "todos",
 )
+_PERSONAL_ACTION_PREFIXES = ("my action items", "my actions", "my todos")
 
 _STATUS_LABELS = {
     "open": "open",
@@ -69,6 +73,15 @@ def parse_action_items_command(text: str) -> str | None:
         if lower.startswith(prefix + " "):
             return raw[len(prefix) :].strip()
     return None
+
+
+def is_personal_actions_command(text: str) -> bool:
+    """Whether the command explicitly requests the caller's private action inbox."""
+    lower = (text or "").strip().lower()
+    return any(
+        lower == prefix or lower.startswith(prefix + " ")
+        for prefix in _PERSONAL_ACTION_PREFIXES
+    )
 
 
 def parse_action_items_time_window(remainder: str) -> tuple[str, str, str]:
@@ -592,11 +605,13 @@ async def process_action_items(
     *,
     auto_publish: bool = False,
 ) -> None:
+    personal_actions = is_personal_actions_command(command_text)
     parsed_remainder = parse_action_items_command(command_text)
     remainder, auto_publish_flag = _strip_flags(
         parsed_remainder if parsed_remainder is not None else command_text
     )
-    remainder, all_channels = _strip_all_channels_scope(remainder)
+    remainder, explicit_all_channels = _strip_all_channels_scope(remainder)
+    all_channels = personal_actions or explicit_all_channels
     auto_publish = auto_publish or auto_publish_flag
     if all_channels:
         auto_publish = False
@@ -666,6 +681,7 @@ async def process_action_items(
             f"{range_label} across all accessible channels",
             include_instructions=False,
         )
+        body = f"*My actions — {range_label}*\n\n{body}"
         notes: list[str] = []
         if skipped_channels:
             shown = ", ".join(skipped_channels[:8])
