@@ -39,6 +39,7 @@
         "im:history",
         "im:write",
         "mpim:history",
+        "mpim:read",
         "mpim:write",
         "users:read",
         "users:read.email",
