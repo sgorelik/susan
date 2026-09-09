@@ -4,11 +4,108 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import time
 import urllib.parse
 
 import httpx
 
 from app.config import logger
+
+# GitHub asks that requests for a single user be made serially; concurrent
+# /search/issues calls are what trips the secondary rate limit. Every search in
+# Susan queues here so a wide weekly digest cannot burst against the API.
+_SEARCH_SEM = asyncio.Semaphore(1)
+_SEARCH_LAST_TS = 0.0
+_SEARCH_URL = "https://api.github.com/search/issues"
+
+
+def _search_min_interval() -> float:
+    return max(0.0, float(os.environ.get("GITHUB_SEARCH_MIN_INTERVAL_SECONDS", "1.0")))
+
+
+def _search_max_attempts() -> int:
+    return max(1, min(8, int(os.environ.get("GITHUB_SEARCH_MAX_RETRIES", "4"))))
+
+
+def _is_rate_limited(status: int, data: dict) -> bool:
+    if status == 429:
+        return True
+    if status != 403:
+        return False
+    msg = str(data.get("message") or "").lower()
+    return "rate limit" in msg or "abuse" in msg
+
+
+def _retry_after_seconds(r: httpx.Response) -> float | None:
+    """Honour GitHub's own backoff hint before falling back to exponential delay."""
+    raw = r.headers.get("retry-after")
+    if raw:
+        try:
+            return min(max(float(raw), 1.0), 300.0)
+        except ValueError:
+            pass
+    if r.headers.get("x-ratelimit-remaining") == "0":
+        try:
+            return min(max(float(r.headers["x-ratelimit-reset"]) - time.time(), 1.0), 300.0)
+        except (KeyError, ValueError):
+            pass
+    return None
+
+
+async def _search_request(client: httpx.AsyncClient, hdrs: dict, params: dict) -> dict:
+    """One /search/issues call, serialized and retried on rate limits."""
+    global _SEARCH_LAST_TS
+    attempts = _search_max_attempts()
+    for attempt in range(attempts):
+        async with _SEARCH_SEM:
+            gap = _search_min_interval() - (time.monotonic() - _SEARCH_LAST_TS)
+            if gap > 0:
+                await asyncio.sleep(gap)
+            r = await client.get(_SEARCH_URL, headers=hdrs, params=params)
+            _SEARCH_LAST_TS = time.monotonic()
+        try:
+            data = r.json()
+        except ValueError:
+            data = {}
+        if r.status_code == 200:
+            return data if isinstance(data, dict) else {}
+        if _is_rate_limited(r.status_code, data):
+            if attempt >= attempts - 1:
+                raise RuntimeError(
+                    f"GitHub search failed: still rate limited after {attempts} attempts. "
+                    "Wait a few minutes and try again."
+                )
+            wait = _retry_after_seconds(r) or min(2.0 * (2**attempt), 60.0)
+            logger.warning(
+                "GitHub search rate limited (HTTP %s); retrying in %.0fs (attempt %s/%s)",
+                r.status_code,
+                wait,
+                attempt + 1,
+                attempts,
+            )
+            await asyncio.sleep(wait)
+            continue
+        raise RuntimeError(
+            f"GitHub search failed ({r.status_code}): {data.get('message', data)}"
+        )
+    raise RuntimeError("GitHub search failed: retries exhausted")
+
+
+async def _search_issues_pages(
+    q: str, token: str, *, max_pages: int = 10, sort: str | None = None
+) -> list[dict]:
+    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    items: list[dict] = []
+    async with httpx.AsyncClient(timeout=60) as client:
+        for page in range(1, max(1, max_pages) + 1):
+            params: dict = {"q": q, "per_page": 100, "page": page}
+            if sort:
+                params.update({"sort": sort, "order": "desc"})
+            batch = (await _search_request(client, hdrs, params)).get("items") or []
+            items.extend(batch)
+            if len(batch) < 100:
+                break
+    return items
 
 def _pr_turnaround_hours(item: dict) -> float | None:
     from datetime import datetime
@@ -30,48 +127,12 @@ async def fetch_opened_prs_for_repo_range(
     repo: str, since_d: str, until_d: str, token: str
 ) -> list[dict]:
     q = f"repo:{repo} is:pr created:>={since_d} created:<={until_d}"
-    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-    items: list[dict] = []
-    async with httpx.AsyncClient(timeout=60) as client:
-        for page in range(1, 11):
-            r = await client.get(
-                "https://api.github.com/search/issues",
-                headers=hdrs,
-                params={"q": q, "per_page": 100, "page": page},
-            )
-            data = r.json()
-            if r.status_code != 200:
-                raise RuntimeError(
-                    f"GitHub search failed ({r.status_code}): {data.get('message', data)}"
-                )
-            batch = data.get("items") or []
-            items.extend(batch)
-            if len(batch) < 100:
-                break
-    return items
+    return await _search_issues_pages(q, token, max_pages=10)
 
 
 async def search_issues(q: str, token: str, *, max_pages: int = 5, sort: str = "updated") -> list[dict]:
     """Issue/PR search (``/search/issues``) for an arbitrary query string."""
-    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-    items: list[dict] = []
-    async with httpx.AsyncClient(timeout=60) as client:
-        for page in range(1, max(1, max_pages) + 1):
-            r = await client.get(
-                "https://api.github.com/search/issues",
-                headers=hdrs,
-                params={"q": q, "per_page": 100, "page": page, "sort": sort, "order": "desc"},
-            )
-            data = r.json()
-            if r.status_code != 200:
-                raise RuntimeError(
-                    f"GitHub search failed ({r.status_code}): {data.get('message', data)}"
-                )
-            batch = data.get("items") or []
-            items.extend(batch)
-            if len(batch) < 100:
-                break
-    return items
+    return await _search_issues_pages(q, token, max_pages=max_pages, sort=sort)
 
 
 async def fetch_issue(repo: str, number: int, token: str) -> dict | None:
@@ -241,25 +302,7 @@ async def fetch_merged_prs_for_repo_range(
 ) -> list[dict]:
     """GitHub search API: merged PRs in repo between since_d and until_d (YYYY-MM-DD)."""
     q = f"repo:{repo} is:pr is:merged merged:>={since_d} merged:<={until_d}"
-    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-    items: list[dict] = []
-    async with httpx.AsyncClient(timeout=60) as client:
-        for page in range(1, 11):
-            r = await client.get(
-                "https://api.github.com/search/issues",
-                headers=hdrs,
-                params={"q": q, "per_page": 100, "page": page},
-            )
-            data = r.json()
-            if r.status_code != 200:
-                raise RuntimeError(
-                    f"GitHub search failed ({r.status_code}): {data.get('message', data)}"
-                )
-            batch = data.get("items") or []
-            items.extend(batch)
-            if len(batch) < 100:
-                break
-    return items
+    return await _search_issues_pages(q, token, max_pages=10)
 
 
 _PR_SUMMARY_PARTICIPANT_SEM = asyncio.Semaphore(10)
