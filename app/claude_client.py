@@ -21,21 +21,27 @@ from app.model_routing import is_commercial_action, resolve_model, route_for_act
 
 
 class ModelCompletion(str):
-    """Completion text annotated with the route that actually served it."""
+    """Completion text annotated with the route and model that actually served it."""
 
     model_route: str
+    model_name: str | None
 
-    def __new__(cls, text: str, *, model_route: str) -> ModelCompletion:
+    def __new__(
+        cls, text: str, *, model_route: str, model_name: str | None = None
+    ) -> ModelCompletion:
         value = super().__new__(cls, text)
         value.model_route = model_route
+        value.model_name = model_name
         return value
 
 
-async def _call_f1_sovereign(system: str, user: str, max_tokens: int | None = None) -> str:
+async def _call_f1_sovereign(
+    system: str, user: str, max_tokens: int | None = None
+) -> tuple[str, str]:
     """Call the self-hosted FrontierOne model via its OpenAI-compatible endpoint.
 
-    Used for sovereign-routed commands. Same (system, user) -> text contract as
-    call_claude.
+    Returns (text, served_model). The served model is read back from the response
+    so attribution reflects what answered, not what we asked for.
     """
     url = f"{F1_MODEL_BASE_URL}/chat/completions"
     headers = {"content-type": "application/json"}
@@ -61,7 +67,9 @@ async def _call_f1_sovereign(system: str, user: str, max_tokens: int | None = No
         if r.status_code < 400:
             try:
                 data = r.json()
-                return data["choices"][0]["message"]["content"]
+                text = data["choices"][0]["message"]["content"]
+                served_model = str(data.get("model") or "").strip() or F1_MODEL_NAME
+                return text, served_model
             except (json.JSONDecodeError, KeyError, IndexError, TypeError):
                 logger.error("Unexpected F1 model response: %s", r.text[:500])
                 raise RuntimeError("Unexpected response from FrontierOne model")
@@ -235,13 +243,18 @@ async def call_claude(
         text = await _call_anthropic(
             system, user, max_tokens, action=action, model_route="commercial"
         )
-        return ModelCompletion(text, model_route="commercial")
+        return ModelCompletion(text, model_route="commercial", model_name=model)
     if requested_route in ("sovereign", "local") and f1_model_active():
-        logger.info("LLM route: F1 sovereign (action=%s)", action)
-        text = await _call_f1_sovereign(system, user, max_tokens)
-        return ModelCompletion(text, model_route="sovereign")
-    logger.info("LLM route: default Anthropic (action=%s)", action)
+        text, served_model = await _call_f1_sovereign(system, user, max_tokens)
+        logger.info(
+            "LLM route: F1 sovereign (action=%s model=%s)", action, served_model
+        )
+        return ModelCompletion(text, model_route="sovereign", model_name=served_model)
+    default_model = resolve_model(action=action, model_route=model_route)
+    logger.info(
+        "LLM route: default Anthropic (action=%s model=%s)", action, default_model
+    )
     text = await _call_anthropic(
         system, user, max_tokens, action=action, model_route=model_route
     )
-    return ModelCompletion(text, model_route="commercial")
+    return ModelCompletion(text, model_route="commercial", model_name=default_model)

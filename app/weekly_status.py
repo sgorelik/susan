@@ -303,6 +303,7 @@ async def process_weekly_status(
 
     title = _weekly_status_title_line(repos, range_label, include_github=include_github)
     model_route = summary.model_route
+    model_name = summary.model_name
     if auto_publish:
         try:
             await publish_weekly_status(
@@ -311,6 +312,7 @@ async def process_weekly_status(
                 title,
                 summary,
                 model_route=model_route,
+                model_name=model_name,
             )
         except Exception as e:
             logger.exception("Weekly status auto-publish failed")
@@ -339,6 +341,7 @@ async def process_weekly_status(
         "repos": repos if include_github else [],
         "include_github": include_github,
         "model_route": model_route,
+        "model_name": model_name,
     }
     draft_id = await create_user_draft(
         user, "weekly_status", json.dumps(meta, ensure_ascii=False)

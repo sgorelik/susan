@@ -13,8 +13,10 @@ async def test_call_claude_reports_sovereign_route(
     monkeypatch.setenv("SUSAN_DEFAULT_MODEL_ROUTE", "sovereign")
     monkeypatch.setattr(client, "f1_model_active", lambda: True)
 
-    async def fake_f1(system: str, user: str, max_tokens: int | None = None) -> str:
-        return "sovereign response"
+    async def fake_f1(
+        system: str, user: str, max_tokens: int | None = None
+    ) -> tuple[str, str]:
+        return "sovereign response", "deepseek-ai-deepseek-v4-a05f5b"
 
     monkeypatch.setattr(client, "_call_f1_sovereign", fake_f1)
 
@@ -22,6 +24,7 @@ async def test_call_claude_reports_sovereign_route(
 
     assert result == "sovereign response"
     assert result.model_route == "sovereign"
+    assert result.model_name == "deepseek-ai-deepseek-v4-a05f5b"
 
 
 @pytest.mark.asyncio
@@ -47,3 +50,40 @@ async def test_call_claude_reports_commercial_route(
 
     assert result == "commercial response"
     assert result.model_route == "commercial"
+    assert result.model_name == "claude-opus-4-6"
+
+
+@pytest.mark.asyncio
+async def test_sovereign_model_name_read_from_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attribution names what answered, even if the endpoint swaps the model."""
+    monkeypatch.setattr(client, "F1_MODEL_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setattr(client, "F1_MODEL_NAME", "requested-model")
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict:
+            return {
+                "model": "actually-served-model",
+                "choices": [{"message": {"content": "hi"}}],
+            }
+
+    class FakeClient:
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+        async def post(self, *args: object, **kwargs: object) -> FakeResponse:
+            return FakeResponse()
+
+    monkeypatch.setattr(client.httpx, "AsyncClient", lambda **kw: FakeClient())
+
+    text, served = await client._call_f1_sovereign("system", "user")
+
+    assert text == "hi"
+    assert served == "actually-served-model"

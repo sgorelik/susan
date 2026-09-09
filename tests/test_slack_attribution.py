@@ -11,6 +11,26 @@ def test_sovereign_route_gets_attribution() -> None:
     assert blocks is None
 
 
+def test_sovereign_footer_names_the_model() -> None:
+    text, blocks = _append_attribution(
+        "Hello",
+        [{"type": "section"}],
+        model_route="sovereign",
+        model_name="deepseek-ai-deepseek-v4-a05f5b",
+    )
+    expected = f"{F1_ATTRIBUTION} (deepseek-ai-deepseek-v4-a05f5b)"
+    assert expected in (text or "")
+    assert any(expected in str(b) for b in (blocks or []))
+
+
+def test_commercial_route_never_names_a_sovereign_model() -> None:
+    text, _ = _append_attribution(
+        "Hello", None, model_route="commercial", model_name="claude-opus-4-6"
+    )
+    assert text == "Hello"
+    assert "claude-opus-4-6" not in (text or "")
+
+
 def test_commercial_route_does_not_get_sovereign_attribution() -> None:
     text, blocks = _append_attribution("Hello", None, model_route="commercial")
     assert text == "Hello"

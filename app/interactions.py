@@ -565,6 +565,9 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                     model_route = meta.get("model_route")
                     if model_route not in ("sovereign", "commercial"):
                         model_route = None
+                    model_name = meta.get("model_name")
+                    if not isinstance(model_name, str) or not model_name.strip():
+                        model_name = None
                     post_ch = (meta.get("channel_id") or channel or "").strip()
                     th = meta.get("thread_ts")
                     if not isinstance(th, str) or not th.strip():
@@ -579,6 +582,7 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                             title,
                             body,
                             model_route=model_route,
+                            model_name=model_name,
                         )
                         result = "Posted the weekly status Canvas link to the channel."
                 except (json.JSONDecodeError, TypeError, RuntimeError) as e:

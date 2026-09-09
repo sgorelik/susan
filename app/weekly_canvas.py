@@ -51,12 +51,18 @@ async def publish_weekly_status(
     body: str,
     *,
     model_route: str | None = None,
+    model_name: str | None = None,
 ) -> None:
     """Post weekly status to Canvas when enabled; otherwise fall back to long channel messages."""
     if weekly_status_use_canvas():
         try:
             await _publish_weekly_status_to_canvas(
-                channel, thread_ts, title, body, model_route=model_route
+                channel,
+                thread_ts,
+                title,
+                body,
+                model_route=model_route,
+                model_name=model_name,
             )
             return
         except Exception as e:
@@ -65,7 +71,7 @@ async def publish_weekly_status(
                 e,
             )
     await post_pr_summary_to_channel(
-        channel, thread_ts, title, body, model_route=model_route
+        channel, thread_ts, title, body, model_route=model_route, model_name=model_name
     )
 
 
@@ -76,6 +82,7 @@ async def _publish_weekly_status_to_canvas(
     body: str,
     *,
     model_route: str | None = None,
+    model_name: str | None = None,
 ) -> None:
     markdown = _canvas_document_markdown(title, body)
     canvas_id = await slack_api_canvases_create(
@@ -96,4 +103,5 @@ async def _publish_weekly_status_to_canvas(
         unfurl_links=False,
         unfurl_media=False,
         model_route=model_route,
+        model_name=model_name,
     )

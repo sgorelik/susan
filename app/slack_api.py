@@ -26,16 +26,18 @@ def _append_attribution(
     blocks: list | None,
     *,
     model_route: str | None = None,
+    model_name: str | None = None,
     skip_sovereign_attribution: bool = False,
     commercial_footer: str | None = None,
 ) -> tuple[str | None, list | None]:
-    """Append attribution based on the route that served the completion."""
+    """Append attribution based on the route and model that served the completion."""
     if commercial_footer:
         footer = commercial_footer
     elif skip_sovereign_attribution or (model_route or "").strip().lower() != "sovereign":
         return text, blocks
     else:
-        footer = F1_ATTRIBUTION
+        served = (model_name or "").strip()
+        footer = f"{F1_ATTRIBUTION} ({served})" if served else F1_ATTRIBUTION
     out_blocks = blocks
     if blocks is not None:
         already = any(
@@ -589,6 +591,7 @@ async def post_ephemeral(
     blocks: list | None = None,
     *,
     model_route: str | None = None,
+    model_name: str | None = None,
     skip_sovereign_attribution: bool = False,
     commercial_footer: str | None = None,
 ):
@@ -596,6 +599,7 @@ async def post_ephemeral(
         text,
         blocks,
         model_route=model_route,
+        model_name=model_name,
         skip_sovereign_attribution=skip_sovereign_attribution,
         commercial_footer=commercial_footer,
     )
@@ -653,6 +657,7 @@ async def post_slack_delayed_response(
     payload: dict,
     *,
     model_route: str | None = None,
+    model_name: str | None = None,
     skip_sovereign_attribution: bool = False,
     commercial_footer: str | None = None,
 ) -> None:
@@ -662,6 +667,7 @@ async def post_slack_delayed_response(
             payload.get("text"),
             payload.get("blocks"),
             model_route=model_route,
+            model_name=model_name,
             skip_sovereign_attribution=skip_sovereign_attribution,
             commercial_footer=commercial_footer,
         )
@@ -683,6 +689,7 @@ async def notify_user_ephemeral(
     response_url: str | None = None,
     *,
     model_route: str | None = None,
+    model_name: str | None = None,
     skip_sovereign_attribution: bool = False,
     commercial_footer: str | None = None,
 ) -> None:
@@ -694,6 +701,7 @@ async def notify_user_ephemeral(
             text,
             blocks,
             model_route=model_route,
+            model_name=model_name,
             skip_sovereign_attribution=skip_sovereign_attribution,
             commercial_footer=commercial_footer,
         )
@@ -708,6 +716,7 @@ async def notify_user_ephemeral(
             response_url,
             payload,
             model_route=model_route,
+            model_name=model_name,
             skip_sovereign_attribution=skip_sovereign_attribution,
             commercial_footer=commercial_footer,
         )
@@ -723,6 +732,7 @@ async def post_message(
     unfurl_media: bool | None = None,
     slack_user_id: str | None = None,
     model_route: str | None = None,
+    model_name: str | None = None,
     skip_sovereign_attribution: bool = False,
     commercial_footer: str | None = None,
 ) -> dict:
@@ -730,6 +740,7 @@ async def post_message(
         text,
         blocks,
         model_route=model_route,
+        model_name=model_name,
         skip_sovereign_attribution=skip_sovereign_attribution,
         commercial_footer=commercial_footer,
     )
@@ -843,6 +854,7 @@ async def post_pr_summary_to_channel(
     body: str,
     *,
     model_route: str | None = None,
+    model_name: str | None = None,
 ) -> None:
     """Publish PR summary as channel/thread messages (splits long bodies; ≤48 sections per message)."""
     chunk_size = 2800
@@ -880,6 +892,7 @@ async def post_pr_summary_to_channel(
             thread_ts=reply_thread_ts,
             blocks=blk,
             model_route=model_route,
+            model_name=model_name,
         )
         ts = data.get("ts")
         if reply_thread_ts is None and ts and not is_last:
