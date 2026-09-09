@@ -81,6 +81,7 @@ from app.granola_summarize import parse_granola_slash_command, process_granola_s
 from app.action_items import (
     _strip_all_channels_scope,
     is_personal_actions_command,
+    is_team_actions_command,
     parse_action_items_command,
     process_action_items,
 )
@@ -588,127 +589,190 @@ def is_susan_help_command(text_lower: str) -> bool:
     return bool(re.match(r"^(help|commands|usage)\b", t))
 
 
-def susan_slash_help_response() -> JSONResponse:
-    """Ephemeral Block Kit help; command keywords mirror detect_action / ACTIONS."""
-    action_lines: list[str] = []
-    for _key, (label, kws) in ACTIONS.items():
-        kw_str = ", ".join(f"`{k}`" for k in kws)
-        action_lines.append(f"• *{label}* — include one of: {kw_str}")
-    actions_body = "\n".join(action_lines)
+_HELP_TOPICS = ("actions", "status", "roadmap", "connect", "schedule", "all")
 
-    body_how = (
+
+def parse_help_topic(text: str) -> str:
+    """Return the topic after `help`/`commands`/`usage`, or "" for the overview."""
+    t = (text or "").strip().lower()
+    if t == "?":
+        return ""
+    remainder = re.sub(r"^(help|commands|usage)\b", "", t).strip()
+    remainder = re.sub(
+        r"^(me\s+with|me|with|on|for|about|the|my|team)\b", "", remainder
+    ).strip()
+    for topic in _HELP_TOPICS:
+        if remainder == topic or remainder.startswith(topic):
+            return topic
+    if remainder.startswith("action") or remainder.startswith("todo"):
+        return "actions"
+    if remainder.startswith("weekly") or remainder.startswith("pr"):
+        return "status"
+    if remainder.startswith("board"):
+        return "roadmap"
+    return ""
+
+
+def _help_overview() -> list[str]:
+    return [
         "*How it works*\n"
         "Run `/susan` *in a thread* so Susan reads that thread, or paste a *Slack message link* "
-        "(⋯ → Copy link) if you’re not in the thread. You’ll get a *private preview*; then *Approve*, "
-        "*Edit* (email & calendar), or *Cancel*. "
-        "For *summarize merged PRs* and *weekly status*, approving posts to the *channel* "
-        "(everyone can see it)."
-    )
-    body_connect = (
-        "*Connect accounts*\n"
-        "• `/susan connect` — Google, GitHub, and Granola (whatever is configured on the server)\n"
-        "• `/susan connect google` — Docs, Gmail, Calendar, Drive metadata (weekly status: linked folders/files)\n"
-        "• `/susan connect github` — issues, PRs, PR summaries; *tech-channel* weekly status (see below)\n"
-        "• `/susan connect granola` — meeting notes that inform Susan's responses"
-    )
-    body_what = "*What to ask*\n" + actions_body
-    body_ex = (
-        "*Examples*\n"
-        "`/susan granola` or `/susan gn` — summarize *your* Granola meetings (default lookback); "
-        "add free text for the window or focus, e.g. `/susan gn last calendar week` or "
-        "`/susan granola group sync notes last 14 days`\n"
-        "`/susan actions` or `/susan action items` — everyone’s outstanding tasks in this channel, with *@mentions*, "
-        "Drive, Granola, and GitHub; kept in a *Google Sheet* (one tab per channel) for provenance\n"
-        "`/susan my actions last week` — your private personal inbox of Slack asks/mentions across accessible channels, "
-        "Gmail requests, Drive comment mentions, and Granola commitments across the week\n"
-        "`/susan actions last 14 days --no-approval` — for scheduled Slack messages (posts directly to channel)\n"
-        "`/susan standups last week` — summarize daily standup notes from #team-tech\n"
-        "`/susan surface failures` / `what's failing` — failing CI/promote/cost alerts from alert channels\n"
-        "`/susan needs my review` / `surface reviews` — PRs and asks that need *your* review\n"
-        "`/susan create a doc summarizing this thread for the launch notes`\n"
-        "`/susan send email to the team thanking them for the release`\n"
-        "`/susan create invite for a 30m design review next Tuesday`\n"
-        "`/susan create issue in org/repo login button is misaligned`\n"
-        "`/susan create pr in org/repo fixing the typo we discussed`\n"
-        "`/susan summarize merged prs for org/repo last 30 days`\n"
-        "`/susan summarize merged prs for org/a org/b org/c last 14 days`\n"
-        "`/susan weekly status` · `/susan weekly report last 14 days` · `/susan team status last calendar week`\n"
-        "`/susan prep me for a sales call with Acme Corp` — F1-focused brief (scans your Drive for "
-        "sales/GTM docs by name, Granola, company research; concise TLDR in Slack + full brief in Google Docs)\n"
-        "`/susan weekly status --no-approval` — generate and *post immediately* to the channel (for schedules / Mondays); "
-        "same with `-no-approval`. Optional: set `SUSAN_WEEKLY_AUTO_POST_USER_IDS` to comma-separated Slack user ids "
-        "to restrict who may use that flag.\n"
-        "`/susan schedule add weekly status last calendar week every monday at 9:00 in #team-tech` — "
-        "recurring jobs (see `schedule help`)"
-    )
-    body_roadmap = (
-        "*Roadmap board* (GitHub Projects — the plan of record)\n"
-        "`/susan board status` — weekly digest: what shipped, what only moved status, what's "
-        "blocked and on whom (add a range, e.g. `board status last 14 days`)\n"
-        "`/susan board pack` — the board/investor update, including an honest read on anything "
-        "*Partial* or *Done (dev)*\n"
-        "`/susan board risks` — P0/P1 items that would stop a pilot handover, ranked\n"
-        "`/susan board claims` — what you can describe to a customer as live today, and what you "
-        "must not overstate\n"
-        "`/susan customer ask Augur` — what we owe a customer, where each piece stands, and what "
-        "we're waiting on them for\n"
-        "`/susan roadmap can we promise streaming responses in the UK?` — any question, answered "
-        "from the board with issue numbers\n"
-        "`/susan roadmap add we need a continuous path for pushing model updates` — checks for "
-        "duplicates, drafts a properly formed issue, and *shows it to you before filing*\n\n"
-        "Susan quotes the *Status* word verbatim and treats *Partial* and *Done (dev)* as **not "
-        "done**. Every claim comes with an issue number so you can check it in a click. "
-        "Susan can file issues and open PRs — she never merges. "
-        "Needs GitHub connected with the `read:project` scope, plus `SUSAN_ROADMAP_ORG` / "
-        "`SUSAN_ROADMAP_PROJECT` on the server."
-    )
-    body_pr = (
-        "*PR summaries & weekly status — time ranges* (optional; default is last 7 days)\n"
-        "`last 14 days` · `past week` · `past month` · `since 2026-01-01` · `from 2026-01-01 to 2026-03-01` · "
-        "`last calendar week` (Mon–Sun UTC, previous week)"
-    )
-    body_repo = (
-        "*Repos*\n"
-        "Name `owner/repo` in the message (several: `org/a org/b` or `repos: org/a, org/b`), "
-        "or use `GITHUB_REPO` / `GITHUB_REPOS` on the server. "
-        "For *PR summaries* with multiple entries in `GITHUB_REPOS` and no repos in the text, "
-        "Susan shows a *multi-select* — choose repos, then *Run PR summary*. "
-        "*Weekly status*: in *tech* Slack channels (default names: `team-tech`, `software`, `security` — set "
-        "`SUSAN_TECH_WEEKLY_CHANNEL_NAMES` to override), Susan includes **every** repo in `GITHUB_REPOS` "
-        "(or `GITHUB_REPO` if the list is empty) and needs GitHub connected. In *other* channels, weekly status is "
-        "**Slack-only** (no GitHub). The digest follows the channel you run `/susan` in, or a pasted archives link.\n"
-        "For *PRs/issues*, if several repos are allowed she still asks you to pick one.\n\n"
-        "*Dependabot / vulnerabilities* (tech weekly status only): set `GITHUB_OAUTH_SCOPE` to include **`security_events`** "
-        "(for example `repo security_events`) and reconnect GitHub; otherwise Susan will note that alerts are unavailable.\n\n"
-        "*Google Drive & bookmarks* (weekly status): Google Docs/Drive URLs from **channel messages and channel bookmarks** "
-        "(needs `bookmarks:read`) seed a Drive scan; Susan lists files in linked folders (recursive) and linked files whose "
-        "`modifiedTime` falls in the date window — using the **Google account** of the user who runs `/susan`. Enable the "
-        "**Google Drive API** in GCP and reconnect Google after "
-        "deploy (new `drive.metadata.readonly` scope). Caps: `WEEKLY_DRIVE_MAX_FOLDERS`, `WEEKLY_DRIVE_MAX_DEPTH`, "
-        "`WEEKLY_DRIVE_MAX_FILES_REPORTED`, `WEEKLY_DRIVE_MAX_API_CALLS`."
-    )
-    blocks: list[dict] = [
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": "Susan — commands & examples", "emoji": True},
-        },
-        {"type": "section", "text": {"type": "mrkdwn", "text": body_how}},
-        {"type": "divider"},
-        {"type": "section", "text": {"type": "mrkdwn", "text": body_connect}},
-        {"type": "divider"},
-        {"type": "section", "text": {"type": "mrkdwn", "text": body_what}},
-        {"type": "divider"},
-        {"type": "section", "text": {"type": "mrkdwn", "text": body_ex}},
-        {"type": "divider"},
-        {"type": "section", "text": {"type": "mrkdwn", "text": body_roadmap}},
-        {"type": "divider"},
-        {"type": "section", "text": {"type": "mrkdwn", "text": body_pr}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": body_repo}},
+        "(⋯ → Copy link). You get a *private preview* — then *Approve*, *Edit*, or *Cancel*. "
+        "Weekly status and PR summaries post to the *channel* once approved; everything else "
+        "stays private unless you say otherwise.",
+        "*Most used*\n"
+        "• `/susan my actions` — *your* tasks across every channel, Gmail, Drive, and Granola (private)\n"
+        "• `/susan team actions` — *everyone's* open tasks in *this* channel\n"
+        "• `/susan weekly status` — team digest for this channel\n"
+        "• `/susan granola` — summarize your recent meetings\n"
+        "• `/susan needs my review` — PRs and asks waiting on you\n"
+        "• `/susan surface failures` — failing CI, promote, and cost alerts\n"
+        "• `/susan board status` — roadmap digest from the GitHub Projects board\n"
+        "• `/susan create issue in org/repo …` · `create a doc …` · `send email …`",
+        "*More detail*\n"
+        "`/susan help actions` · `help status` · `help roadmap` · `help connect` · "
+        "`help schedule` · `help all`\n"
+        "_Most commands take a time range: `last 14 days`, `past week`, `last calendar week`, "
+        "`since 2026-01-01`. Default is the last 7 days._",
     ]
+
+
+def _help_actions() -> list[str]:
+    return [
+        "*Actions — two different commands*\n"
+        "• `/susan my actions` — *your own* inbox: commitments you made, direct asks, mentions, "
+        "and pending replies. Reads *every channel Susan can see* plus Gmail, Drive comments, "
+        "and Granola. *Only you see it*, and it is never posted to a channel.\n"
+        "• `/susan team actions` — *everyone's* outstanding tasks in *this one channel*, with "
+        "*@mentions*. Posts to the channel after you approve. `/susan actions` does the same thing.",
+        "*Options*\n"
+        "• Add a range: `/susan my actions last 14 days` · `/susan team actions past month`\n"
+        "• `/susan team actions --no-approval` — post straight to the channel (for schedules). "
+        "Restrict who may use it with `SUSAN_WEEKLY_AUTO_POST_USER_IDS`.\n"
+        "• Team actions are kept in a *Google Sheet* (one tab per channel) so you can edit tasks "
+        "and status; Susan syncs on the next run.\n"
+        "• Reply in the digest thread with `done`, `in progress`, or `won't do` (reference `#1`) "
+        "and Susan remembers it for the next roundup.",
+    ]
+
+
+def _help_status() -> list[str]:
+    return [
+        "*Weekly status*\n"
+        "`/susan weekly status` · `/susan weekly report last 14 days` · `/susan team status last calendar week`\n"
+        "In *tech* channels (`team-tech`, `software`, `security` by default — override with "
+        "`SUSAN_TECH_WEEKLY_CHANNEL_NAMES`) Susan includes every repo in `GITHUB_REPOS` and needs "
+        "GitHub connected. In other channels the digest is *Slack-only*. It follows the channel you "
+        "run `/susan` in, or a pasted archives link.\n"
+        "`--no-approval` generates and posts immediately (for Monday schedules).",
+        "*PR summaries*\n"
+        "`/susan summarize merged prs for org/repo last 30 days` · "
+        "`/susan summarize merged prs for org/a org/b last 14 days`\n"
+        "Name `owner/repo` in the message (several: `org/a org/b` or `repos: org/a, org/b`), or set "
+        "`GITHUB_REPO` / `GITHUB_REPOS` on the server. With several repos configured and none named, "
+        "Susan shows a *multi-select*. For PRs and issues she still asks you to pick one repo.",
+        "*Time ranges* (optional; default last 7 days)\n"
+        "`last 14 days` · `past week` · `past month` · `since 2026-01-01` · "
+        "`from 2026-01-01 to 2026-03-01` · `last calendar week` (Mon–Sun UTC)",
+        "*Extra data sources* (weekly status)\n"
+        "• *Dependabot / vulnerabilities* — set `GITHUB_OAUTH_SCOPE` to include `security_events` "
+        "and reconnect GitHub, or Susan notes that alerts are unavailable.\n"
+        "• *Drive & bookmarks* — Google Doc/Drive URLs in channel messages and bookmarks seed a Drive "
+        "scan, using the Google account of whoever runs `/susan`. Enable the Drive API in GCP and "
+        "reconnect Google. Caps: `WEEKLY_DRIVE_MAX_FOLDERS`, `WEEKLY_DRIVE_MAX_DEPTH`, "
+        "`WEEKLY_DRIVE_MAX_FILES_REPORTED`, `WEEKLY_DRIVE_MAX_API_CALLS`.",
+    ]
+
+
+def _help_roadmap() -> list[str]:
+    return [
+        "*Roadmap board* (GitHub Projects — the plan of record)\n"
+        "• `/susan board status` — what shipped, what only moved status, what's blocked and on whom\n"
+        "• `/susan board pack` — the board/investor update, honest about *Partial* and *Done (dev)*\n"
+        "• `/susan board risks` — P0/P1 items that would stop a pilot handover, ranked\n"
+        "• `/susan board claims` — what you can tell a customer is live today\n"
+        "• `/susan customer ask Augur` — what we owe a customer and what we're waiting on\n"
+        "• `/susan roadmap can we promise streaming responses in the UK?` — any question, answered "
+        "from the board with issue numbers\n"
+        "• `/susan roadmap add <idea>` — checks for duplicates, drafts an issue, shows it before filing",
+        "Susan quotes the *Status* word verbatim and treats *Partial* and *Done (dev)* as *not done*. "
+        "Every claim carries an issue number. She can file issues and open PRs — she never merges.\n"
+        "_Needs GitHub connected with `read:project`, plus `SUSAN_ROADMAP_ORG` and "
+        "`SUSAN_ROADMAP_PROJECT` on the server._",
+    ]
+
+
+def _help_connect() -> list[str]:
+    return [
+        "*Connect accounts*\n"
+        "• `/susan connect` — everything configured on the server\n"
+        "• `/susan connect google` — Docs, Gmail, Calendar, Drive metadata\n"
+        "• `/susan connect github` — issues, PRs, PR summaries, tech-channel weekly status\n"
+        "• `/susan connect granola` — meeting notes\n"
+        "_Reconnect after Susan gains a new scope; she'll tell you when that's needed._",
+    ]
+
+
+def _help_schedule() -> list[str]:
+    return [
+        "*Schedules*\n"
+        "`/susan schedule add weekly status last calendar week every monday at 9:00 in #team-tech`\n"
+        "See `/susan schedule help` for the full syntax, listing, and removal.",
+    ]
+
+
+def _help_keywords() -> list[str]:
+    lines = [
+        f"• *{label}* — include one of: " + ", ".join(f"`{k}`" for k in kws)
+        for _key, (label, kws) in ACTIONS.items()
+    ]
+    return ["*Keywords Susan recognizes in free text*\n" + "\n".join(lines)]
+
+
+def susan_slash_help_response(topic: str = "") -> JSONResponse:
+    """Ephemeral Block Kit help; `topic` selects a focused page, "" is the overview."""
+    pages: dict[str, tuple[str, list[str]]] = {
+        "": ("Susan — help", _help_overview()),
+        "actions": ("Susan — actions", _help_actions()),
+        "status": ("Susan — weekly status & PR summaries", _help_status()),
+        "roadmap": ("Susan — roadmap board", _help_roadmap()),
+        "connect": ("Susan — connect accounts", _help_connect()),
+        "schedule": ("Susan — schedules", _help_schedule()),
+    }
+    if topic == "all":
+        title = "Susan — all commands"
+        bodies = (
+            _help_overview()[:1]
+            + _help_actions()
+            + _help_status()
+            + _help_roadmap()
+            + _help_connect()
+            + _help_schedule()
+            + _help_keywords()
+        )
+    else:
+        title, bodies = pages.get(topic, pages[""])
+
+    blocks: list[dict] = [
+        {"type": "header", "text": {"type": "plain_text", "text": title, "emoji": True}}
+    ]
+    for i, body in enumerate(bodies):
+        if i:
+            blocks.append({"type": "divider"})
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": body[:2900]}})
+    if topic:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {"type": "mrkdwn", "text": "`/susan help` for the overview"}
+                ],
+            }
+        )
     return JSONResponse(
         {
             "response_type": "ephemeral",
-            "text": "Susan — commands & examples (see the full message).",
+            "text": f"{title} (see the full message).",
             "blocks": blocks,
         }
     )
@@ -763,7 +827,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
         )
 
     if is_susan_help_command(text_lower):
-        return susan_slash_help_response()
+        return susan_slash_help_response(parse_help_topic(text_lower))
 
     schedule_remainder = parse_schedule_command(text)
     if schedule_remainder is not None:
@@ -823,7 +887,9 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
     actions_remainder = parse_action_items_command(text)
     if actions_remainder is not None:
         _, explicit_all_channels = _strip_all_channels_scope(actions_remainder)
-        actions_all_channels = is_personal_actions_command(text) or explicit_all_channels
+        actions_all_channels = is_personal_actions_command(text) or (
+            explicit_all_channels and not is_team_actions_command(text)
+        )
         _, actions_auto_post = strip_weekly_status_auto_post_flags(text)
         if actions_all_channels:
             actions_auto_post = False
@@ -874,13 +940,19 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
             )
         elif actions_auto_post:
             ack = (
-                "Got it — Susan is scanning Slack (and connected Drive, Granola, GitHub) for *action items* "
-                "and will *post a channel roundup with @mentions* when ready (`--no-approval`)."
+                "Got it — Susan is scanning *this channel* (and connected Drive, Granola, GitHub) for "
+                "*team actions* and will *post a roundup with @mentions* when ready (`--no-approval`)."
             )
         else:
             ack = (
-                "Got it — Susan is gathering *action items* from Slack and connected sources; "
-                "you'll get a preview with @mentions to approve."
+                "Got it — Susan is gathering *team actions* for *this channel* from Slack and connected "
+                "sources; you'll get a preview with @mentions to approve. "
+                "_For your own cross-channel inbox, use `/susan my actions`._"
+            )
+        if explicit_all_channels and is_team_actions_command(text):
+            ack += (
+                "\n\n_Note: team actions are always scoped to one channel, so the all-channels part was "
+                "ignored. Use `/susan my actions` for a cross-channel view._"
             )
         return JSONResponse({"response_type": "ephemeral", "text": ack})
 

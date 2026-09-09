@@ -7,6 +7,7 @@ from app.action_items import (
     _strip_all_channels_scope,
     format_action_items_message,
     is_personal_actions_command,
+    is_team_actions_command,
     parse_action_items_command,
     parse_action_items_time_window,
 )
@@ -29,6 +30,32 @@ def test_personal_actions_command_is_explicit() -> None:
     assert is_personal_actions_command("my action items last month")
     assert not is_personal_actions_command("actions")
     assert not is_personal_actions_command("actions last week")
+    assert not is_personal_actions_command("team actions")
+
+
+def test_team_actions_command_is_explicit() -> None:
+    assert is_team_actions_command("team actions")
+    assert is_team_actions_command("team actions last week")
+    assert is_team_actions_command("team action items last 14 days")
+    assert not is_team_actions_command("my actions")
+    # Bare "actions" is still a team digest; scheduled jobs send it.
+    assert not is_team_actions_command("actions")
+
+
+def test_team_command_stays_channel_scoped_despite_all_channels_phrase() -> None:
+    from app.action_items import use_personal_inbox
+
+    assert use_personal_inbox("my actions last week", explicit_all_channels=False)
+    assert use_personal_inbox("actions all channels", explicit_all_channels=True)
+    assert not use_personal_inbox("team actions", explicit_all_channels=False)
+    assert not use_personal_inbox("team actions all channels", explicit_all_channels=True)
+    assert not use_personal_inbox("actions last week", explicit_all_channels=False)
+
+
+def test_parse_team_actions_command_strips_prefix() -> None:
+    assert parse_action_items_command("team actions") == ""
+    assert parse_action_items_command("team actions last week") == "last week"
+    assert parse_action_items_command("team action items last 14 days") == "last 14 days"
 
 
 def test_parse_all_channel_actions_scope() -> None:

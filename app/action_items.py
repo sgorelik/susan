@@ -42,16 +42,17 @@ from app.weekly_context import (
 )
 from app.weekly_drive import action_items_google_docs_block
 
+_PERSONAL_ACTION_PREFIXES = ("my action items", "my actions", "my todos")
+_TEAM_ACTION_PREFIXES = ("team action items", "team actions", "team todos")
+# Bare "actions" stays a team digest: scheduled jobs and existing usage rely on it.
 _ACTION_PREFIXES = (
-    "my action items",
-    "my actions",
-    "my todos",
+    *_PERSONAL_ACTION_PREFIXES,
+    *_TEAM_ACTION_PREFIXES,
     "action items",
     "action item",
     "actions",
     "todos",
 )
-_PERSONAL_ACTION_PREFIXES = ("my action items", "my actions", "my todos")
 
 _STATUS_LABELS = {
     "open": "open",
@@ -75,13 +76,30 @@ def parse_action_items_command(text: str) -> str | None:
     return None
 
 
+def _starts_with_prefix(text: str, prefixes: tuple[str, ...]) -> bool:
+    lower = (text or "").strip().lower()
+    return any(lower == prefix or lower.startswith(prefix + " ") for prefix in prefixes)
+
+
 def is_personal_actions_command(text: str) -> bool:
     """Whether the command explicitly requests the caller's private action inbox."""
-    lower = (text or "").strip().lower()
-    return any(
-        lower == prefix or lower.startswith(prefix + " ")
-        for prefix in _PERSONAL_ACTION_PREFIXES
-    )
+    return _starts_with_prefix(text, _PERSONAL_ACTION_PREFIXES)
+
+
+def is_team_actions_command(text: str) -> bool:
+    """Whether the command explicitly requests the channel-wide team digest."""
+    return _starts_with_prefix(text, _TEAM_ACTION_PREFIXES)
+
+
+def use_personal_inbox(command_text: str, *, explicit_all_channels: bool) -> bool:
+    """Whether to build the caller's private cross-channel inbox.
+
+    An explicit team digest stays scoped to its channel even if the caller
+    tacked on an all-channels phrase.
+    """
+    if is_team_actions_command(command_text):
+        return False
+    return is_personal_actions_command(command_text) or explicit_all_channels
 
 
 def parse_action_items_time_window(remainder: str) -> tuple[str, str, str]:
@@ -561,7 +579,7 @@ async def publish_action_items_digest(
         sheet_url=sheet_url,
         item_count=len(active_for_display),
     )
-    title = f"Action items — {range_label}"
+    title = f"Team actions — {range_label}"
     post_thread = thread_ts
     if post_thread:
         data = await post_message(channel_id, header, thread_ts=post_thread)
@@ -600,13 +618,14 @@ async def process_action_items(
     *,
     auto_publish: bool = False,
 ) -> None:
-    personal_actions = is_personal_actions_command(command_text)
     parsed_remainder = parse_action_items_command(command_text)
     remainder, auto_publish_flag = _strip_flags(
         parsed_remainder if parsed_remainder is not None else command_text
     )
     remainder, explicit_all_channels = _strip_all_channels_scope(remainder)
-    all_channels = personal_actions or explicit_all_channels
+    all_channels = use_personal_inbox(
+        command_text, explicit_all_channels=explicit_all_channels
+    )
     auto_publish = auto_publish or auto_publish_flag
     if all_channels:
         auto_publish = False
@@ -733,7 +752,7 @@ async def process_action_items(
         return
 
     body = format_action_items_message(display_items, range_label, sheet_url=sheet_url)
-    title = f"Action items — {range_label}"
+    title = f"Team actions — {range_label}"
     meta = {
         "title": title,
         "body": body,
