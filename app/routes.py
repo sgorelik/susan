@@ -1,6 +1,7 @@
 """HTTP routes and FastAPI application factory."""
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -84,8 +85,6 @@ from app.channel_surface import (
     parse_standup_command,
     process_channel_surface,
 )
-import asyncio
-import os
 
 from app.sales_prep import parse_sales_prep_command, process_sales_prep
 from app.slack_events import handle_slack_event_callback, parse_events_body
@@ -450,11 +449,17 @@ def connect_granola_slack_response(
     channel_id: str | None = None,
     resume_id: str | None = None,
 ) -> JSONResponse:
-    """Ephemeral message with link to Granola OAuth. Optional resume_id continues the command after OAuth.
-
-    No shared/fallback Granola token exists — every user must authenticate their own
-    Granola account before Granola-dependent features become available.
-    """
+    """Report shared API access or offer per-user Granola OAuth."""
+    if (os.environ.get("GRANOLA_API_KEY") or "").strip():
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": (
+                    "Granola is already connected through Susan’s shared workspace API key. "
+                    "Try `/susan granola last week` (or `/susan gn last week`)."
+                ),
+            }
+        )
     granola_redir = granola_redirect_uri()
     if not granola_redir:
         return JSONResponse(

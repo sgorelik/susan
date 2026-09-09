@@ -1,8 +1,6 @@
 """Tests for the Granola OAuth integration (oauth.py + db.py)."""
 from __future__ import annotations
 
-import asyncio
-import os
 import urllib.parse
 from unittest import mock
 
@@ -256,3 +254,15 @@ async def test_oauth_resume_pending_supports_granola_provider(monkeypatch: pytes
     assert row["command_text"] == "/susan something granola-dependent"
     # Already consumed.
     assert await db.consume_oauth_resume_pending(rid, "U7", "granola") is None
+
+
+@pytest.mark.asyncio
+async def test_shared_granola_api_key_is_available_to_all_users(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import db
+
+    monkeypatch.setenv("GRANOLA_API_KEY", "shared-workspace-key")
+
+    assert await db.user_has_granola_tokens("U-without-oauth") is True
+    assert await db.get_granola_token("U-without-oauth") == "shared-workspace-key"

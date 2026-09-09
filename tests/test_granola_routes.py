@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     """Configure Granola env then build the FastAPI app fresh."""
+    monkeypatch.delenv("GRANOLA_API_KEY", raising=False)
     monkeypatch.setenv("GRANOLA_CLIENT_ID", "cid")
     monkeypatch.setenv("GRANOLA_CLIENT_SECRET", "csecret")
     monkeypatch.setenv("GRANOLA_REDIRECT_URI", "https://example.com/auth/granola/callback")
@@ -57,6 +58,17 @@ def test_slash_connect_granola_returns_link(client: TestClient) -> None:
     blocks_text = json.dumps(j["blocks"])
     assert "/auth/granola?state=" in blocks_text
     assert "Connect Granola Account" in blocks_text
+
+
+def test_connect_granola_reports_shared_api_key(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GRANOLA_API_KEY", "shared-key")
+
+    j = _slash_post(client, "connect granola")
+
+    assert "already connected" in j["text"]
+    assert "/susan granola last week" in j["text"]
 
 
 def test_slash_connect_combined_includes_granola(client: TestClient) -> None:

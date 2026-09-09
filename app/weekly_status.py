@@ -135,30 +135,36 @@ async def process_weekly_status(
             )
             return
 
+        github_error: str | None = None
+        per_repo: list[tuple[str, list[dict], list[dict], dict]] = []
         try:
             token = await get_github_token(user)
-        except ValueError as e:
-            await notify_user_ephemeral(channel, user, str(e), None, response_url)
-            return
 
-        async def one_repo(r: str) -> tuple[str, list[dict], list[dict], dict]:
-            merged, opened, dep = await asyncio.gather(
-                fetch_merged_prs_for_repo_range(r, since_d, until_d, token),
-                fetch_opened_prs_for_repo_range(r, since_d, until_d, token),
-                fetch_dependabot_alert_stats(r, since_d, until_d, token),
-            )
-            return r, merged, opened, dep
+            async def one_repo(r: str) -> tuple[str, list[dict], list[dict], dict]:
+                merged, opened, dep = await asyncio.gather(
+                    fetch_merged_prs_for_repo_range(r, since_d, until_d, token),
+                    fetch_opened_prs_for_repo_range(r, since_d, until_d, token),
+                    fetch_dependabot_alert_stats(r, since_d, until_d, token),
+                )
+                return r, merged, opened, dep
 
-        try:
             per_repo = await asyncio.gather(*[one_repo(r) for r in repos])
         except Exception as e:
             logger.exception("Weekly status GitHub fetch failed")
-            await notify_user_ephemeral(
-                channel, user, f"Susan error (GitHub): {e}", None, response_url
+            github_error = str(e)
+            logger.warning(
+                "Weekly status continuing without GitHub enrichment: %s",
+                github_error,
             )
-            return
 
         github_sections: list[str] = []
+        if github_error:
+            github_sections.append(
+                "### GitHub enrichment unavailable\n"
+                f"GitHub could not be queried for this run: {github_error}\n"
+                "Generate the weekly update from Slack, bookmarks, and Drive; mention this "
+                "source gap briefly and do not infer PR metrics."
+            )
         for r, merged, opened, dep in per_repo:
             authors = Counter()
             hours: list[float] = []

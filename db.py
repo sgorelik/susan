@@ -849,22 +849,19 @@ async def upsert_granola_token(slack_user_id: str, access_token: str) -> None:
 
 
 async def user_has_granola_tokens(slack_user_id: str) -> bool:
-    """True only if this Slack user has connected their own Granola account.
-
-    There is *no* shared/fallback token: every user must run ``/susan connect granola``.
-    """
+    """True when a shared API key or this user's OAuth token is available."""
+    if (os.environ.get("GRANOLA_API_KEY") or "").strip():
+        return True
     async with SessionLocal() as session:
         row = await session.get(GranolaToken, slack_user_id)
         return row is not None
 
 
 async def get_granola_token(slack_user_id: str) -> str:
-    """Return this Slack user's Granola access token, or raise if not connected.
-
-    No shared fallback — each user must authenticate individually. The error message
-    instructs the user to run ``/susan connect granola``; callers that want graceful
-    degradation should call :func:`user_has_granola_tokens` first and silently skip.
-    """
+    """Return the shared Granola API key or this user's OAuth access token."""
+    shared = (os.environ.get("GRANOLA_API_KEY") or "").strip()
+    if shared:
+        return shared
     async with SessionLocal() as session:
         row = await session.get(GranolaToken, slack_user_id)
         if row:
