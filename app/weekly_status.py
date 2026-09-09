@@ -285,12 +285,16 @@ async def process_weekly_status(
 
     max_tok = max(1500, min(32000, int(os.environ.get("WEEKLY_STATUS_MAX_TOKENS", "8192"))))
     try:
+        logger.info(
+            "Weekly status completion request prompt_chars=%s max_tokens=%s",
+            len(user_prompt),
+            max_tok,
+        )
         summary = await call_claude(
             system,
             user_prompt,
             max_tokens=max_tok,
             action="weekly_status",
-            model_route="commercial",
         )
     except Exception as e:
         logger.exception("Weekly status Claude failed")
@@ -298,9 +302,16 @@ async def process_weekly_status(
         return
 
     title = _weekly_status_title_line(repos, range_label, include_github=include_github)
+    model_route = summary.model_route
     if auto_publish:
         try:
-            await publish_weekly_status(channel, thread_ts, title, summary)
+            await publish_weekly_status(
+                channel,
+                thread_ts,
+                title,
+                summary,
+                model_route=model_route,
+            )
         except Exception as e:
             logger.exception("Weekly status auto-publish failed")
             await notify_user_ephemeral(
@@ -327,6 +338,7 @@ async def process_weekly_status(
         "thread_ts": thread_ts,
         "repos": repos if include_github else [],
         "include_github": include_github,
+        "model_route": model_route,
     }
     draft_id = await create_user_draft(
         user, "weekly_status", json.dumps(meta, ensure_ascii=False)

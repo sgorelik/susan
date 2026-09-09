@@ -5,11 +5,10 @@ import os
 
 from app.config import ANTHROPIC_MODEL
 
-# Context-heavy flows that need a large commercial model (not the F1 sovereign instance).
+# Flows that explicitly require a commercial model.
 COMMERCIAL_ACTIONS = frozenset(
     {
         "sales_prep",
-        "weekly_status",
         "granola_cmd",
         "action_items_cmd",
         "surface_standups",
@@ -30,7 +29,6 @@ COMMERCIAL_ACTIONS = frozenset(
 # Default Anthropic model per commercial action (override via env, e.g. SALES_PREP_ANTHROPIC_MODEL).
 COMMERCIAL_ACTION_MODELS: dict[str, str] = {
     "sales_prep": "claude-opus-4-6",
-    "weekly_status": "claude-opus-4-6",
     "roadmap_status": "claude-opus-4-6",
     "roadmap_pack": "claude-opus-4-6",
 }
@@ -43,7 +41,7 @@ def is_commercial_action(action: str | None, model_route: str | None = None) -> 
 
 
 def route_for_action(action: str | None) -> str:
-    """Return ``commercial`` or ``default`` for the given slash-command action key."""
+    """Return the configured ``commercial``, ``sovereign``, or ``default`` route."""
     if action in COMMERCIAL_ACTIONS:
         return "commercial"
     mode = (os.environ.get("SUSAN_DEFAULT_MODEL_ROUTE") or "default").strip().lower()

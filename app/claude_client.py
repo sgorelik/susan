@@ -17,14 +17,25 @@ from app.config import (
     f1_model_active,
     logger,
 )
-from app.model_routing import is_commercial_action, resolve_model
+from app.model_routing import is_commercial_action, resolve_model, route_for_action
+
+
+class ModelCompletion(str):
+    """Completion text annotated with the route that actually served it."""
+
+    model_route: str
+
+    def __new__(cls, text: str, *, model_route: str) -> ModelCompletion:
+        value = super().__new__(cls, text)
+        value.model_route = model_route
+        return value
 
 
 async def _call_f1_sovereign(system: str, user: str, max_tokens: int | None = None) -> str:
     """Call the self-hosted FrontierOne model via its OpenAI-compatible endpoint.
 
-    Used for light commands when F1_MODEL_BASE_URL is set. Same (system, user) -> text
-    contract as call_claude.
+    Used for sovereign-routed commands. Same (system, user) -> text contract as
+    call_claude.
     """
     url = f"{F1_MODEL_BASE_URL}/chat/completions"
     headers = {"content-type": "application/json"}
@@ -32,7 +43,7 @@ async def _call_f1_sovereign(system: str, user: str, max_tokens: int | None = No
         headers["Authorization"] = f"Bearer {F1_MODEL_API_KEY}"
     if len(user) > F1_MODEL_MAX_PROMPT_CHARS:
         user = "[earlier context truncated]\n" + user[-F1_MODEL_MAX_PROMPT_CHARS:]
-    req_max = max_tokens if max_tokens is not None else 1500
+    req_max = max_tokens if max_tokens is not None else F1_MODEL_MAX_COMPLETION_TOKENS
     body = {
         "model": F1_MODEL_NAME,
         "max_tokens": min(req_max, F1_MODEL_MAX_COMPLETION_TOKENS),
@@ -113,9 +124,8 @@ async def _call_anthropic(
 ) -> str:
     if not ANTHROPIC_API_KEY:
         raise RuntimeError(
-            "ANTHROPIC_API_KEY is not set. Context-heavy commands (sales prep, weekly status, "
-            "Granola, action items) require Anthropic; light commands need F1_MODEL_BASE_URL "
-            "or an Anthropic key."
+            "ANTHROPIC_API_KEY is not set. Commercial-routed commands require Anthropic; "
+            "sovereign-routed commands need F1_MODEL_BASE_URL."
         )
     max_attempts = max(1, min(8, int(os.environ.get("ANTHROPIC_MAX_RETRIES", "5"))))
     base_delay = max(1.0, float(os.environ.get("ANTHROPIC_RETRY_DELAY_SECONDS", "2")))
@@ -214,18 +224,24 @@ async def call_claude(
     *,
     action: str | None = None,
     model_route: str | None = None,
-) -> str:
-    """Route to commercial Anthropic or the self-hosted sovereign model."""
-    if is_commercial_action(action, model_route):
+) -> ModelCompletion:
+    """Route the request and return text annotated with the route actually used."""
+    requested_route = (model_route or route_for_action(action)).strip().lower()
+    if is_commercial_action(action, requested_route):
         model = resolve_model(action=action, model_route="commercial")
         logger.info(
             "LLM route: commercial Anthropic (action=%s model=%s)", action, model
         )
-        return await _call_anthropic(
+        text = await _call_anthropic(
             system, user, max_tokens, action=action, model_route="commercial"
         )
-    if f1_model_active():
+        return ModelCompletion(text, model_route="commercial")
+    if requested_route in ("sovereign", "local") and f1_model_active():
         logger.info("LLM route: F1 sovereign (action=%s)", action)
-        return await _call_f1_sovereign(system, user, max_tokens)
+        text = await _call_f1_sovereign(system, user, max_tokens)
+        return ModelCompletion(text, model_route="sovereign")
     logger.info("LLM route: default Anthropic (action=%s)", action)
-    return await _call_anthropic(system, user, max_tokens, action=action, model_route=model_route)
+    text = await _call_anthropic(
+        system, user, max_tokens, action=action, model_route=model_route
+    )
+    return ModelCompletion(text, model_route="commercial")

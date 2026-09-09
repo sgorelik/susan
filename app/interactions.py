@@ -562,6 +562,9 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                     meta = json.loads(row["content"])
                     title = (meta.get("title") or "Weekly status").strip()
                     body = meta.get("body") or ""
+                    model_route = meta.get("model_route")
+                    if model_route not in ("sovereign", "commercial"):
+                        model_route = None
                     post_ch = (meta.get("channel_id") or channel or "").strip()
                     th = meta.get("thread_ts")
                     if not isinstance(th, str) or not th.strip():
@@ -570,7 +573,13 @@ async def handle_action(request: Request, background_tasks: BackgroundTasks):
                         result = "Could not post — missing channel."
                     else:
                         notify_ch = notify_ch or post_ch
-                        await publish_weekly_status(post_ch, th, title, body)
+                        await publish_weekly_status(
+                            post_ch,
+                            th,
+                            title,
+                            body,
+                            model_route=model_route,
+                        )
                         result = "Posted the weekly status Canvas link to the channel."
                 except (json.JSONDecodeError, TypeError, RuntimeError) as e:
                     logger.exception("weekly_status post failed")

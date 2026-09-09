@@ -17,17 +17,19 @@ ANTHROPIC_API_KEY = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
 ANTHROPIC_MODEL = (os.environ.get("ANTHROPIC_MODEL") or "claude-sonnet-4-6").strip()
 
 # --- FrontierOne sovereign model (OpenAI-compatible, self-hosted on OVH) ---
-# When F1_MODEL_BASE_URL is set, ALL LLM calls route here instead of Anthropic,
-# and every Slack message is attributed to the sovereign model.
+# When configured, eligible LLM calls can route here instead of Anthropic.
+# Attribution is based on the route that actually served each completion.
 F1_MODEL_BASE_URL = (os.environ.get("F1_MODEL_BASE_URL") or "").strip().rstrip("/")
 F1_MODEL_API_KEY = (os.environ.get("F1_MODEL_API_KEY") or "").strip()
-F1_MODEL_NAME = (os.environ.get("F1_MODEL_NAME") or "model-a").strip()
+F1_MODEL_NAME = (
+    os.environ.get("F1_MODEL_NAME") or "deepseek-ai-deepseek-v4-a05f5b"
+).strip()
 F1_ATTRIBUTION = "running on Secure Sovereign FrontierOne AI model"
-# Keep susan within a small, model-friendly context (a 7B model doesn't benefit
-# from huge contexts, and this removes any dependence on the served context size).
-# Prompt is truncated (keeping the most recent text) to this many chars (~4 chars/token).
-F1_MODEL_MAX_PROMPT_CHARS = int(os.environ.get("F1_MODEL_MAX_PROMPT_CHARS", "20000"))
-F1_MODEL_MAX_COMPLETION_TOKENS = int(os.environ.get("F1_MODEL_MAX_COMPLETION_TOKENS", "1500"))
+# Keep a high safety cap while preserving full weekly inputs for the 262k-context endpoint.
+F1_MODEL_MAX_PROMPT_CHARS = int(os.environ.get("F1_MODEL_MAX_PROMPT_CHARS", "350000"))
+F1_MODEL_MAX_COMPLETION_TOKENS = int(
+    os.environ.get("F1_MODEL_MAX_COMPLETION_TOKENS", "16384")
+)
 
 
 def f1_model_active() -> bool:
