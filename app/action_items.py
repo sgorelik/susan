@@ -6,7 +6,6 @@ import json
 import os
 import re
 from inspect import cleandoc
-from typing import Any
 
 from db import (
     ACTION_ITEM_ACTIVE_STATUSES,
@@ -27,11 +26,14 @@ from app.config import SUSAN_VOICE, logger
 from app.github_http import fetch_merged_prs_for_repo_range, fetch_opened_prs_for_repo_range
 from app.action_items_sheet import sync_action_items_sheet, sync_sheet_after_status_updates
 from app.granola_summarize import _format_notes_for_prompt, collect_granola_notes_for_window
+from app.personal_actions_google import collect_personal_google_actions
 from app.slack_api import (
+    fetch_slack_all_channel_history_since,
     fetch_slack_channel_history_since,
     notify_user_ephemeral,
     post_message,
     slack_channel_bookmarks_for_weekly,
+    slack_user_display_name,
 )
 from app.weekly_context import (
     parse_weekly_status_time_range,
@@ -90,36 +92,61 @@ def _strip_flags(remainder: str) -> tuple[str, bool]:
     return strip_weekly_status_auto_post_flags(remainder)
 
 
+def _strip_all_channels_scope(remainder: str) -> tuple[str, bool]:
+    """Remove an explicit all-channel scope phrase from an actions command."""
+    pattern = re.compile(
+        r"(?i)(?:\bacross\s+all\s+channels\b|\bfrom\s+all\s+channels\b|"
+        r"\ball\s+channels\b|\bacross\s+slack\b)"
+    )
+    all_channels = bool(pattern.search(remainder or ""))
+    cleaned = pattern.sub(" ", remainder or "")
+    return re.sub(r"\s+", " ", cleaned).strip(), all_channels
+
+
 async def _gather_context_blocks(
     user: str,
     hist_channel: str,
     since_d: str,
     until_d: str,
     slack_digest: str,
-) -> str:
+    *,
+    all_channels: bool = False,
+) -> tuple[str, list[str]]:
     """Optional Google Drive, Granola, GitHub snippets appended to the Claude prompt."""
     blocks: list[str] = []
-    bookmark_google, bookmark_md = await slack_channel_bookmarks_for_weekly(hist_channel)
-    if bookmark_md:
-        blocks.append(f"### Channel bookmarks\n{bookmark_md}")
+    warnings: list[str] = []
+    bookmark_google: list[str] = []
+    if not all_channels:
+        bookmark_google, bookmark_md = await slack_channel_bookmarks_for_weekly(hist_channel)
+        if bookmark_md:
+            blocks.append(f"### Channel bookmarks\n{bookmark_md}")
 
     if await user_has_google_tokens(user):
         try:
-            docs_block = await action_items_google_docs_block(
-                user,
-                slack_digest,
-                extra_google_urls=bookmark_google,
-            )
-            if docs_block.strip():
-                blocks.append(docs_block.strip())
-            else:
-                blocks.append(
-                    "_(No Google Doc links in channel messages or bookmarks — "
-                    "post or bookmark a doc URL to include outstanding tasks from Docs.)_"
+            if all_channels:
+                google_block, google_warnings = await collect_personal_google_actions(
+                    user, since_d, until_d
                 )
+                if google_block.strip():
+                    blocks.append(google_block.strip())
+                warnings.extend(google_warnings)
+            else:
+                docs_block = await action_items_google_docs_block(
+                    user,
+                    slack_digest,
+                    extra_google_urls=bookmark_google,
+                )
+                if docs_block.strip():
+                    blocks.append(docs_block.strip())
+                else:
+                    blocks.append(
+                        "_(No Google Doc links in channel messages or bookmarks — "
+                        "post or bookmark a doc URL to include outstanding tasks from Docs.)_"
+                    )
         except Exception as e:
             logger.warning("Action items Google Docs block failed: %s", e)
             blocks.append(f"_(Google Docs unavailable: {e})_")
+            warnings.append(f"Google unavailable: {e}")
     else:
         blocks.append("_(Google not connected — skipping Docs/Drive scan.)_")
 
@@ -189,7 +216,7 @@ async def _gather_context_blocks(
     blocks.append(
         "_(Calendar read is not enabled; action items come from Slack, Drive, Granola, and GitHub when connected.)_"
     )
-    return "\n\n".join(blocks)
+    return "\n\n".join(blocks), warnings
 
 
 def _format_items_for_claude(items: list[dict]) -> str:
@@ -427,11 +454,23 @@ async def _extract_action_items_with_claude(
     slack_digest: str,
     extra_context: str,
     existing_items: list[dict],
+    focus_user_id: str | None = None,
+    focus_user_name: str | None = None,
 ) -> list[dict]:
+    focus_rule = ""
+    if focus_user_id:
+        focus_rule = (
+            "\nThis is a PRIVATE PERSONAL ACTION INBOX. Return ONLY actions belonging to "
+            f"<@{focus_user_id}> ({focus_user_name or focus_user_id}): their explicit "
+            "commitments, direct asks/mentions from others, requested approvals/replies, "
+            "and assigned next steps. Set every returned assignee_slack_id to "
+            f'"{focus_user_id}". Do not return other people\'s work or generic team tasks.\n'
+        )
     system = cleandoc(
         f"""
         You are Susan. Extract actionable tasks with clear owners from ALL provided sources.
         {SUSAN_VOICE}
+        {focus_rule}
 
         Output ONLY valid JSON (no markdown outside the JSON):
 
@@ -442,16 +481,21 @@ async def _extract_action_items_with_claude(
               "text": "<short imperative task — one line>",
               "assignee_slack_id": "<Slack user id U… from transcript, or null>",
               "status": "open|in_progress",
-              "source": "slack|granola|drive|github",
+              "source": "slack|gmail|granola|drive|github",
               "status_note": "<optional>"
             }}
           ]
         }}
 
         Where to look (scan every section — do not rely on Slack main messages alone):
-        - **Slack channel**: top-level messages AND thread replies. Commitments and @mention asks count.
-        - **Google Docs**: unchecked checklist items, "Action items", "TODO", "Owner", open tasks.
-        - **Granola notes**: "Action items", "Next steps", "Follow-ups", transcript commitments.
+        - **Slack**: top-level messages and thread replies across every provided channel.
+          Commitments, direct mentions, questions requiring a reply, and asks count.
+        - **Gmail**: messages addressed to the user that contain a concrete request,
+          promised reply, approval needed, or deadline. Do not turn newsletters into tasks.
+        - **Google Docs/Drive**: unresolved comments mentioning the user, unchecked
+          assigned items, "Action items", "TODO", "Owner", and open tasks.
+        - **Granola notes**: "Action items", "Next steps", "Follow-ups", asks from
+          other people, and transcript commitments.
         - **GitHub**: opened PRs that imply follow-up work.
 
         Rules:
@@ -475,6 +519,12 @@ async def _extract_action_items_with_claude(
     try:
         parsed = _parse_extraction_json(raw)
         parsed = _drop_terminal_and_completed(parsed, existing_items)
+        if focus_user_id:
+            parsed = [
+                item
+                for item in parsed
+                if item.get("assignee_slack_id") == focus_user_id
+            ]
         return _cap_items_per_assignee(parsed)
     except json.JSONDecodeError as e:
         logger.error("Action items JSON parse failed: %s raw=%r", e, raw[:500])
@@ -542,15 +592,23 @@ async def process_action_items(
     *,
     auto_publish: bool = False,
 ) -> None:
-    remainder, auto_publish_flag = _strip_flags(command_text)
+    parsed_remainder = parse_action_items_command(command_text)
+    remainder, auto_publish_flag = _strip_flags(
+        parsed_remainder if parsed_remainder is not None else command_text
+    )
+    remainder, all_channels = _strip_all_channels_scope(remainder)
     auto_publish = auto_publish or auto_publish_flag
+    if all_channels:
+        auto_publish = False
 
     since_d, until_d, range_label = parse_action_items_time_window(remainder)
     oldest_ts = utc_date_start_slack_ts(since_d)
 
     sheet_url: str | None = None
     sheet_err: str | None = None
-    if await user_has_google_tokens(user):
+    if all_channels:
+        sheet_err = None
+    elif await user_has_google_tokens(user):
         try:
             sheet_url = await sync_action_items_sheet(user, hist_channel)
         except Exception as e:
@@ -562,17 +620,31 @@ async def process_action_items(
             "Run `/susan connect google` to create the team ledger on first use."
         )
 
+    skipped_channels: list[str] = []
     try:
-        slack_digest = await fetch_slack_channel_history_since(
-            hist_channel, oldest_ts, user, include_thread_replies=True
-        )
+        if all_channels:
+            slack_digest, skipped_channels = await fetch_slack_all_channel_history_since(
+                oldest_ts, user
+            )
+        else:
+            slack_digest = await fetch_slack_channel_history_since(
+                hist_channel, oldest_ts, user, include_thread_replies=True
+            )
     except Exception as e:
         logger.exception("Action items Slack fetch failed")
         await notify_user_ephemeral(channel, user, f"Susan error (Slack): {e}", None, response_url)
         return
 
-    extra = await _gather_context_blocks(user, hist_channel, since_d, until_d, slack_digest)
-    existing = await list_active_action_items(hist_channel)
+    extra, source_warnings = await _gather_context_blocks(
+        user,
+        hist_channel,
+        since_d,
+        until_d,
+        slack_digest,
+        all_channels=all_channels,
+    )
+    existing = [] if all_channels else await list_active_action_items(hist_channel)
+    focus_name = await slack_user_display_name(user) if all_channels else None
 
     try:
         extracted = await _extract_action_items_with_claude(
@@ -580,10 +652,31 @@ async def process_action_items(
             slack_digest=slack_digest,
             extra_context=extra,
             existing_items=existing,
+            focus_user_id=user if all_channels else None,
+            focus_user_name=focus_name,
         )
     except Exception as e:
         logger.exception("Action items extraction failed")
         await notify_user_ephemeral(channel, user, f"Susan error: {e}", None, response_url)
+        return
+
+    if all_channels:
+        body = format_action_items_message(
+            extracted,
+            f"{range_label} across all accessible channels",
+            include_instructions=False,
+        )
+        notes: list[str] = []
+        if skipped_channels:
+            shown = ", ".join(skipped_channels[:8])
+            notes.append(
+                f"Slack channels skipped: {shown}"
+                + ("…" if len(skipped_channels) > 8 else "")
+            )
+        notes.extend(source_warnings)
+        if notes:
+            body += "\n\n⚠️ _" + " · ".join(notes) + "_"
+        await notify_user_ephemeral(channel, user, body, None, response_url)
         return
 
     merged = await upsert_action_items(hist_channel, extracted)

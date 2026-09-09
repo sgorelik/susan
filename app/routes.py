@@ -78,7 +78,11 @@ from app.weekly_context import (
     weekly_status_include_github,
 )
 from app.granola_summarize import parse_granola_slash_command, process_granola_summarize
-from app.action_items import parse_action_items_command, process_action_items
+from app.action_items import (
+    _strip_all_channels_scope,
+    parse_action_items_command,
+    process_action_items,
+)
 from app.channel_surface import (
     parse_failures_command,
     parse_reviews_command,
@@ -614,6 +618,8 @@ def susan_slash_help_response() -> JSONResponse:
         "`/susan granola group sync notes last 14 days`\n"
         "`/susan actions` or `/susan action items` — outstanding tasks with *@mentions* from Slack, "
         "Drive, Granola, and GitHub; kept in a *Google Sheet* (one tab per channel) for provenance\n"
+        "`/susan actions all channels last week` — private personal inbox of your Slack asks/mentions, "
+        "Gmail requests, Drive comment mentions, and Granola commitments across the week\n"
         "`/susan actions last 14 days --no-approval` — for scheduled Slack messages (posts directly to channel)\n"
         "`/susan standups last week` — summarize daily standup notes from #team-tech\n"
         "`/susan surface failures` / `what's failing` — failing CI/promote/cost alerts from alert channels\n"
@@ -815,7 +821,10 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
 
     actions_remainder = parse_action_items_command(text)
     if actions_remainder is not None:
+        _, actions_all_channels = _strip_all_channels_scope(actions_remainder)
         _, actions_auto_post = strip_weekly_status_auto_post_flags(text)
+        if actions_all_channels:
+            actions_auto_post = False
         if actions_auto_post and not weekly_status_auto_post_user_allowed(user):
             return JSONResponse(
                 {
@@ -856,7 +865,12 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                     logger.error("Could not notify user after action items error: %s", e2)
 
         background_tasks.add_task(run_action_items)
-        if actions_auto_post:
+        if actions_all_channels:
+            ack = (
+                "Got it — Susan is building your *private personal action inbox* from "
+                "all accessible Slack channels, Gmail, Drive comments, Granola, and GitHub."
+            )
+        elif actions_auto_post:
             ack = (
                 "Got it — Susan is scanning Slack (and connected Drive, Granola, GitHub) for *action items* "
                 "and will *post a channel roundup with @mentions* when ready (`--no-approval`)."

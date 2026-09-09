@@ -1,6 +1,7 @@
 """Slack signing verification, history, posting, and recipient resolution."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -503,6 +504,98 @@ async def fetch_slack_channel_history_since(
         return "(No channel messages in this time window.)"
     return out
 
+
+async def fetch_slack_all_channel_history_since(
+    oldest_slack_ts: str,
+    slack_user_id: str,
+) -> tuple[str, list[str]]:
+    """History from every public/private channel the bot belongs to.
+
+    Public channels Susan has not joined are deliberately excluded; a personal
+    all-channel query must not silently make the bot join unrelated channels.
+    """
+    max_channels = max(
+        1, min(200, int(os.environ.get("ACTION_ITEMS_ALL_CHANNEL_MAX_CHANNELS", "60")))
+    )
+    per_channel_chars = max(
+        1000,
+        min(
+            50_000,
+            int(os.environ.get("ACTION_ITEMS_ALL_CHANNEL_MAX_CHARS_PER_CHANNEL", "12000")),
+        ),
+    )
+    total_chars_cap = max(
+        10_000,
+        min(
+            500_000,
+            int(os.environ.get("ACTION_ITEMS_ALL_CHANNEL_MAX_TOTAL_CHARS", "250000")),
+        ),
+    )
+    conversations: list[tuple[str, str]] = []
+    cursor: str | None = None
+    async with httpx.AsyncClient(timeout=45) as client:
+        while len(conversations) < max_channels:
+            params = {
+                "types": "public_channel,private_channel",
+                "exclude_archived": "true",
+                "limit": "200",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            r = await client.get(
+                "https://slack.com/api/conversations.list",
+                headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+                params=params,
+            )
+            data = r.json()
+            if not data.get("ok"):
+                raise RuntimeError(
+                    f"Could not list Slack conversations ({data.get('error', 'unknown_error')})."
+                )
+            for ch in data.get("channels") or []:
+                cid = str(ch.get("id") or "")
+                if not cid or not ch.get("is_member"):
+                    continue
+                name = (
+                    ch.get("name")
+                    or ch.get("name_normalized")
+                    or cid
+                )
+                conversations.append((cid, str(name)))
+                if len(conversations) >= max_channels:
+                    break
+            cursor = (data.get("response_metadata") or {}).get("next_cursor") or None
+            if not cursor:
+                break
+
+    sections: list[str] = []
+    skipped: list[str] = []
+    total = 0
+    for cid, name in conversations:
+        try:
+            history = await fetch_slack_channel_history_since(
+                cid,
+                oldest_slack_ts,
+                slack_user_id,
+                include_thread_replies=True,
+            )
+        except Exception as e:
+            logger.warning("All-channel actions skipped Slack channel %s: %s", cid, e)
+            skipped.append(name)
+            continue
+        if history.startswith("(No channel messages"):
+            continue
+        section = f"### Slack #{name} ({cid})\n{history[:per_channel_chars]}"
+        if total + len(section) > total_chars_cap:
+            skipped.append(f"{name} (total context cap)")
+            break
+        sections.append(section)
+        total += len(section)
+        await asyncio.sleep(0.2)
+
+    if not sections:
+        return "(No accessible Slack messages in this time window.)", skipped
+    return "\n\n".join(sections), skipped
 
 
 async def slack_api_conversation_channel_name(channel_id: str) -> str | None:

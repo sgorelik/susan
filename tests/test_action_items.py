@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from app.action_items import (
+    _strip_all_channels_scope,
     format_action_items_message,
     parse_action_items_command,
     parse_action_items_time_window,
@@ -17,6 +18,64 @@ def test_parse_action_items_command() -> None:
     assert parse_action_items_command("todos") == ""
     assert parse_action_items_command("create issue") is None
     assert parse_action_items_command("interactions") is None
+
+
+def test_parse_all_channel_actions_scope() -> None:
+    assert _strip_all_channels_scope("all channels last week") == ("last week", True)
+    assert _strip_all_channels_scope("last week across all channels") == (
+        "last week",
+        True,
+    )
+    assert _strip_all_channels_scope("last week") == ("last week", False)
+
+
+@pytest.mark.asyncio
+async def test_personal_inbox_filters_other_peoples_actions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+
+    import app.action_items as actions
+    from app.claude_client import ModelCompletion
+
+    async def fake_completion(*args: object, **kwargs: object) -> ModelCompletion:
+        return ModelCompletion(
+            json.dumps(
+                {
+                    "items": [
+                        {
+                            "id": None,
+                            "text": "Reply to Saga",
+                            "assignee_slack_id": "U12345678",
+                            "status": "open",
+                            "source": "gmail",
+                        },
+                        {
+                            "id": None,
+                            "text": "Alex task",
+                            "assignee_slack_id": "U87654321",
+                            "status": "open",
+                            "source": "slack",
+                        },
+                    ]
+                }
+            ),
+            model_route="commercial",
+            model_name="claude-opus-4-6",
+        )
+
+    monkeypatch.setattr(actions, "call_claude", fake_completion)
+
+    result = await actions._extract_action_items_with_claude(
+        range_label="last week",
+        slack_digest="",
+        extra_context="",
+        existing_items=[],
+        focus_user_id="U12345678",
+        focus_user_name="Stacy",
+    )
+
+    assert [item["text"] for item in result] == ["Reply to Saga"]
 
 
 def test_format_action_items_message_mentions() -> None:
