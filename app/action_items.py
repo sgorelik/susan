@@ -340,14 +340,13 @@ def _parse_extraction_json(raw: str) -> list[dict]:
     return out
 
 
-def _build_item_numbers(items: list[dict]) -> dict[str, int]:
-    """Stable global numbers for thread status replies (#1, #2, …)."""
-    numbers: dict[str, int] = {}
-    for i, it in enumerate(items, 1):
-        iid = (it.get("id") or "").strip()
-        if iid:
-            numbers[iid] = i
-    return numbers
+def _build_item_numbers(items: list[dict]) -> dict[int, int]:
+    """Global numbers for thread status replies (#1, #2, …), keyed by item identity.
+
+    Personal-inbox items come straight from extraction and are never persisted,
+    so numbering cannot depend on a database id.
+    """
+    return {id(it): i for i, it in enumerate(items, 1)}
 
 
 def _group_items_by_assignee(items: list[dict]) -> list[tuple[str | None, list[dict]]]:
@@ -404,7 +403,7 @@ def format_action_items_header(
 def format_assignee_action_items_message(
     assignee_slack_id: str | None,
     items: list[dict],
-    item_numbers: dict[str, int],
+    item_numbers: dict[int, int],
 ) -> str:
     """One Slack message tagging a single assignee with their numbered items."""
     if not items:
@@ -414,12 +413,8 @@ def format_assignee_action_items_message(
         lines = [f"<@{assignee_slack_id}> you have *{count}* outstanding:"]
     else:
         lines = [f"*Unassigned* — *{count}* item(s):"]
-    for it in items:
-        iid = (it.get("id") or "").strip()
-        num = item_numbers.get(iid)
-        if num is None:
-            continue
-        lines.append(_format_item_line(it, num))
+    for position, it in enumerate(items, 1):
+        lines.append(_format_item_line(it, item_numbers.get(id(it), position)))
     return "\n".join(lines)
 
 

@@ -122,6 +122,21 @@ def test_format_action_items_message_mentions() -> None:
     assert "in progress" in msg
 
 
+def test_personal_inbox_items_render_without_database_ids() -> None:
+    """Extraction output has no ids; every counted item must still be listed."""
+    items = [
+        {"id": None, "text": f"Task {n}", "assignee_slack_id": "U123ABC", "status": "open"}
+        for n in range(1, 8)
+    ]
+    msg = format_action_items_message(
+        items, "last week across all accessible channels", include_instructions=False
+    )
+    assert "*7* outstanding action item(s)" in msg
+    assert "<@U123ABC> you have *7* outstanding:" in msg
+    for n in range(1, 8):
+        assert f"*{n}.* Task {n}" in msg
+
+
 def test_group_items_by_assignee() -> None:
     from app.action_items import _group_items_by_assignee
 
