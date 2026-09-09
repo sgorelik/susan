@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from app.config import ACTIONS
 from app.sales_prep import extract_search_terms, parse_sales_prep_command
+from app.slack_api import detect_action
 
 
 def test_parse_sales_prep_command_primary() -> None:
@@ -11,6 +12,12 @@ def test_parse_sales_prep_command_primary() -> None:
     assert parse_sales_prep_command("Prep Me For A Sales Call With Jane Doe at BigBank") == (
         "Jane Doe at BigBank"
     )
+
+
+def test_parse_sales_prep_accepts_prepare() -> None:
+    """`prepare` is the natural phrasing and previously fell through to the PR action."""
+    assert parse_sales_prep_command("prepare me for a sales call with Saga") == "Saga"
+    assert parse_sales_prep_command("prepare for a sales call with Acme Corp") == "Acme Corp"
 
 
 def test_parse_sales_prep_command_alternates() -> None:
@@ -28,8 +35,11 @@ def test_parse_sales_prep_command_rejects_unrelated() -> None:
 
 def test_sales_prep_not_matched_by_detect_action() -> None:
     assert ACTIONS["sales_prep"][1] == []
-    # "prep" contains substring "pr" — explicit parser in routes.py runs before detect_action.
     assert parse_sales_prep_command("prep me for a sales call with Acme") == "Acme"
+    # Belt and braces: even if the explicit parser misses a phrasing, keyword
+    # detection must not silently turn a sales request into a GitHub PR.
+    assert detect_action("prepare me for a sales call with Saga") is None
+    assert detect_action("prep me for a sales call with Acme") is None
 
 
 def test_extract_search_terms() -> None:

@@ -34,7 +34,7 @@ from app.weekly_drive import (
 from db import get_granola_token, get_valid_access_token, user_has_google_tokens, user_has_granola_tokens
 
 _SALES_PREP_CMD_RE = re.compile(
-    r"^prep\s+(?:me\s+)?for\s+(?:a\s+)?sales\s+call\s+with\s+(.+)$",
+    r"^prep(?:are)?\s+(?:me\s+)?for\s+(?:a\s+)?sales\s+call\s+with\s+(.+)$",
     re.I,
 )
 _SALES_PREP_ALT_RE = re.compile(

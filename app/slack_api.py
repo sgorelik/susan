@@ -94,10 +94,25 @@ def verify_slack(req_body: bytes, timestamp: str, signature: str) -> bool:
     return True
 
 
+_ACTION_KEYWORD_RES: dict[str, re.Pattern[str]] = {}
+
+
+def _action_keyword_re(keyword: str) -> re.Pattern[str]:
+    """Whole-word keyword match, tolerating a plural s.
+
+    Substring matching made every two-letter keyword a trap: `pr` matched inside
+    `prepare`, so "prepare me for a sales call" was read as "create a GitHub PR".
+    """
+    cached = _ACTION_KEYWORD_RES.get(keyword)
+    if cached is None:
+        cached = re.compile(rf"\b{re.escape(keyword)}s?\b", re.IGNORECASE)
+        _ACTION_KEYWORD_RES[keyword] = cached
+    return cached
+
+
 def detect_action(text: str) -> str | None:
-    lower = text.lower()
     for key, (_, keywords) in ACTIONS.items():
-        if any(k in lower for k in keywords):
+        if any(_action_keyword_re(k).search(text or "") for k in keywords):
             return key
     return None
 
