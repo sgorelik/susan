@@ -91,6 +91,7 @@ from app.channel_surface import (
     parse_standup_command,
     process_channel_surface,
 )
+from app.standup_digest import parse_daily_standup_command, process_standup_digest
 
 from app.sales_prep import parse_sales_prep_command, process_sales_prep
 from app.slack_events import handle_slack_event_callback, parse_events_body
@@ -623,6 +624,7 @@ def _help_overview() -> list[str]:
         "*Most used*\n"
         "• `/susan my actions` — *your* tasks across every channel, Gmail, Drive, and Granola (private)\n"
         "• `/susan team actions` — *everyone's* open tasks in *this* channel\n"
+        "• `/susan daily status` — standup digest from Granola: updates, blockers, decisions\n"
         "• `/susan weekly status` — team digest for this channel\n"
         "• `/susan granola` — summarize your recent meetings\n"
         "• `/susan needs my review` — PRs and asks waiting on you\n"
@@ -658,6 +660,16 @@ def _help_actions() -> list[str]:
 
 def _help_status() -> list[str]:
     return [
+        "*Daily standup digest* (from Granola notes)\n"
+        "`/susan daily status` — reads today's standup meeting from Granola and posts "
+        "*Updates*, *Blockers*, *Decisions*, *Parking lot*, *Discussion*, and *Next steps*. "
+        "Empty sections are dropped.\n"
+        "• `/susan daily status yesterday` · `/susan daily status last 3 days`\n"
+        "• `--no-approval` posts straight to the channel; without it you get a private preview\n"
+        "• Post it automatically: "
+        "`/susan schedule add daily status every weekday at 10:00 in #team-tech`\n"
+        "• Susan finds the meeting by title. If yours isn't called \"standup\", set "
+        "`SUSAN_STANDUP_MEETING_TERMS` to a comma-separated list of title words.",
         "*Weekly status*\n"
         "`/susan weekly status` · `/susan weekly report last 14 days` · `/susan team status last calendar week`\n"
         "In *tech* channels (`team-tech`, `software`, `security` by default — override with "
@@ -1025,6 +1037,47 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                     f"Got it — Susan is preparing a *sales call brief* for *{sales_prep_target}* "
                     "(internal docs, Granola, and company research). You'll get a concise TLDR in "
                     "Slack with a link to the full Google Doc when ready."
+                ),
+            }
+        )
+
+    # Before parse_standup_command: "standup digest" also matches its bare "standup" prefix.
+    if parse_daily_standup_command(text) is not None:
+        _, standup_auto_post = strip_weekly_status_auto_post_flags(text)
+        if standup_auto_post and not weekly_status_auto_post_user_allowed(user):
+            return JSONResponse(
+                {
+                    "response_type": "ephemeral",
+                    "text": (
+                        "Auto-publish (`--no-approval`) is restricted for your user. Remove the flag "
+                        "for a private preview, or ask an admin to add your Slack user id to "
+                        "`SUSAN_WEEKLY_AUTO_POST_USER_IDS`."
+                    ),
+                }
+            )
+
+        async def run_standup_digest():
+            try:
+                await process_standup_digest(
+                    text, channel, user, thread_ts, response_url
+                )
+            except Exception as e:
+                logger.exception("Standup digest task failed")
+                try:
+                    await notify_user_ephemeral(
+                        channel, user, f"Susan error (standup): {e}", None, response_url
+                    )
+                except Exception as e2:
+                    logger.error("Could not notify user after standup error: %s", e2)
+
+        background_tasks.add_task(run_standup_digest)
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": (
+                    "Got it — Susan is building the *standup digest* from Granola notes "
+                    "(updates, blockers, decisions, parking lot, next steps)."
+                    + ("" if standup_auto_post else " You'll get a private preview first.")
                 ),
             }
         )
