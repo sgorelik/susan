@@ -15,6 +15,29 @@ def test_slack_mrkdwn_to_canvas_markdown() -> None:
     assert "**1. Last week:**" in out
 
 
+def test_model_emitted_horizontal_rules_are_dropped() -> None:
+    src = "*Platform*\n- shipped it\n\n---\n\n*Onboarding*\n- new flow\n***\n___\n===\n"
+    out = slack_mrkdwn_to_canvas_markdown(src)
+    assert not any(
+        line.strip() in ("---", "***", "___", "===") for line in out.splitlines()
+    )
+    assert "**Platform**" in out
+    assert "**Onboarding**" in out
+    assert "\n\n\n" not in out
+
+
+def test_rule_directly_under_text_does_not_become_a_heading() -> None:
+    # "latency down\n---" would parse as a setext H2 in the Canvas renderer.
+    out = slack_mrkdwn_to_canvas_markdown("latency down\n---\n*Onboarding*")
+    assert out == "latency down\n\n**Onboarding**"
+
+
+def test_canvas_document_keeps_single_footer_rule() -> None:
+    md = weekly_canvas._canvas_document_markdown("Weekly status", "*Platform*\n---\n- shipped")
+    assert md.count("---") == 1
+    assert md.endswith("---\n_Posted via Susan_")
+
+
 def test_weekly_status_use_canvas_default() -> None:
     assert weekly_status_use_canvas() is True
 

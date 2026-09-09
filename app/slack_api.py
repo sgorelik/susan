@@ -955,6 +955,39 @@ def markdownish_to_slack_mrkdwn(text: str) -> str:
     return "".join(buf)
 
 
+def _split_overlong_line(line: str, chunk_size: int) -> list[str]:
+    out: list[str] = []
+    rest = line
+    while len(rest) > chunk_size:
+        cut = rest.rfind(" ", 0, chunk_size + 1)
+        if cut <= 0:
+            cut = chunk_size
+        out.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+    if rest:
+        out.append(rest)
+    return out
+
+
+def split_for_slack_sections(text: str, chunk_size: int) -> list[str]:
+    """Split text into ≤chunk_size blocks on line boundaries, so a section never breaks mid-sentence."""
+    parts: list[str] = []
+    buf = ""
+    for line in (text or "").splitlines():
+        pieces = [line] if len(line) <= chunk_size else _split_overlong_line(line, chunk_size)
+        for piece in pieces:
+            candidate = f"{buf}\n{piece}" if buf else piece
+            if len(candidate) <= chunk_size:
+                buf = candidate
+                continue
+            if buf:
+                parts.append(buf)
+            buf = piece
+    if buf:
+        parts.append(buf)
+    return [p for p in (part.strip("\n") for part in parts) if p.strip()]
+
+
 async def post_pr_summary_to_channel(
     channel: str,
     thread_ts: str | None,
@@ -968,10 +1001,7 @@ async def post_pr_summary_to_channel(
     chunk_size = 2800
     max_sections = 48
     s = markdownish_to_slack_mrkdwn((body or "").strip())
-    parts: list[str] = []
-    while s:
-        parts.append(s[:chunk_size])
-        s = s[chunk_size:]
+    parts = split_for_slack_sections(s, chunk_size)
     if not parts:
         parts = ["_(empty)_"]
     reply_thread_ts = thread_ts

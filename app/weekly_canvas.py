@@ -15,6 +15,10 @@ from app.slack_api import (
 _SLACK_LINK_RE = re.compile(r"<(https?://[^|>]+)\|([^>]+)>")
 _SLACK_BARE_LINK_RE = re.compile(r"<(https?://[^>]+)>")
 _SLACK_BOLD_RE = re.compile(r"(?<!\*)\*([^*\n]+)\*(?!\*)")
+# A line of only dashes/asterisks/underscores/equals renders as a full-width rule in Canvas,
+# and directly under a text line it turns that line into a setext heading.
+_RULE_LINE_RE = re.compile(r"^[ \t]*(?:-{3,}|\*{3,}|_{3,}|={3,}|\u2014{3,})[ \t]*$", re.MULTILINE)
+_EXTRA_BLANK_LINES_RE = re.compile(r"\n{3,}")
 
 
 def weekly_status_use_canvas() -> bool:
@@ -34,7 +38,9 @@ def slack_mrkdwn_to_canvas_markdown(text: str) -> str:
     s = _SLACK_LINK_RE.sub(link_sub, s)
     s = _SLACK_BARE_LINK_RE.sub(lambda m: m.group(1), s)
     s = _SLACK_BOLD_RE.sub(r"**\1**", s)
-    return s
+    s = _RULE_LINE_RE.sub("", s)
+    s = _EXTRA_BLANK_LINES_RE.sub("\n\n", s)
+    return s.strip()
 
 
 def _canvas_document_markdown(title: str, body: str) -> str:
