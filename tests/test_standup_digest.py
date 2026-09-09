@@ -98,16 +98,21 @@ async def test_auto_publish_posts_to_channel(monkeypatch: pytest.MonkeyPatch) ->
         )
 
     posted: dict[str, object] = {}
+    notes: list[str] = []
 
     async def fake_post(channel, text, **kwargs):
         posted.update(channel=channel, text=text, **kwargs)
         return {"ok": True, "ts": "1"}
+
+    async def fake_notify(channel, user, text, blocks=None, response_url=None, **kw):
+        notes.append(text)
 
     monkeypatch.setattr(sd, "user_has_granola_tokens", has_tokens)
     monkeypatch.setattr(sd, "get_granola_token", token)
     monkeypatch.setattr(sd, "collect_granola_notes_matching_terms", one_note)
     monkeypatch.setattr(sd, "call_claude", fake_completion)
     monkeypatch.setattr(sd, "post_message", fake_post)
+    monkeypatch.setattr(sd, "notify_user_ephemeral", fake_notify)
 
     await sd.process_standup_digest(
         "daily status --no-approval", "C1", "U1", None, None
@@ -119,6 +124,55 @@ async def test_auto_publish_posts_to_channel(monkeypatch: pytest.MonkeyPatch) ->
     # Attribution must follow the model that actually served the request.
     assert posted["model_route"] == "sovereign"
     assert posted["model_name"] == "deepseek-v4"
+    assert any("everyone here can see it" in n for n in notes)
+
+
+@pytest.mark.asyncio
+async def test_no_approval_without_dashes_still_posts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.claude_client import ModelCompletion
+
+    async def has_tokens(user: str) -> bool:
+        return True
+
+    async def token(user: str) -> str:
+        return "tok"
+
+    async def one_note(*args: object, **kwargs: object) -> tuple[list, int]:
+        return [{"id": "not_1", "title": "Daily standup", "summary_markdown": "Ana: shipped"}], 1
+
+    async def fake_completion(*args: object, **kwargs: object) -> ModelCompletion:
+        return ModelCompletion("*Updates*\n• *Ana* — shipped", model_route="sovereign")
+
+    posted: list[object] = []
+
+    async def fake_post(*args: object, **kwargs: object) -> dict:
+        posted.append(args)
+        return {"ok": True, "ts": "1"}
+
+    async def fake_notify(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(sd, "user_has_granola_tokens", has_tokens)
+    monkeypatch.setattr(sd, "get_granola_token", token)
+    monkeypatch.setattr(sd, "collect_granola_notes_matching_terms", one_note)
+    monkeypatch.setattr(sd, "call_claude", fake_completion)
+    monkeypatch.setattr(sd, "post_message", fake_post)
+    monkeypatch.setattr(sd, "notify_user_ephemeral", fake_notify)
+
+    await sd.process_standup_digest("daily status no approval", "C1", "U1", None, None)
+
+    assert posted, "plain 'no approval' must post to the channel, not stay ephemeral"
+
+
+def test_strip_auto_post_flags_accepts_spoken_form() -> None:
+    from app.weekly_context import strip_weekly_status_auto_post_flags
+
+    cleaned, auto = strip_weekly_status_auto_post_flags("yesterday no approval")
+    assert auto is True
+    assert cleaned == "yesterday"
+    cleaned, auto = strip_weekly_status_auto_post_flags("last week")
+    assert auto is False
+    assert cleaned == "last week"
 
 
 @pytest.mark.asyncio

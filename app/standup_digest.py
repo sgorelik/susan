@@ -241,6 +241,13 @@ async def process_standup_digest(
                 model_route=model_route,
                 model_name=model_name,
             )
+            await notify_user_ephemeral(
+                channel,
+                user,
+                "✓ Posted the *standup digest* to the channel — everyone here can see it.",
+                None,
+                response_url,
+            )
         except Exception as e:
             logger.exception("Standup digest post failed")
             await notify_user_ephemeral(

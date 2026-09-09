@@ -16,12 +16,12 @@ def utc_date_start_slack_ts(iso_date: str) -> str:
 
 
 _WEEKLY_AUTO_POST_FLAG_RE = re.compile(
-    r"(?i)(?:^|\s)(?:--no-approval|-no-approval)(?:\s|$)"
+    r"(?i)(?:^|\s)(?:--no-approval|-no-approval|no-approval|no\s+approval)(?:\s|$)"
 )
 
 
 def strip_weekly_status_auto_post_flags(text: str) -> tuple[str, bool]:
-    """Remove --no-approval / -no-approval; return (text for date/link parsing, auto_publish)."""
+    """Remove auto-post flags (`--no-approval`, `no approval`); return (text, auto_publish)."""
     raw = (text or "").strip()
     auto = bool(_WEEKLY_AUTO_POST_FLAG_RE.search(raw))
     cleaned = _WEEKLY_AUTO_POST_FLAG_RE.sub(" ", raw)
