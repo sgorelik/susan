@@ -395,4 +395,6 @@ async def process_weekly_status(
         preview_note,
         blocks,
         response_url,
+        model_route=model_route,
+        model_name=model_name,
     )
