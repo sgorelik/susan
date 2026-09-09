@@ -14,10 +14,7 @@ import httpx
 
 from app.claude_client import call_claude
 from app.config import SUSAN_VOICE, logger
-from app.granola_summarize import (
-    _format_notes_for_prompt,
-    collect_granola_notes_matching_terms,
-)
+from app.granola_summarize import collect_granola_notes_matching_terms
 from app.slack_api import notify_user_ephemeral, post_message
 from app.weekly_context import parse_weekly_status_time_range, strip_weekly_status_auto_post_flags
 from db import get_granola_token, user_has_granola_tokens
@@ -59,6 +56,115 @@ def _max_standup_notes() -> int:
     return max(1, min(10, n))
 
 
+def _max_transcript_chars() -> int:
+    """Transcript budget per run. F1_MODEL_MAX_PROMPT_CHARS is the real ceiling."""
+    n = int((os.environ.get("SUSAN_STANDUP_MAX_TRANSCRIPT_CHARS") or "120000").strip() or "120000")
+    return max(5_000, min(300_000, n))
+
+
+def _standup_max_tokens() -> int:
+    n = int((os.environ.get("SUSAN_STANDUP_MAX_TOKENS") or "8192").strip() or "8192")
+    return max(1024, min(32_000, n))
+
+
+def _note_attendee_names(note: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    for a in note.get("attendees") or []:
+        if isinstance(a, dict):
+            name = (a.get("name") or a.get("email") or "").strip()
+            if name:
+                out.append(name)
+    return out
+
+
+def _transcript_speaker_names(note: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    for seg in note.get("transcript") or []:
+        if not isinstance(seg, dict):
+            continue
+        sp = seg.get("speaker")
+        if isinstance(sp, dict) and (sp.get("name") or "").strip():
+            names.add(sp["name"].strip())
+    return names
+
+
+def _recording_user_name(note: dict[str, Any]) -> str:
+    """Granola labels the recorder's own audio as `attribution: me` with no name.
+
+    The recorder is the attendee who never appears as a named speaker.
+    """
+    named = _transcript_speaker_names(note)
+    unmatched = [
+        a
+        for a in _note_attendee_names(note)
+        if not any(a.split()[0].lower() in n.lower() for n in named if n)
+    ]
+    return unmatched[0] if len(unmatched) == 1 else "Meeting host"
+
+
+def format_standup_transcript(note: dict[str, Any], max_chars: int) -> str:
+    """Speaker-labelled transcript, consecutive turns merged, oldest first."""
+    segments = note.get("transcript") or []
+    if not isinstance(segments, list) or not segments:
+        return ""
+    me = _recording_user_name(note)
+    turns: list[tuple[str, list[str]]] = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        sp = seg.get("speaker") if isinstance(seg.get("speaker"), dict) else {}
+        if (sp or {}).get("attribution") == "me":
+            speaker = me
+        else:
+            speaker = ((sp or {}).get("name") or "Unknown speaker").strip()
+        if turns and turns[-1][0] == speaker:
+            turns[-1][1].append(text)
+        else:
+            turns.append((speaker, [text]))
+
+    lines: list[str] = []
+    total = 0
+    dropped = 0
+    for speaker, parts in turns:
+        line = f"{speaker}: {' '.join(parts)}"
+        if total + len(line) > max_chars:
+            dropped += 1
+            continue
+        lines.append(line)
+        total += len(line)
+    if dropped:
+        lines.append(f"_…{dropped} further turn(s) omitted (transcript budget)._")
+    return "\n".join(lines)
+
+
+def standup_notes_for_prompt(notes: list[dict[str, Any]], max_chars: int) -> str:
+    """Granola's own summary plus the full speaker-labelled transcript per meeting."""
+    budget = max_chars // max(1, len(notes))
+    blocks: list[str] = []
+    for i, n in enumerate(notes, 1):
+        title = n.get("title") or "(untitled)"
+        created = n.get("created_at") or ""
+        attendees = ", ".join(_note_attendee_names(n)) or "(none listed)"
+        summary = n.get("summary_markdown") or n.get("summary_text") or ""
+        block = (
+            f"### Meeting {i}: {title}\n"
+            f"- created: {created}\n"
+            f"- attendees: {attendees}\n\n"
+            f"#### Granola's own summary\n{summary}\n"
+        )
+        transcript = format_standup_transcript(n, max(1000, budget - len(block)))
+        if transcript:
+            block += (
+                "\n#### Full transcript (authoritative — the summary above may omit things)\n"
+                f"{transcript}\n"
+            )
+        blocks.append(block)
+    return "\n---\n".join(blocks)
+
+
 def parse_standup_digest_window(remainder: str) -> tuple[str, str, str]:
     """Return (since, until, label). Defaults to today, since this runs after standup."""
     r = (remainder or "").strip().lower()
@@ -80,20 +186,27 @@ def _standup_system_prompt() -> str:
         Slack mrkdwn only: *single asterisks* for bold, never **double**. No # headings.
         Refer to people by the names used in the notes.
 
+        *Completeness comes first, brevity second.* Write tersely, but never drop a
+        substantive item to save space. It is a failure to omit an update, a blocker,
+        or a decision because the digest was getting long. Every person who spoke gets
+        an entry. Cut words, never content.
+
         Sections, in this order. *Omit any section with nothing real to report* — never
         emit a heading followed by "none" or "n/a":
 
         *Updates*
-        • One line per person: `*<Name>* — what they reported`. Merge their whole update
-          into one line. Lead with the outcome, not the process.
+        • `*<Name>* — what they reported`. One bullet per person; add a second or third
+          bullet under that person when they covered genuinely separate workstreams.
+          Cover *every* person who gave an update. Lead with the outcome, not the process.
 
         *Blockers*
         • `*<Name>* — what is blocked, and who or what is needed to unblock it`.
-          Only real blockers: something that stops progress and needs someone else.
+          Anything waiting on another person, an access request, a review, a decision,
+          or an external party. Include every one mentioned, even in passing.
 
         *Decisions*
-        • What was decided and by whom. Only actual decisions, not opinions or options
-          still being weighed.
+        • What was decided and by whom. Include every decision reached, including small
+          ones and ones reversing an earlier plan. Not opinions still being weighed.
 
         *Parking lot*
         • Topics raised and deliberately deferred, or that ran out of time. Note who
@@ -107,6 +220,10 @@ def _standup_system_prompt() -> str:
         • `*<Name>* — action`. Concrete commitments with an owner. Skip vague intentions.
 
         Rules:
+        - The transcript is authoritative. Granola's own summary is a starting point and
+          routinely omits things — mine the transcript for updates, blockers, and
+          decisions the summary missed.
+        - Ignore greetings, scheduling chatter, and audio problems.
         - Use only what the notes contain. Never invent an update for someone who did not speak.
         - If the notes are too thin for a real digest, say so in one line instead of padding.
         - No preamble, no sign-off, no "here is".
@@ -119,15 +236,19 @@ async def build_standup_digest(
     range_label: str,
 ) -> str:
     """Summarize standup notes into the channel-facing digest body."""
-    bundle = _format_notes_for_prompt(notes, max_chars=100_000)
+    bundle = standup_notes_for_prompt(notes, max_chars=_max_transcript_chars())
+    attendees = sorted({a for n in notes for a in _note_attendee_names(n)})
+    roster = ", ".join(attendees) if attendees else "(not listed)"
     user_prompt = (
-        f"Standup window: {range_label}.\n\n"
+        f"Standup window: {range_label}.\n"
+        f"Attendees across these meetings: {roster}.\n"
+        "Every attendee who spoke must appear under Updates.\n\n"
         f"--- Granola standup notes ({len(notes)} meeting(s)) ---\n{bundle}"
     )
     summary = await call_claude(
         _standup_system_prompt(),
         user_prompt,
-        max_tokens=4096,
+        max_tokens=_standup_max_tokens(),
         action="standup_digest",
     )
     return summary
@@ -180,6 +301,7 @@ async def process_standup_digest(
             until_d,
             terms,
             max_detail_fetch=_max_standup_notes(),
+            include_transcript=True,
         )
     except httpx.HTTPStatusError as e:
         logger.warning("Standup digest Granola fetch failed: %s", e)

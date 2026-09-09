@@ -234,6 +234,139 @@ async def test_missing_granola_tells_user_to_connect(
     assert "connect granola" in sent["text"].lower()
 
 
+def _note_with_transcript() -> dict:
+    return {
+        "title": "Tech Standup: Daily",
+        "attendees": [{"name": "Stacy Gorelik"}, {"name": "Dmitry"}, {"name": "Gavin"}],
+        "summary_markdown": "Short summary that omits most of the meeting.",
+        "transcript": [
+            {"text": "Morning.", "speaker": {"attribution": "me", "source": "microphone"}},
+            {"text": "I shipped the parser.", "speaker": {"attribution": "me"}},
+            {"text": "I am blocked on the API key.", "speaker": {"attribution": "them", "name": "Dmitry Ryabkov"}},
+            {"text": "I'll send it today.", "speaker": {"attribution": "them", "name": "Gavin Elder"}},
+        ],
+    }
+
+
+def test_recording_user_is_resolved_from_attendees() -> None:
+    """Granola labels the recorder's audio `me` with no name; infer who that is."""
+    assert sd._recording_user_name(_note_with_transcript()) == "Stacy Gorelik"
+
+
+def test_recording_user_falls_back_when_ambiguous() -> None:
+    note = {"attendees": [{"name": "A"}, {"name": "B"}], "transcript": []}
+    assert sd._recording_user_name(note) == "Meeting host"
+
+
+def test_transcript_is_speaker_labelled_and_merges_turns() -> None:
+    out = sd.format_standup_transcript(_note_with_transcript(), 10_000)
+    lines = out.splitlines()
+    # The recorder's two consecutive lines merge into one labelled turn.
+    assert lines[0] == "Stacy Gorelik: Morning. I shipped the parser."
+    assert lines[1] == "Dmitry Ryabkov: I am blocked on the API key."
+    assert lines[2] == "Gavin Elder: I'll send it today."
+
+
+def test_transcript_budget_reports_what_it_dropped() -> None:
+    out = sd.format_standup_transcript(_note_with_transcript(), 40)
+    assert "further turn(s) omitted" in out
+
+
+def test_prompt_includes_full_transcript_not_just_summary() -> None:
+    """The summary alone was losing most of the meeting; the transcript is authoritative."""
+    bundle = sd.standup_notes_for_prompt([_note_with_transcript()], 100_000)
+    assert "Granola's own summary" in bundle
+    assert "Full transcript" in bundle
+    assert "authoritative" in bundle
+    assert "I am blocked on the API key." in bundle
+    assert "Stacy Gorelik, Dmitry, Gavin" in bundle
+
+
+def test_prompt_survives_note_without_transcript() -> None:
+    bundle = sd.standup_notes_for_prompt(
+        [{"title": "S", "summary_markdown": "just a summary"}], 100_000
+    )
+    assert "just a summary" in bundle
+    assert "Full transcript" not in bundle
+
+
+def test_system_prompt_prioritises_completeness() -> None:
+    p = sd._standup_system_prompt()
+    assert "Completeness comes first" in p
+    assert "Cut words, never content" in p
+
+
+@pytest.mark.asyncio
+async def test_digest_requests_the_transcript(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: transcripts were never fetched, so ~90% of the meeting was invisible."""
+    from app.claude_client import ModelCompletion
+
+    seen: dict[str, object] = {}
+
+    async def has_tokens(user: str) -> bool:
+        return True
+
+    async def token(user: str) -> str:
+        return "tok"
+
+    async def capture(*args: object, **kwargs: object) -> tuple[list, int]:
+        seen.update(kwargs)
+        return [_note_with_transcript()], 1
+
+    async def fake_completion(system, user_prompt, **kwargs):
+        seen["prompt"] = user_prompt
+        seen["max_tokens"] = kwargs.get("max_tokens")
+        return ModelCompletion("*Updates*\n• *Ana* — x", model_route="sovereign")
+
+    async def noop(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(sd, "user_has_granola_tokens", has_tokens)
+    monkeypatch.setattr(sd, "get_granola_token", token)
+    monkeypatch.setattr(sd, "collect_granola_notes_matching_terms", capture)
+    monkeypatch.setattr(sd, "call_claude", fake_completion)
+    monkeypatch.setattr(sd, "notify_user_ephemeral", noop)
+
+    await sd.process_standup_digest("daily status", "C1", "U1", None, None)
+
+    assert seen["include_transcript"] is True
+    assert "I am blocked on the API key." in str(seen["prompt"])
+    assert "Every attendee who spoke must appear" in str(seen["prompt"])
+    assert int(seen["max_tokens"] or 0) >= 8192
+
+
+@pytest.mark.asyncio
+async def test_collector_passes_transcript_flag_to_granola(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.granola_summarize as gs
+
+    asked: dict[str, object] = {}
+
+    async def fake_list(client, bearer, **kwargs):
+        return {"notes": [{"id": "not_1", "title": "Daily standup"}], "hasMore": False}
+
+    async def fake_get(client, bearer, nid, *, include_transcript):
+        asked["include_transcript"] = include_transcript
+        return {"id": nid, "title": "Daily standup"}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+    monkeypatch.setattr(gs.httpx, "AsyncClient", lambda **kw: FakeClient())
+    monkeypatch.setattr(gs, "_granola_list_page", fake_list)
+    monkeypatch.setattr(gs, "_granola_get_note", fake_get)
+
+    await gs.collect_granola_notes_matching_terms(
+        "tok", "2026-09-09", "2026-09-09", ["standup"], include_transcript=True
+    )
+    assert asked["include_transcript"] is True
+
+
 def test_schedule_add_parses_daily_status() -> None:
     from app.scheduler import parse_schedule_add
 

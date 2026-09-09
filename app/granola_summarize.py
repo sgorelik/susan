@@ -137,6 +137,7 @@ async def collect_granola_notes_matching_terms(
     *,
     max_detail_fetch: int = 5,
     max_list_pages: int | None = None,
+    include_transcript: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
     """List Granola notes in window; fetch detail only for title/summary matches.
 
@@ -184,7 +185,9 @@ async def collect_granola_notes_matching_terms(
         out: list[dict[str, Any]] = []
         for nid in matched_ids[:max_detail_fetch]:
             try:
-                detail = await _granola_get_note(client, bearer, nid, include_transcript=False)
+                detail = await _granola_get_note(
+                    client, bearer, nid, include_transcript=include_transcript
+                )
                 out.append(detail)
             except httpx.HTTPStatusError as e:
                 logger.warning("Granola get note %s: HTTP %s", nid, e.response.status_code)
