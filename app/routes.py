@@ -27,6 +27,7 @@ from db import (
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
+from app.babysit import farm_configured, process_babysit
 from app.config import ACTIONS, GITHUB_ACTIONS, GOOGLE_ACTIONS, logger
 from app.github_pickers import (
     post_github_repo_multi_summary_picker_ephemeral,
@@ -629,6 +630,7 @@ def _help_overview() -> list[str]:
         "• `/susan granola` — summarize your recent meetings\n"
         "• `/susan needs my review` — PRs and asks waiting on you\n"
         "• `/susan surface failures` — failing CI, promote, and cost alerts\n"
+        "• `/susan babysit` — trigger the PR farm to babysit open PRs to green\n"
         "• `/susan board status` — roadmap digest from the GitHub Projects board\n"
         "• `/susan create issue in org/repo …` · `create a doc …` · `send email …`",
         "*More detail*\n"
@@ -1190,6 +1192,43 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
             {"response_type": "ephemeral", "text": ROADMAP_ACKS[roadmap_kind]}
         )
 
+    if text_lower.startswith("babysit") or text_lower.startswith("pr farm"):
+        if not farm_configured():
+            return JSONResponse(
+                {
+                    "response_type": "ephemeral",
+                    "text": (
+                        "The PR farm isn’t configured on this server (`FARM_BASE_URL` unset). "
+                        "Ask an admin to set it, or run the farm locally with `./run-farm.sh`."
+                    ),
+                }
+            )
+
+        async def run_babysit():
+            try:
+                await process_babysit(
+                    text, channel, user, thread_ts, response_url
+                )
+            except Exception as e:
+                logger.exception("babysit task failed")
+                try:
+                    await notify_user_ephemeral(
+                        channel, user, f"Susan error (babysit): {str(e)}", None, response_url
+                    )
+                except Exception as e2:
+                    logger.error("Could not notify user after babysit error: %s", e2)
+
+        background_tasks.add_task(run_babysit)
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": (
+                    "Got it — Susan is triggering the *PR farm* to babysit open PRs to green. "
+                    "You’ll get a confirmation when the pass has started."
+                ),
+            }
+        )
+
     action = detect_action(text)
     if not action:
         return JSONResponse(
@@ -1201,7 +1240,8 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                     "`summarize prs`, `weekly status`, `prep me for a sales call with …`, "
                     "`standups`, `surface failures`, `needs my review`, "
                     "`board status`, `customer ask <name>`, `roadmap add …`, "
-                    "`actions` / `action items`, or Granola-only: `granola` / `gn`."
+                    "`actions` / `action items`, `babysit`, "
+                    "or Granola-only: `granola` / `gn`."
                 ),
             }
         )
