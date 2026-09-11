@@ -97,6 +97,7 @@ Run tests / checks (if you add them): `python -m py_compile app/*.py` is a minim
 - `/susan weekly status …` — Structured update (*workstreams* with *1. Last week* / *2. Next steps* and links) from **Slack messages**, **channel bookmarks**, **Google Drive**, and **all `GITHUB_REPOS`** in tech channels. Publishes the full report to a **Slack Canvas** and posts a short link in the channel (needs `canvases:write` + `files:read`; falls back to long channel messages if Canvas is unavailable). Optional `--no-approval` (restrict with `SUSAN_WEEKLY_AUTO_POST_USER_IDS`).
 - `/susan standups …` — Summarize daily standup notes from `#team-tech` (threads) for a date window
 - `/susan surface failures` / `what's failing` — Digest of failing CI/promote/cost alerts from configured alert channels
+- `/susan babysit` / `pr farm` — Trigger the dev-tools PR farm to babysit open PRs to green (needs `FARM_BASE_URL`)
 - `/susan needs my review` / `surface reviews` — PRs and asks that need *your* review (alerts + `#team-tech`)
 - `/susan board status` · `board pack` · `board risks` · `board claims` · `customer ask <name>` · `roadmap <question>` · `roadmap add <decision>` — the **roadmap board** (see below)
 - `/susan help` — full in-Slack help
@@ -166,6 +167,8 @@ the proposed field values go into the issue body for a human to set.
 | `SUSAN_ROADMAP_BOARD_WRITE` | Optional | `true` lets Susan add an approved issue to the board and set its fields (needs `project` scope) |
 | `GITHUB_BASE_BRANCH` | Optional | Default `main` |
 | `GITHUB_TOKEN` | Optional | **Shared PAT for all users** — see SECURITY.md |
+| `FARM_BASE_URL` | For `/susan babysit` | Base URL of the dev-tools PR farm HTTP trigger (e.g. `http://farm-host:8787`); enables the babysit command |
+| `FARM_SERVE_TOKEN` | Optional | Bearer token the farm requires on `POST /babysit` |
 | `GOOGLE_ACCESS_TOKEN` | Optional | **Shared Google token for all users** — see SECURITY.md |
 | `DEFAULT_EMAIL_TO` | Optional | Fallback when draft has no To: line |
 | `SLACK_USER_EMAIL_MAP` | Optional | `U123:a@b.com,…` or JSON map when Slack hides emails |
